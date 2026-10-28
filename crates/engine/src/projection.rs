@@ -247,15 +247,9 @@ impl Actor {
     pub(super) fn folded(&mut self, entries: &[Entry]) {
         let session = &self.live.session;
         let hooks = self.registry.hooks();
-        self.projection.transcript = self
-            .projection
-            .transcript
-            .take()
-            .filter(|t| t.is_on(&self.registry));
-        // An edit changes what came before it: the transcript is made again.
-        if entries.iter().any(|e| matches!(e.body, Body::Edit { .. })) {
-            self.projection.transcript = None;
-        }
+        self.projection.transcript = self.projection.transcript.take().filter(|t| {
+            t.is_on(&self.registry) && !entries.iter().any(|e| matches!(e.body, Body::Edit { .. }))
+        });
         for e in entries {
             let _ = self.projection.invocations.fold(e);
             if let Body::Answer { call, .. }
@@ -316,11 +310,17 @@ impl Actor {
             // the transcript stops short of it, and the next projection
             // goes on from there on a blocking worker; as it does from
             // any entry it stopped short of before.
-            if let Some(transcript) = &mut self.projection.transcript
-                && transcript.through() + 1 == e.seq.get()
-                && e.body.blobs().is_empty()
+            if self
+                .projection
+                .transcript
+                .as_mut()
+                .is_some_and(|transcript| {
+                    transcript.through() + 1 == e.seq.get()
+                        && e.body.blobs().is_empty()
+                        && !transcript.apply(e, replied.map(|(_, m)| m))
+                })
             {
-                transcript.apply(e, replied.map(|(_, m)| m));
+                self.projection.transcript = None;
             }
             // A call ends with its result, unless it was detached: then
             // with its own envelope, its result a placeholder.
@@ -445,15 +445,92 @@ impl Actor {
         frame
     }
 
+    pub(super) async fn canonical_conversation(
+        &mut self,
+        call: CallId,
+    ) -> io::Result<llm::Messages> {
+        let conversation = self.conversation(call).await?;
+        rt::try_unblock_with(
+            &*self.live.session.shared.rt,
+            Cpu,
+            rt::STORAGE_BYTES,
+            move || {
+                conversation
+                    .canonical()
+                    .map(std::borrow::Cow::into_owned)
+                    .map_err(io::Error::other)
+            },
+        )
+        .await?
+    }
+
     /// The conversation the model sees before entry `call`: the
     /// transcript as it stands, gone on with on a blocking worker from
     /// where it stopped short, or, with none, made from the whole log.
-    pub(super) async fn conversation(&mut self, call: CallId) -> io::Result<llm::Messages> {
+    fn canonical_source(
+        &self,
+        call: CallId,
+    ) -> Arc<dyn Fn() -> Result<llm::Messages, llm::Error> + Send + Sync> {
+        let source_through = self.journal.ordered_seq;
+        let source_frames = Arc::clone(&self.live.frames);
+        let source_registry = Arc::downgrade(&self.registry);
+        let source_pending: Vec<_> = self.pending_entries().collect();
+        let source_places = self.live.session.blobs.places();
+        let model_only = self.live.session.model_only();
+        Arc::new(move || {
+            let source_registry = source_registry.upgrade().ok_or_else(|| {
+                llm::Error::new(
+                    llm::Kind::Other,
+                    "canonical history's registry generation has retired",
+                )
+            })?;
+            Transcript::replay(
+                |each| {
+                    'history: for batch in source_frames.batches_after(0) {
+                        for entry in batch? {
+                            if entry.seq.get() > source_through {
+                                break 'history;
+                            }
+                            if entry.seq < call.0
+                                || matches!(entry.body, Body::Context { .. } | Body::Edit { .. })
+                            {
+                                each(&entry);
+                            }
+                        }
+                    }
+                    for entry in &source_pending {
+                        if entry.seq.get() <= source_through
+                            && (entry.seq < call.0
+                                || matches!(entry.body, Body::Context { .. } | Body::Edit { .. }))
+                        {
+                            each(entry);
+                        }
+                    }
+                    Ok(())
+                },
+                Arc::clone(&source_registry),
+                if model_only {
+                    ""
+                } else {
+                    source_registry.system_prompt()
+                },
+                &source_places,
+            )
+            .map(Transcript::into_messages)
+            .map_err(|error| llm::Error::new(llm::Kind::Other, error.to_string()))
+        })
+    }
+
+    pub(super) async fn conversation(&mut self, call: CallId) -> io::Result<llm::Conversation> {
+        let restore = self.canonical_source(call);
         if let Some(messages) = (self.projection.transcript.as_ref())
             .filter(|t| t.through() + 1 >= call.get())
-            .and_then(|t| t.before(call.get()))
+            .and_then(|t| {
+                let restore = Arc::clone(&restore);
+                t.request_before(call.get(), move || restore())
+            })
         {
-            return Ok(messages.clone());
+            return Ok(messages);
         }
         let frames = Arc::clone(&self.live.frames);
         let registry = Arc::clone(&self.registry);
@@ -471,17 +548,25 @@ impl Actor {
                 } else {
                     registry.system_prompt()
                 };
-                // Each entry is read once: what was folded stays.
-                let transcript = if let Some(mut transcript) = kept {
-                    let through = transcript.through();
-                    for batch in frames.batches_after(through) {
-                        for entry in batch? {
-                            transcript.apply(&entry, None);
-                        }
+                let mut entries = Vec::new();
+                if let Some(transcript) = &kept {
+                    for batch in frames.batches_after(transcript.through()) {
+                        entries.extend(batch?);
                     }
-                    for entry in pending.iter().filter(|e| e.seq.get() > through) {
-                        transcript.apply(entry, None);
-                    }
+                    entries.extend(
+                        pending
+                            .iter()
+                            .filter(|e| e.seq.get() > transcript.through())
+                            .cloned(),
+                    );
+                }
+                let advanced = kept.and_then(|mut transcript| {
+                    entries
+                        .iter()
+                        .all(|entry| transcript.apply(entry, None))
+                        .then_some(transcript)
+                });
+                let transcript = if let Some(transcript) = advanced {
                     transcript
                 } else {
                     Transcript::replay(
@@ -501,7 +586,7 @@ impl Actor {
                         &places,
                     )?
                 };
-                if let Some(messages) = transcript.before(call.get()).cloned() {
+                if let Some(messages) = transcript.request_before(call.get(), move || restore()) {
                     return io::Result::Ok((transcript, messages));
                 }
                 let messages = Transcript::replay(
@@ -528,7 +613,7 @@ impl Actor {
                     &places,
                 )?
                 .into_messages();
-                io::Result::Ok((transcript, messages))
+                io::Result::Ok((transcript, messages.into()))
             },
         )
         .await??;

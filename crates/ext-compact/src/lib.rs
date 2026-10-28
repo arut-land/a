@@ -132,18 +132,25 @@ impl Extension for Compact {
                     }
                     Rewrite::Pass
                 }
-                Some((share, window))
-                    if estimate(request) > share.of(window)
+                Some((share, window)) => {
+                    let messages = match request.messages.canonical() {
+                        Ok(messages) => messages,
+                        Err(error) => return Rewrite::Stop(Err(error)),
+                    };
+                    let estimated = estimate(&messages);
+                    if estimated > share.of(window)
                         && cx.call.is_some_and(|call| {
                             !cx.state(|c: &Compacted| c.calls.contains(&call.get()))
-                        }) =>
-                {
-                    let error = format!(
-                        "the request is about {} tokens, past {} of the model's {window}",
-                        estimate(request),
-                        share.of(window)
-                    );
-                    Rewrite::Stop(Err(llm::Error::new(llm::Kind::ContextOverflow, error)))
+                        })
+                    {
+                        let error = format!(
+                            "the request is about {estimated} tokens, past {} of the model's {window}",
+                            share.of(window)
+                        );
+                        Rewrite::Stop(Err(llm::Error::new(llm::Kind::ContextOverflow, error)))
+                    } else {
+                        Rewrite::Pass
+                    }
                 }
                 _ => Rewrite::Pass,
             });
@@ -157,7 +164,7 @@ fn window(request: &llm::Request) -> Option<u32> {
 
 /// About how many tokens `request`'s messages are: a quarter of their
 /// text, a JSON output's as a few hundred, and media as a thousand.
-fn estimate(request: &llm::Request) -> u64 {
+fn estimate(messages: &llm::Messages) -> u64 {
     use llm::{Message, Output, UserPart};
     let parts = |parts: &[UserPart]| -> usize {
         (parts.iter())
@@ -167,7 +174,7 @@ fn estimate(request: &llm::Request) -> u64 {
             })
             .sum()
     };
-    let bytes: usize = (request.messages.iter())
+    let bytes: usize = (messages.iter())
         .map(|m| match m {
             Message::System(s) => s.text().len(),
             Message::User(u) => parts(&u.content),

@@ -68,7 +68,7 @@ fn round(provider: &Provider, model: &str, turn: usize) -> [Message; 2] {
 fn body(provider: &Provider, messages: &Messages) -> Vec<u8> {
     let request = Request {
         model: "claude-sonnet-4-5".into(),
-        messages: messages.clone(),
+        messages: messages.clone().into(),
         generation: crate::Generation {
             max_output_tokens: std::num::NonZeroU32::new(64),
             ..crate::Generation::default()
@@ -387,5 +387,312 @@ fn oversized_exchanges_keep_opaque_provider_items_native() {
                 assert!(!format!("{user:?}").contains("native-id"));
             }
         }
+    }
+}
+
+struct StoredMessages(std::path::PathBuf);
+
+impl StoredMessages {
+    fn new(messages: &Messages) -> Self {
+        let stored = Self(std::env::temp_dir().join(format!(
+            "a-resident-{}-{}",
+            std::process::id(),
+            mark()
+        )));
+        stored.write(messages);
+        stored
+    }
+
+    fn write(&self, messages: &Messages) {
+        std::fs::write(&self.0, crate::Json::encode(messages).unwrap().raw()).unwrap();
+    }
+
+    fn request(&self, resident: &Resident, tail: &Messages, reads: &Arc<AtomicU64>) -> Request {
+        let path = self.0.clone();
+        let reads = Arc::clone(reads);
+        Request {
+            model: "claude-sonnet-4-5".into(),
+            messages: Conversation::retained(resident.clone(), tail.clone(), move || {
+                reads.fetch_add(1, Ordering::Relaxed);
+                let json = std::fs::read_to_string(&path)
+                    .map_err(|error| Error::new(crate::Kind::Other, error.to_string()))?;
+                Messages::from_json(&json)
+                    .map_err(|error| Error::new(crate::Kind::Decode, error.to_string()))
+            }),
+            generation: crate::Generation {
+                max_output_tokens: std::num::NonZeroU32::new(64),
+                ..crate::Generation::default()
+            },
+            ..Request::default()
+        }
+    }
+}
+
+impl Drop for StoredMessages {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[test]
+fn settled_prefix_is_shared_without_reconstruction() {
+    for provider in providers() {
+        let mut canonical = Messages::from(vec![Message::system("terse"), Message::user("go")]);
+        let mut tail = canonical.clone();
+        let mut resident = Resident::default();
+        let stored = StoredMessages::new(&canonical);
+        let reads = Arc::new(AtomicU64::new(0));
+        let first = stored.request(&resident, &tail, &reads);
+        provider.request(&first.model, &first).unwrap();
+        drop(first);
+        folded();
+        resident.retain(&mut tail);
+        let mut previous = None;
+        for turn in 0..20 {
+            for message in round(&provider, "claude-sonnet-4-5", turn) {
+                canonical.push(message.clone());
+                tail.push(message);
+            }
+            stored.write(&canonical);
+            let mut request = stored.request(&resident, &tail, &reads);
+            let mut whole = Messages::from(canonical.to_vec());
+            for extra in 0..turn % 3 {
+                let message = Message::user(format!("request-local reminder {extra}"));
+                request.messages.push(message.clone());
+                whole.push(message);
+            }
+            let sent = provider
+                .request(&request.model, &request)
+                .unwrap()
+                .into_body();
+            assert_eq!(folded(), 2 + turn % 3, "{}", provider.protocol.key());
+            if let Some((payload, bytes)) = previous {
+                assert_eq!(crate::http::Payload::to_vec(&payload), bytes);
+            }
+            let expected = body(&provider, &whole);
+            folded();
+            assert_eq!(sent.to_vec(), expected, "{}", provider.protocol.key());
+            previous = Some((sent, expected));
+            drop(request);
+            resident.retain(&mut tail);
+            assert_eq!(tail.len(), 0);
+        }
+        assert_eq!(reads.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[test]
+fn settled_canonical_payloads_are_released() {
+    for provider in providers() {
+        let data: Arc<[u8]> = vec![7; 5 * 1024 * 1024].into();
+        let weak = Arc::downgrade(&data);
+        let canonical = Messages::from(vec![
+            Message::User(crate::User {
+                content: vec![crate::UserPart::Media(crate::Media {
+                    media_type: "image/png".into(),
+                    source: crate::Source::Bytes { data },
+                    meta: crate::Meta::new(),
+                })],
+            }),
+            Message::assistant("seen"),
+            Message::user("continue"),
+        ]);
+        let mut tail = canonical.clone();
+        let mut resident = Resident::default();
+        let stored = StoredMessages::new(&canonical);
+        let request = stored.request(&resident, &tail, &Arc::new(AtomicU64::new(0)));
+        let prepared = crate::prepare_request(&provider, &request);
+        drop(request);
+        drop(canonical);
+        resident.retain(&mut tail);
+        assert!(
+            weak.upgrade().is_none(),
+            "{} retains canonical payload",
+            provider.protocol.key()
+        );
+        assert_eq!(tail.len(), 0);
+        std::hint::black_box(prepared.origin());
+    }
+}
+
+#[test]
+fn mutable_results_and_target_changes_match_canonical_replay() {
+    for mut provider in providers() {
+        let mut canonical = Messages::from(vec![Message::system("terse"), Message::user("go")]);
+        for message in round(&provider, "claude-sonnet-4-5", 0) {
+            canonical.push(message);
+        }
+        let mut tail = canonical.clone();
+        let mut resident = Resident::default();
+        let stored = StoredMessages::new(&canonical);
+        let reads = Arc::new(AtomicU64::new(0));
+        let request = stored.request(&resident, &tail, &reads);
+        provider.request(&request.model, &request).unwrap();
+        drop(request);
+        resident.retain(&mut tail);
+        for message in round(&provider, "claude-sonnet-4-5", 1) {
+            canonical.push(message.clone());
+            tail.push(message);
+        }
+        for messages in [&mut canonical, &mut tail] {
+            let Some(Message::Tool(tool)) = messages.last_mut() else {
+                panic!("tool tail")
+            };
+            tool.results[0].output = Output::Text("late output".into());
+        }
+        stored.write(&canonical);
+        for changed in [false, true] {
+            if changed {
+                provider.id = "another-provider".into();
+            }
+            let mut request = stored.request(&resident, &tail, &reads);
+            request
+                .messages
+                .push(Message::user("request-local reminder"));
+            let sent = provider
+                .request(&request.model, &request)
+                .unwrap()
+                .into_body()
+                .to_vec();
+            let mut whole = Messages::from(canonical.to_vec());
+            whole.push(Message::user("request-local reminder"));
+            assert_eq!(sent, body(&provider, &whole), "{}", provider.protocol.key());
+        }
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[test]
+fn fitting_an_encoded_prefix_changes_only_the_request() {
+    for provider in providers() {
+        let canonical = Messages::from(vec![
+            Message::User(crate::User {
+                content: vec![crate::UserPart::Media(crate::Media {
+                    media_type: "image/png".into(),
+                    source: crate::Source::Data {
+                        data: "AA==".into(),
+                    },
+                    meta: crate::Meta::new(),
+                })],
+            }),
+            Message::assistant("seen"),
+            Message::user("continue"),
+        ]);
+        let mut tail = canonical.clone();
+        let mut resident = Resident::default();
+        let stored = StoredMessages::new(&canonical);
+        let reads = Arc::new(AtomicU64::new(0));
+        let request = stored.request(&resident, &tail, &reads);
+        provider.request(&request.model, &request).unwrap();
+        drop(request);
+        resident.retain(&mut tail);
+        let request = stored.request(&resident, &tail, &reads);
+        assert_eq!(request.messages.images(), 1);
+        let target = Target {
+            provider: &provider,
+            model: &request.model,
+        };
+        let limits = crate::fit::Limits {
+            images: 0,
+            bytes: 4096,
+        };
+        let (_, fitted) = crate::fit::fit(&request, limits, |input| {
+            provider.protocol.encode(&target, input)
+        })
+        .unwrap();
+        let whole = Request {
+            messages: canonical.clone().into(),
+            ..request.clone()
+        };
+        let (_, expected) = crate::fit::fit(&whole, limits, |input| {
+            provider.protocol.encode(&target, input)
+        })
+        .unwrap();
+        assert_eq!(
+            fitted.to_vec(),
+            expected.to_vec(),
+            "{}",
+            provider.protocol.key()
+        );
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+        assert_eq!(request.messages.images(), 1);
+    }
+}
+
+#[test]
+fn diverging_sources_never_reuse_each_others_prefix() {
+    for provider in providers() {
+        let canonical = Messages::from(vec![
+            Message::system("terse"),
+            Message::user("shared"),
+            Message::assistant("base"),
+            Message::user("last"),
+        ]);
+        let stored = StoredMessages::new(&canonical);
+        let mut tail = canonical.clone();
+        let mut resident = Resident::default();
+        let reads = Arc::new(AtomicU64::new(0));
+        let request = stored.request(&resident, &tail, &reads);
+        provider.request(&request.model, &request).unwrap();
+        drop(request);
+        resident.retain(&mut tail);
+        let mut left = (resident.clone(), tail.clone(), canonical.clone());
+        let mut right = (resident, tail, canonical);
+        for (branch, text) in [(&mut left, "left branch"), (&mut right, "right branch")] {
+            for message in [Message::assistant(text), Message::user("next")] {
+                branch.1.push(message.clone());
+                branch.2.push(message);
+            }
+            stored.write(&branch.2);
+            let request = stored.request(&branch.0, &branch.1, &reads);
+            provider.request(&request.model, &request).unwrap();
+            drop(request);
+            branch.0.retain(&mut branch.1);
+        }
+        stored.write(&left.2);
+        let request = stored.request(&left.0, &left.1, &reads);
+        let sent = provider
+            .request(&request.model, &request)
+            .unwrap()
+            .into_body()
+            .to_vec();
+        assert_eq!(
+            sent,
+            body(&provider, &left.2),
+            "{}",
+            provider.protocol.key()
+        );
+    }
+}
+
+#[test]
+fn canonical_exports_cannot_cache_encoded_bytes_in_the_resident_tail() {
+    for provider in providers() {
+        let tail = Messages::from(vec![
+            Message::user("input"),
+            Message::assistant("reply"),
+            Message::user("continue"),
+        ]);
+        let stored = StoredMessages::new(&tail);
+        let request = stored.request(&Resident::default(), &tail, &Arc::new(AtomicU64::new(0)));
+        let fragment = {
+            let canonical = Request {
+                messages: request.messages.canonical().unwrap().into_owned().into(),
+                ..request.clone()
+            };
+            let target = Target {
+                provider: &provider,
+                model: &canonical.model,
+            };
+            let encoded = provider.protocol.encode(&target, &canonical).unwrap();
+            Arc::downgrade(&encoded.history.as_ref().unwrap().settled[0])
+        };
+        drop(request);
+        assert!(
+            fragment.upgrade().is_none(),
+            "{} cached through a canonical export",
+            provider.protocol.key()
+        );
+        assert_eq!(tail.len(), 3);
     }
 }

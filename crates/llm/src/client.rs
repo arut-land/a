@@ -20,31 +20,59 @@ use crate::protocol::{Decoder, Flow, Provider, Target};
 use crate::spec::{Event, Origin, Request, Response};
 use crate::sse::{DecodeLimits, SseFramer};
 
-/// Streams the reply to `request` from `provider`.
-pub fn stream(http: &dyn Http, provider: &Provider, request: &Request) -> Events {
+/// Wire bytes and decoder state, without ownership of canonical history.
+/// Preparation does no network I/O; dispatch consumes the prepared request.
+pub struct Prepared {
+    protocol: Arc<dyn crate::protocol::Protocol>,
+    origin: Origin,
+    outgoing: Result<(http::Request<crate::http::Payload>, Box<dyn Decoder>), Error>,
+}
+
+/// Encodes and fits a request before its caller authorizes network dispatch.
+pub fn prepare_request(provider: &Provider, request: &Request) -> Prepared {
     let target = Target {
         provider,
         model: &request.model,
     };
-    let mut started = None;
-    let state = match provider.request(&request.model, request) {
-        Ok(http_request) => {
-            let decoder = provider.protocol.decoder(&target, request);
-            started = Some(Instant::now());
-            State::Sending {
-                reply: http.send(http_request),
-                decoder,
-            }
-        }
-        Err(error) => State::Failed(Some(error)),
-    };
-    Events {
-        state,
-        started,
+    Prepared {
         protocol: Arc::clone(&provider.protocol),
-        reply: Accumulator::new(),
-        read: None,
+        origin: origin(provider, &request.model),
+        outgoing: provider
+            .request(&request.model, request)
+            .map(|http_request| (http_request, provider.protocol.decoder(&target, request))),
     }
+}
+
+impl Prepared {
+    pub fn origin(&self) -> &Origin {
+        &self.origin
+    }
+
+    pub fn start(self, http: &dyn Http) -> Events {
+        let mut started = None;
+        let state = match self.outgoing {
+            Ok((request, decoder)) => {
+                started = Some(Instant::now());
+                State::Sending {
+                    reply: http.send(request),
+                    decoder,
+                }
+            }
+            Err(error) => State::Failed(Some(error)),
+        };
+        Events {
+            state,
+            started,
+            protocol: self.protocol,
+            reply: Accumulator::new(),
+            read: None,
+        }
+    }
+}
+
+/// Streams the reply to `request` from `provider`.
+pub fn stream(http: &dyn Http, provider: &Provider, request: &Request) -> Events {
+    prepare_request(provider, request).start(http)
 }
 
 /// The finished reply to `request`.

@@ -59,7 +59,7 @@ pub fn fit(
     limits: Limits,
     mut encode: impl FnMut(&Request) -> Result<Encoded, Error>,
 ) -> Result<(Encoded, Payload), Error> {
-    let mut remaining: usize = request.messages.iter().map(images).sum();
+    let mut remaining = request.messages.images();
     let mut fitted = Cow::Borrowed(request);
     let mut at = 0;
     loop {
@@ -70,16 +70,15 @@ pub fn fit(
                 return Ok((encoded, payload));
             }
         }
-        while images(&fitted.messages[at]) == 0 {
+        let messages = fitted.to_mut().messages.canonical_mut()?;
+        while images(&messages[at]) == 0 {
             at += 1;
         }
         let remove = remaining
             .saturating_sub(limits.images)
             .max(1)
-            .min(images(&fitted.messages[at]));
-        let message = fitted
-            .to_mut()
-            .messages
+            .min(images(&messages[at]));
+        let message = messages
             .get_mut(at)
             .expect("the oldest remaining image has a message");
         leave_out(message, remove - 1);

@@ -441,7 +441,7 @@ fn encode_long_transcript() {
         // Conversations no request encoded before.
         let mut fresh: Vec<Request> = (0..=20)
             .map(|_| Request {
-                messages: request.messages.to_vec().into(),
+                messages: request.messages.canonical().unwrap().to_vec().into(),
                 ..request.clone()
             })
             .collect();
@@ -490,7 +490,9 @@ fn read_logged_reply() {
         provider: "anthropic".into(),
         model: "claude".into(),
     };
-    let Message::Assistant(message) = transcript(1, 0, &origin).messages[2].clone() else {
+    let Message::Assistant(message) =
+        transcript(1, 0, &origin).messages.canonical().unwrap()[2].clone()
+    else {
         unreachable!("the assistant turn");
     };
     let mut content = Vec::new();
@@ -618,7 +620,7 @@ fn transcript_memory() {
     };
     let request = |messages: llm::Messages| Request {
         model: "gpt-6-luna".into(),
-        messages,
+        messages: messages.into(),
         ..Request::default()
     };
     let mut fresh: Vec<llm::Messages> = (0..=5).map(|_| messages.to_vec().into()).collect();

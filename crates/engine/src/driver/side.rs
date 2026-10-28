@@ -402,7 +402,7 @@ async fn run_side_once(
         return Replied::Failed(error.clone());
     }
     let mut request = llm::Request {
-        messages,
+        messages: messages.into(),
         model: model.as_ref().map_or_default(Model::id),
         ..llm::Request::default()
     };
@@ -428,14 +428,34 @@ async fn run_side_once(
                 (Some(provider), _) => {
                     let _ = super::services::attempt_clock();
                     observed.started = Some(session.shared.rt.now());
-                    let response = provider.reply(side, &request.messages).await;
+                    let response = match request.messages.canonical() {
+                        Ok(messages) => provider.reply(side, &messages).await,
+                        Err(error) => Err(error),
+                    };
                     observed.usage = match &response {
                         Ok(response) => llm::Usage::encode_counts(&response.usage.counts()).ok(),
                         Err(error) => error.usage_json(),
                     };
                     replied(response)
                 }
-                (None, Ok(model)) => reply(model, &request, cancel, &mut quiet, observed).await,
+                (None, Ok(model)) => {
+                    let preparing = model.clone();
+                    let request = request.clone();
+                    match rt::try_unblock_with(
+                        &*session.shared.rt,
+                        rt::BlockingClass::Cpu,
+                        rt::STORAGE_BYTES,
+                        move || preparing.prepare(&request),
+                    )
+                    .await
+                    {
+                        Ok(prepared) => reply(model, prepared, cancel, &mut quiet, observed).await,
+                        Err(error) => (
+                            Replied::Failed(llm::Error::new(llm::Kind::Other, error.to_string())),
+                            None,
+                        ),
+                    }
+                }
                 (None, Err(error)) => (Replied::Failed(error.clone()), None),
             }
         })
@@ -748,7 +768,7 @@ impl Actor {
         let history = match turn.context {
             ext::Context::OwnerPrefix => llm::Messages::default(),
             ext::Context::Fresh | ext::Context::Owner => self
-                .conversation(CallId(seq))
+                .canonical_conversation(CallId(seq))
                 .await
                 .map_err(|e| e.to_string())?,
         };
