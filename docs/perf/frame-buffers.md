@@ -118,3 +118,21 @@ Native guidance: [Apple madvise](https://developer.apple.com/library/archive/doc
 [Linux THP](https://docs.kernel.org/admin-guide/mm/transhuge.html),
 [Windows VirtualFree](https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualfree),
 [Windows discard](https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-discardvirtualmemory).
+
+## Final hosted primitive, ten 5 MiB bursts
+
+Seven interleaved samples per native host. Times are median [min–max] ms.
+
+| Host | Vec | known native length | unknown hybrid length | known RSS delta KiB | known private delta KiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Linux ARM64 | 25.12 [24.93–25.52] | 6.49 [6.37–6.86] | 23.33 [23.18–23.48] | 64.00 [64.00–64.00] | n/a |
+| Linux X64 | 14.28 [14.13–15.24] | 8.57 [8.23–8.66] | 13.65 [13.27–14.15] | 68.00 [68.00–68.00] | n/a |
+| Windows ARM64 | 26.02 [25.86–26.24] | 9.75 [9.56–12.04] | 15.40 [15.08–27.97] | 32.00 [32.00–32.00] | 0.00 [0.00–0.00] |
+| Windows X64 | 13.65 [13.63–13.80] | 9.36 [9.31–9.46] | 11.80 [11.64–11.91] | 40.00 [40.00–44.00] | 0.00 [0.00–4.00] |
+
+Native clippy and release/reservation invariants passed on all four hosts.
+The raw 1M x 64-byte guard loop is slower than Vec alone, despite staying
+on the heap path; the full report records those results too. M3 application
+small-frame streaming holds/improves throughput. Cross-platform application
+throughput and the outstanding client framing regression still prevent
+universal performance acceptance.
