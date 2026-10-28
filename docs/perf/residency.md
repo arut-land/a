@@ -23,7 +23,7 @@ resident and observed; the used-stage turn has finished, rather than holding
 CPU busy artificially. Inputs are sent to all attached sessions before replies
 are consumed. The slow follower stops reading after initial synchronization,
 then drains through the last exact reply and idle acknowledgement before
-closing. A slow or disconnected follower is a failed sample, not successful
+closing. Its entire accumulated entry tail must match the durable log exactly. A slow or disconnected follower is a failed sample, not successful
 work with discarded history. This fixture covers finite reader lag, not an
 indefinitely stalled consumer.
 

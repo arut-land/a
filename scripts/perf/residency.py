@@ -33,6 +33,15 @@ fn replay_is_complete(expected: &[Entry], actual: &[Entry], seq: u64) {
     assert_eq!(actual, expected, "reopen must preserve every durable entry");
     assert_eq!(seq, expected.last().map_or(0, |e| e.seq.get()));
 }
+fn durable(home: &sys::Home, id: SessionId) -> Vec<Entry> {
+    let text = std::fs::read_to_string(home.sessions_dir().join(id.to_string()).join("log.jsonl"))
+        .unwrap();
+    assert!(text.ends_with('\n'));
+    text.lines()
+        .skip(1)
+        .map(|line| Entry::from_json(line.as_bytes()).unwrap())
+        .collect()
+}
 fn main() {
     let home = sys::Home::from(std::path::PathBuf::from(
         std::env::var_os("A_HOME").unwrap(),
@@ -90,17 +99,9 @@ fn main() {
         };
         let ms = started.elapsed().as_secs_f64() * 1000.;
         let id = id.unwrap();
-        let text =
-            std::fs::read_to_string(home.sessions_dir().join(id.to_string()).join("log.jsonl"))
-                .unwrap();
-        assert!(text.ends_with('\n'));
-        let expected: Vec<_> = text
-            .lines()
-            .skip(1)
-            .map(|line| Entry::from_json(line.as_bytes()).unwrap())
-            .collect();
+        let expected = durable(&home, id);
         replay_is_complete(&expected, &entries, seq);
-        (stream, reader, id, ms, entries.len())
+        (stream, reader, id, ms, entries.len(), seq)
     };
     let mut held = Vec::new();
     let mut slow = None;
@@ -119,15 +120,15 @@ fn main() {
                 serde_json::to_value(sessions).unwrap()
             }
             "new" => {
-                let (_, _, id, _, _) = attach(Target::New);
+                let (_, _, id, _, _, _) = attach(Target::New);
                 serde_json::json!(id)
             }
             "attach" | "slow" => {
                 let id: SessionId = serde_json::from_value(value["id"].clone()).unwrap();
-                let (stream, reader, actual, ms, entries) = attach(Target::Id(id));
+                let (stream, reader, actual, ms, entries, seq) = attach(Target::Id(id));
                 assert_eq!(actual, id);
                 if value["op"] == "slow" {
-                    slow = Some((stream, reader));
+                    slow = Some((stream, reader, id, seq));
                 } else {
                     held.push((stream, reader));
                 }
@@ -183,7 +184,8 @@ fn main() {
                 serde_json::Value::Null
             }
             "drain" => {
-                let (mut stream, mut reader) = slow.take().unwrap();
+                let (mut stream, mut reader, id, since) = slow.take().unwrap();
+                let mut entries = Vec::new();
                 let mut answered = false;
                 loop {
                     match protocol::read_frame::<DaemonMsg>(&mut reader)
@@ -191,9 +193,10 @@ fn main() {
                         .unwrap()
                     {
                         DaemonMsg::Entry(entry) => {
-                            if let protocol::Body::Assistant { text } = entry.body {
-                                answered |= text == last;
+                            if let protocol::Body::Assistant { text } = &entry.body {
+                                answered |= text == &last;
                             }
+                            entries.push(entry);
                         }
                         DaemonMsg::Activity {
                             activity: Activity::Idle,
@@ -203,6 +206,15 @@ fn main() {
                         _ => {}
                     }
                 }
+                let expected: Vec<_> = durable(&home, id)
+                    .into_iter()
+                    .filter(|entry| entry.seq.get() > since)
+                    .collect();
+                assert!(
+                    !expected.is_empty(),
+                    "slow follower must have work to drain"
+                );
+                replay_is_complete(&expected, &entries, entries.last().unwrap().seq.get());
                 protocol::write_frame(&mut stream, &ClientMsg::Detach).unwrap();
                 while protocol::read_frame::<DaemonMsg>(&mut reader)
                     .unwrap()
