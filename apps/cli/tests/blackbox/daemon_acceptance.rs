@@ -1,6 +1,7 @@
 //! Daemon promises exercised through the shipped command interface on every host.
 
 use crate::support::{Isolated, TestProcess, deadline};
+use protocol::{Body, ClientMsg, DaemonMsg, Target};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::TcpListener;
@@ -176,32 +177,37 @@ fn an_upgrade_hands_running_work_to_the_newer_build() {
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
     let gate = format!("exec 3<>/dev/tcp/127.0.0.1/{port}; printf ready >&3; read -r reply <&3");
-    let job = format!("$ echo now; ({gate}; echo late) &");
-    let ran = TestProcess::spawn(&mut env.command_at(&older, &["--mode", "auto", "-p", &job]))
-        .collect(deadline())
-        .unwrap();
+    let launching = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    launching.set_nonblocking(true).unwrap();
+    let launch_port = launching.local_addr().unwrap().port();
+    // Hold the launcher past detachment too: its outcome must not be
+    // mistaken for the separate call's outcome on a slow runner.
+    let job = format!(
+        "$ echo now; ({gate}; echo late) & exec 4<>/dev/tcp/127.0.0.1/{launch_port}; printf ready >&4; read -r reply <&4"
+    );
+    let launcher = TestProcess::spawn(&mut env.command_at(&older, &["--mode", "auto", "-p", &job]));
+    let mut job_release = child_at_gate(&listener);
+    let mut launch_release = child_at_gate(&launching);
+    let job_session = env.logs().into_keys().next().unwrap();
+    let detached = |body: &Body| matches!(body, Body::Detached { .. });
+    wait_for_session_entry(&env, &job_session, deadline(), detached);
+    launch_release.write_all(b"done\n").unwrap();
+    let ran = launcher.collect(deadline()).unwrap();
     assert!(
         ran.status.success(),
         "{}",
         String::from_utf8_lossy(&ran.stderr)
     );
-    let mut job_release = child_at_gate(&listener);
     // Its client waits for the call's outcome, through the upgrade.
     let call = format!("$ echo start; {gate}; echo end; exit 7");
     let waiting = TestProcess::spawn(&mut env.command_at(&older, &["--mode", "auto", "-p", &call]));
     let mut call_release = child_at_gate(&listener);
-    let detached = Instant::now() + Duration::from_secs(30);
-    while !env
+    let call_session = env
         .logs()
-        .values()
-        .any(|log| String::from_utf8_lossy(log).contains(r#""kind":"detached""#))
-    {
-        assert!(
-            Instant::now() < detached,
-            "the call never went on in the background"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
+        .into_keys()
+        .find(|id| *id != job_session)
+        .unwrap();
+    wait_for_session_entry(&env, &call_session, deadline(), detached);
     let older_pid = env.pid();
     let older_build = env.home.runtime().current().unwrap();
     env.run(&["ls"]);
@@ -217,28 +223,30 @@ fn an_upgrade_hands_running_work_to_the_newer_build() {
         );
         env.run(&["ls"]);
     }
-    assert_eq!(
-        env.pid() == older_pid,
-        cfg!(unix),
-        "where the newer build serves"
-    );
-    let logged = |text: &str| {
-        env.logs()
-            .values()
-            .any(|log| String::from_utf8_lossy(log).contains(text))
-    };
-    assert!(!logged(r#""purpose":"job""#), "the gated job ended early");
+    assert_eq!(env.pid() == older_pid, cfg!(unix), "upgrade process");
+    let logged =
+        |session: &str, text: &str| String::from_utf8_lossy(&env.logs()[session]).contains(text);
     assert!(
-        !logged(r#""purpose":"detached""#),
+        !logged(&job_session, r#""purpose":"job""#),
+        "the gated job ended early"
+    );
+    assert!(
+        !logged(&call_session, r#""purpose":"detached""#),
         "the gated call ended early"
     );
     job_release.write_all(b"done\n").unwrap();
     call_release.write_all(b"done\n").unwrap();
-    let ended = Instant::now() + Duration::from_secs(30);
-    while !(logged(r#""purpose":"job""#) && logged(r#""purpose":"detached""#)) {
-        assert!(Instant::now() < ended, "the work's ends never came");
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    let ended = deadline();
+    wait_for_session_entry(&env, &job_session, ended, |body| {
+        matches!(body,
+            Body::Enqueue { envelope } if envelope.id().purpose == protocol::EnvelopeId::JOB
+        )
+    });
+    wait_for_session_entry(&env, &call_session, ended, |body| {
+        matches!(body,
+            Body::Enqueue { envelope } if envelope.id().purpose == protocol::EnvelopeId::DETACHED
+        )
+    });
     let waited = waiting.collect(deadline()).unwrap();
     let said = String::from_utf8_lossy(&waited.stdout);
     assert!(said.contains(r#""output":"start\nend\n""#), "{said}");
@@ -259,6 +267,54 @@ fn an_upgrade_hands_running_work_to_the_newer_build() {
         committed,
         "the successor's outcomes were not durable"
     );
+}
+
+fn wait_for_session_entry(
+    env: &Isolated,
+    session: &str,
+    until: Instant,
+    ready: impl Fn(&Body) -> bool,
+) {
+    let mut stream = env.home.endpoint().connect().unwrap();
+    stream
+        .set_read_timeout(Some(until - Instant::now()))
+        .unwrap();
+    ClientMsg::Hello {
+        proto: protocol::PROTO,
+        build: env.home.runtime().current().unwrap(),
+        caps: protocol::Caps::NONE,
+        client: None,
+        machine: None,
+    }
+    .write_frame(&mut stream)
+    .unwrap();
+    assert!(matches!(
+        protocol::read_frame::<DaemonMsg>(&mut stream).unwrap(),
+        Some(DaemonMsg::Welcome { .. })
+    ));
+    ClientMsg::Attach {
+        target: Target::Id(serde_json::from_value(session.into()).unwrap()),
+        workspace: None,
+        since: 0,
+        env: None,
+        decl: protocol::ClientDecl::default(),
+    }
+    .write_frame(&mut stream)
+    .unwrap();
+    loop {
+        assert!(
+            Instant::now() < until,
+            "session {session} never sent the expected entry"
+        );
+        stream
+            .set_read_timeout(Some(until - Instant::now()))
+            .unwrap();
+        match protocol::read_frame::<DaemonMsg>(&mut stream).unwrap() {
+            Some(DaemonMsg::Entry(entry)) if ready(&entry.body) => return,
+            Some(_) => {}
+            None => panic!("session {session} stopped before the expected entry"),
+        }
+    }
 }
 
 fn child_at_gate(listener: &TcpListener) -> std::net::TcpStream {
