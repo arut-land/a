@@ -5,6 +5,47 @@ use crate::store::{Faulty, SyncFailure};
 use super::*;
 
 #[test]
+fn shutdown_consumes_a_prefetched_flush_completion() {
+    let mut h = ManualSession::new();
+    h.complete();
+    h.request("rest");
+    *lock(&h.runtime.tasks) = Some(Vec::new());
+    *lock(&h.runtime.flushes) = Some(Vec::new());
+    let (reply, _ack) = oneshot::channel();
+    h.session.send(Msg::Request {
+        request: Request::Input {
+            segments: "last input".into(),
+            mode: Mode::Queue,
+            force: false,
+        },
+        origin: None,
+        reply,
+    });
+    h.poll();
+    h.session.stop();
+    let flushes = lock(&h.runtime.flushes).take().unwrap();
+    assert!(
+        !flushes.is_empty(),
+        "the last input must await a real flush"
+    );
+    for flush in flushes {
+        flush();
+    }
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let tasks = lock(&h.runtime.tasks).take().unwrap();
+    for mut task in tasks {
+        let _ = task.as_mut().poll(&mut cx);
+    }
+    let ended = h.actor.as_mut().poll(&mut cx).is_ready();
+    // A failed assertion must not hang TestingLive's shutdown guard too.
+    h.session.ended.set();
+    assert!(
+        ended,
+        "shutdown lost the flush completion prefetched after stop"
+    );
+}
+
+#[test]
 fn a_failed_enqueue_releases_transport_for_retry() {
     for failure in [SyncFailure::Discard, SyncFailure::Retain] {
         let mut harness = ManualSession::new();
@@ -193,6 +234,8 @@ fn logging_flush_deadline_also_bounds_owned_runtime_shutdown() {
     );
 }
 
+type FlushWork = Box<dyn FnOnce() + Send>;
+
 /// The actor runs only when polled by the test; I/O completes inline and
 /// deferred timers fire only when released, so queued messages define exact bursts.
 struct Manual {
@@ -200,12 +243,18 @@ struct Manual {
     captured: AtomicBool,
     actor: Mutex<Option<rt::BoxFuture<'static, ()>>>,
     timers: Mutex<Vec<oneshot::Sender<()>>>,
+    tasks: Mutex<Option<Vec<rt::BoxFuture<'static, ()>>>>,
+    flushes: Mutex<Option<Vec<FlushWork>>>,
 }
 
 impl rt::Runtime for Manual {
     fn spawn(&self, task: rt::BoxFuture<'static, ()>) {
         if self.captured.swap(true, Ordering::SeqCst) {
-            self.background.spawn(task);
+            if let Some(tasks) = lock(&self.tasks).as_mut() {
+                tasks.push(task);
+            } else {
+                self.background.spawn(task);
+            }
         } else {
             *lock(&self.actor) = Some(task);
         }
@@ -226,7 +275,11 @@ impl rt::Runtime for Manual {
         &self,
         work: Box<dyn FnOnce() + Send>,
     ) -> rt::BoxFuture<'static, io::Result<()>> {
-        work();
+        if let Some(flushes) = lock(&self.flushes).as_mut() {
+            flushes.push(work);
+        } else {
+            work();
+        }
         Box::pin(async { Ok(()) })
     }
 
@@ -309,6 +362,8 @@ impl ManualSession {
             captured: AtomicBool::new(false),
             actor: Mutex::default(),
             timers: Mutex::default(),
+            tasks: Mutex::default(),
+            flushes: Mutex::default(),
         });
         fixture = fixture.configure(|shared| shared.rt = Arc::clone(&manual) as _);
         let session = fixture.create();
@@ -1243,6 +1298,8 @@ fn final_sync_publishes_activity_after_its_entries() {
         captured: AtomicBool::new(false),
         actor: Mutex::default(),
         timers: Mutex::default(),
+        tasks: Mutex::default(),
+        flushes: Mutex::default(),
     });
     fixture = fixture.configure(|shared| shared.rt = Arc::clone(&manual) as _);
     let session = fixture.create();
