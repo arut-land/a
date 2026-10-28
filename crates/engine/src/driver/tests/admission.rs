@@ -92,7 +92,14 @@ fn turn_flushes_are_input_unsafe_work_and_final_publication() {
 }
 
 fn pipeline(registry: Registry) -> (Fixture, Arc<Faulty>, Arc<Script>) {
-    let faulty = Arc::new(Faulty::new(Arc::new(Memory::default())));
+    pipeline_on(Arc::new(Memory::default()), registry)
+}
+
+fn pipeline_on(
+    store: Arc<dyn LogStore>,
+    registry: Registry,
+) -> (Fixture, Arc<Faulty>, Arc<Script>) {
+    let faulty = Arc::new(Faulty::new(store));
     let script = Script::new(&cassette(
         "openai/streaming_grammar/tool_then_followup_text.yaml",
     ));
@@ -1344,5 +1351,282 @@ impl ext::RunningProcess for StaleProcess {
     }
     fn ended(&self) -> BoxFuture<'_, ()> {
         Box::pin(std::future::pending())
+    }
+}
+
+#[path = "../../../../kernel/tests/schedules.rs"]
+mod schedules;
+
+fn native_schedule(trace: &schedules::trace::Trace) -> bool {
+    use schedules::trace::Decision;
+
+    let at = |decision| trace.0.iter().position(|step| *step == decision);
+    let (Some(cancel), Some(complete)) = (at(Decision::Cancel), at(Decision::Complete)) else {
+        return false;
+    };
+    let early = trace
+        .0
+        .iter()
+        .position(|step| matches!(step, Decision::Flush { epoch: 0, .. }));
+    let late = trace
+        .0
+        .iter()
+        .position(|step| matches!(step, Decision::Flush { epoch: 1, .. }));
+    trace.validate().is_ok()
+        && early
+            .zip(late)
+            .is_some_and(|(early, late)| cancel < complete && complete < early && late < early)
+}
+
+fn replay_held_epochs(trace: &schedules::trace::Trace) -> schedules::trace::Checked<Vec<Entry>> {
+    use schedules::trace::{Decision, Failure, Result, require};
+
+    trace.validate().map_err(Failure::Invalid)?;
+    if !native_schedule(trace) {
+        return Err(Failure::Invalid("unsupported native schedule".into()));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (started, starts) = channel::unbounded();
+    let (fixture, faulty, script) = pipeline_on(
+        Arc::new(crate::store::Jsonl::open(dir.path()).unwrap()),
+        Registry::default()
+            .with(&HeldHarbor(Arc::new(started)))
+            .unwrap(),
+    );
+    let session = fixture.create();
+    settle(&session);
+    let before = session.frames.seq();
+    let fence = session.session.fence.load(Ordering::SeqCst);
+    let first = faulty.hold_next_flush();
+    let second = faulty.hold_next_flush();
+    let mut accepted = Some(enqueue(&session, "hello"));
+    first.started();
+    let (context, release) = started_harbor(&starts);
+    require(
+        session.frames.seq() == before,
+        "safe work precedes publication",
+    )?;
+    let mut release = Some(release);
+    let mut interrupted = None;
+    let mut batches = Vec::new();
+    let mut failed = false;
+    for step in &trace.0[1..] {
+        match *step {
+            Decision::Progress => context.progress("ordered"),
+            Decision::Batch => {
+                session.send(Msg::Sync);
+                batches.push(positions(&session).0);
+            }
+            Decision::Cancel => {
+                let (reply, ack) = oneshot::channel();
+                session.send(Msg::Request {
+                    request: Request::Interrupt,
+                    origin: None,
+                    reply,
+                });
+                let _ = positions(&session);
+                require(
+                    context.cancel.is_set(),
+                    "interrupt must revoke the tool context",
+                )?;
+                interrupted = Some(ack);
+            }
+            Decision::Complete => {
+                release.take().unwrap().send("finished".into());
+                session.wait("scripted completion", PATIENCE, || !session.has_work());
+            }
+            Decision::Flush {
+                epoch: 1,
+                result: Result::Success,
+            } => {
+                deliver_later_epoch(&session, fence, batches[1], before)?;
+            }
+            Decision::Flush { epoch: 0, result } => {
+                failed = result == Result::Failure;
+                if failed {
+                    faulty.fail_next_sync(SyncFailure::Discard);
+                }
+                first.release();
+                // The real flusher serializes native syscalls; notification delivery
+                // above is independently scripted, as in the existing epoch test.
+                second.release();
+                let answer = rt::block_on(accepted.take().unwrap()).unwrap();
+                require(
+                    answer.is_err() == failed,
+                    "input acknowledgment must follow its flush result",
+                )?;
+            }
+            _ => {
+                return Err(Failure::Invalid(format!(
+                    "unsupported native decision: {step:?}"
+                )));
+            }
+        }
+    }
+    let answer = rt::block_on(interrupted.unwrap()).unwrap();
+    require(
+        answer.is_err() == failed,
+        "interrupt acknowledgment must follow its flush result",
+    )?;
+    require(
+        lock(&script.sent).len() == 1,
+        "interrupt forbids a follow-up",
+    )?;
+    durable_trace(
+        &session,
+        &faulty,
+        before,
+        if failed {
+            Result::Failure
+        } else {
+            Result::Success
+        },
+    )
+}
+
+fn deliver_later_epoch(
+    session: &Live,
+    fence: u64,
+    through: u64,
+    before: u64,
+) -> schedules::trace::Checked<()> {
+    use schedules::trace::require;
+
+    session.send(Msg::Flushed {
+        fence,
+        through,
+        result: Ok(()),
+    });
+    require(
+        positions(session).1 == before,
+        "later delivery skipped the unresolved epoch",
+    )?;
+    require(
+        session.frames.seq() == before,
+        "publication skipped the unresolved epoch",
+    )
+}
+
+fn durable_trace(
+    session: &Live,
+    faulty: &Faulty,
+    before: u64,
+    result: schedules::trace::Result,
+) -> schedules::trace::Checked<Vec<Entry>> {
+    use schedules::trace::require;
+
+    settle(session);
+    let log = log_of(session);
+    if result == schedules::trace::Result::Failure {
+        require(
+            session.frames.seq() == before,
+            "failed epoch published its suffix",
+        )?;
+    } else {
+        let outcomes: Vec<_> = log
+            .iter()
+            .filter_map(|e| match &e.body {
+                Body::ToolResult { outcome, .. } => Some(outcome),
+                _ => None,
+            })
+            .collect();
+        require(
+            outcomes
+                == [&Outcome::Done {
+                    output: Json::encode(&"finished").unwrap().into(),
+                }],
+            "successful epoch must preserve the one scripted outcome",
+        )?;
+    }
+    faulty.cut();
+    session.halt();
+    require(
+        log == faulty.entries(session.id).unwrap(),
+        "publication differs from the power-cut prefix",
+    )?;
+    Ok(log)
+}
+
+#[test]
+fn scripted_epoch_delivery_and_crash_cuts_preserve_native_admission() {
+    use schedules::trace::{Decision, Result, Trace};
+
+    let traces = match std::env::var("A_NATIVE_SCHEDULE_TRACE") {
+        Ok(text) => vec![text.parse::<Trace>().unwrap()],
+        Err(_) => [Result::Success, Result::Failure]
+            .into_iter()
+            .flat_map(|result| {
+                schedules::trace::held_epochs(result)
+                    .into_iter()
+                    .filter(|t| {
+                        let cancel = t.0.iter().position(|s| *s == Decision::Cancel).unwrap();
+                        let complete = t.0.iter().position(|s| *s == Decision::Complete).unwrap();
+                        let early =
+                            t.0.iter()
+                                .position(|s| matches!(s, Decision::Flush { epoch: 0, .. }))
+                                .unwrap();
+                        let batches = t.0.iter().filter(|s| **s == Decision::Batch).count();
+                        cancel < complete && complete < early && matches!(batches, 2 | 6)
+                    })
+            })
+            .collect(),
+    };
+    for trace in traces {
+        trace.validate().unwrap();
+        let selected_cut = trace.0.iter().find_map(|s| match s {
+            Decision::Crash { cut } => Some(*cut),
+            _ => None,
+        });
+        let trace = Trace(
+            trace
+                .0
+                .into_iter()
+                .filter(|s| !matches!(s, Decision::Crash { .. }))
+                .collect(),
+        );
+        eprintln!("native replay: A_NATIVE_SCHEDULE_TRACE='{trace}'");
+        let log = replay_held_epochs(&trace).unwrap_or_else(|error| {
+            let minimal = schedules::trace::shrink(trace.clone(), |candidate| {
+                native_schedule(candidate) && matches!(replay_held_epochs(candidate), Err(schedules::trace::Failure::Invariant(_)))
+            });
+            panic!("{error}\nreplay with A_NATIVE_SCHEDULE_TRACE='{minimal}' cargo test -p engine scripted_epoch_delivery -- --nocapture\noriginal: {trace}");
+        });
+        for cut in selected_cut.map_or(0..=log.len(), |cut| cut..=cut) {
+            assert!(cut <= log.len(), "invalid native crash cut: {cut}");
+            let mut crashed = trace.clone();
+            crashed.0.push(Decision::Crash { cut });
+            assert_eq!(crashed.to_string().parse::<Trace>().unwrap(), crashed);
+            eprintln!("native replay: A_NATIVE_SCHEDULE_TRACE='{crashed}'");
+            let dir = tempfile::tempdir().unwrap();
+            let fixture = Fixture::on(
+                Arc::new(crate::store::Jsonl::open(dir.path()).unwrap()),
+                ext::LOOP,
+                Registry::default().with(&Harbor).unwrap(),
+                openai(&Script::new(&[retry::text_reply()])),
+            );
+            let session = fixture.start(&log[..cut]);
+            let final_log = log_of(&session);
+            let registry = fixture.0.registry.get();
+            let (folded, plan) = Core::resume(
+                bind(&registry, &session.session),
+                &final_log,
+                &Load::default(),
+            );
+            assert!(folded.at_rest(), "native trace: {crashed}");
+            assert!(
+                plan.appends.is_empty() && plan.admitted.is_empty(),
+                "native trace: {crashed}: {plan:?}"
+            );
+            let mut settled = std::collections::BTreeSet::new();
+            for e in &final_log {
+                if let Body::ToolResult { call, .. } | Body::ModelResult { call, .. } = e.body {
+                    assert!(
+                        settled.insert(call),
+                        "duplicate result, native trace: {crashed}"
+                    );
+                }
+            }
+            session.halt();
+        }
     }
 }
