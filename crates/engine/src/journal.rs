@@ -93,10 +93,20 @@ impl Actor {
             .flat_map(|(entries, _)| entries.iter().cloned())
     }
 
-    pub(super) async fn drain_flushes(&mut self, mail: &channel::Receiver<Msg>) {
+    pub(super) async fn drain_flushes(
+        &mut self,
+        mail: &channel::Receiver<Msg>,
+        mut next: Option<Msg>,
+    ) {
         let _ = self.sync().await;
         while !self.journal.flushes.is_empty() {
-            let Some(msg) = mail.recv().await else { break };
+            // A log-reading message may already have ended the last burst.
+            let Some(msg) = (match next.take() {
+                Some(msg) => Some(msg),
+                None => mail.recv().await,
+            }) else {
+                break;
+            };
             if let Msg::Flushed {
                 fence,
                 through,

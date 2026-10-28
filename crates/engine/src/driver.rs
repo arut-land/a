@@ -1482,7 +1482,7 @@ impl Actor {
                 self.keep_snapshot().await;
             }
         }
-        self.drain_flushes(&mail).await;
+        self.drain_flushes(&mail, next).await;
         self.publish();
         if self.journal.since_snapshot >= SNAPSHOT_EVERY {
             self.keep_snapshot().await;

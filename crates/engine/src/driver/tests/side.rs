@@ -974,7 +974,7 @@ impl Extension for BackgroundCompletion {
 
 #[test]
 fn shutdown_never_admits_a_background_side_call_waiting_for_its_flush() {
-    let measured = std::time::Instant::now();
+    let measured = Instant::now();
     eprintln!("side {:?}: start", measured.elapsed());
     let faulty = Arc::new(crate::store::Faulty::new(Arc::new(Memory::default())));
     let http = Flaky::new([Reply::Events(text_reply())]);

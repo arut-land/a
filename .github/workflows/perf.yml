@@ -376,10 +376,84 @@ jobs:
         run: |
           $runners = @((Get-Command pwsh.exe).Source, "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe")
           "A_TEST_POWERSHELL=$($runners -join ';')" >> $env:GITHUB_ENV
-      - name: Repeat native release invariants
+      - name: Interleave baseline and fixed native release invariants
         run: |
-          mise exec -- cargo build --release -p a --features fixtures
-          for i in $(seq 1 60); do
-            echo "iteration $i $(date -u +%FT%TZ)"
-            mise exec -- cargo nextest run --release -p engine -p a -E 'test(an_upgrade_hands_running_work_to_the_newer_build) | test(shutdown_never_admits_a_background_side_call_waiting_for_its_flush)' --no-tests=fail --no-capture --no-fail-fast
-          done
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/tgt-win-flakes"
+          python - <<'PYTHON'
+          import json, os, pathlib, shutil, statistics, subprocess, time
+          root = pathlib.Path.cwd()
+          target = pathlib.Path(os.environ['CARGO_TARGET_DIR']).resolve()
+          target.mkdir(parents=True, exist_ok=True)
+          tests = {
+              'a::blackbox': ['daemon_acceptance::an_upgrade_hands_running_work_to_the_newer_build'],
+              'engine': ['driver::tests::side::shutdown_never_admits_a_background_side_call_waiting_for_its_flush',
+                         'driver::tests::durable::shutdown_consumes_a_prefetched_flush_completion'],
+          }
+          expression = ' | '.join('test(=' + name + ')' for names in tests.values() for name in names)
+          paths = [root / 'crates/engine/src/driver.rs', root / 'apps/cli/tests/blackbox/daemon_acceptance.rs']
+          original = [p.read_text() for p in paths]
+          patched = [original[0].replace('self.drain_flushes(&mail, next).await;', 'self.drain_flushes(&mail, None).await;'),
+                     original[1].replace('|session: &str, text: &str| String::from_utf8_lossy(&env.logs()[session]).contains(text);',
+                                         '|_session: &str, text: &str| env.logs().values().any(|log| String::from_utf8_lossy(log).contains(text));')]
+          assert all(a != b for a, b in zip(original, patched)), 'baseline reconstruction did not match'
+          executables = {}
+          product = target / 'release' / ('a.exe' if os.name == 'nt' else 'a')
+          try:
+              for variant, source in [('baseline', patched), ('fixed', original)]:
+                  for path, text in zip(paths, source):
+                      path.write_text(text)
+                  print('BUILD', variant, time.strftime('%FT%TZ', time.gmtime()), flush=True)
+                  listed = subprocess.check_output(['mise', 'exec', '--', 'cargo', 'nextest', 'list', '--release',
+                      '-p', 'engine', '-p', 'a', '--lib', '--test', 'blackbox', '-E', expression, '--message-format', 'json'])
+                  suites = json.loads(listed)['rust-suites']
+                  saved = target / ('pair-' + variant)
+                  saved.mkdir(exist_ok=True)
+                  executables[variant] = {}
+                  for name in tests:
+                      executable = saved / (name.replace('::', '-') + ('.exe' if os.name == 'nt' else ''))
+                      shutil.copy2(suites[name]['binary-path'], executable)
+                      executables[variant][name] = executable
+                  shutil.copy2(product, saved / product.name)
+          finally:
+              for path, text in zip(paths, original):
+                  path.write_text(text)
+          results = []
+          rounds = int(os.environ.get('FLAKE_ROUNDS', '60'))
+          for iteration in range(rounds):
+              for variant in (['baseline', 'fixed'] if iteration % 2 == 0 else ['fixed', 'baseline']):
+                  shutil.copy2(target / ('pair-' + variant) / product.name, product)
+                  for suite, names in tests.items():
+                      for name in names:
+                          started = time.perf_counter()
+                          try:
+                              run = subprocess.run([str(executables[variant][suite]), '--exact', name, '--nocapture'],
+                                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=125)
+                              code, output = run.returncode, run.stdout.decode(errors='replace')
+                          except subprocess.TimeoutExpired as error:
+                              code, output = 'timeout', (error.stdout or b'').decode(errors='replace')
+                          row = dict(iteration=iteration + 1, variant=variant, test=name, seconds=time.perf_counter() - started,
+                                     code=code, output=output)
+                          results.append(row)
+                          print(json.dumps({k:v for k,v in row.items() if k != 'output'}), flush=True)
+                          (target / 'win-flakes-pair.json').write_text(json.dumps(results, indent=2))
+                          if variant == 'fixed' and code != 0:
+                              print(output, flush=True)
+                              raise SystemExit('fixed invariant failed')
+          summary = []
+          for variant in executables:
+              for names in tests.values():
+                  for name in names:
+                      rows = [r for r in results if r['variant'] == variant and r['test'] == name]
+                      times = [r['seconds'] for r in rows]
+                      spread = statistics.quantiles(times, n=10) if len(times) >= 10 else [min(times)] * 9
+                      summary.append(dict(variant=variant, test=name, n=len(rows), passed=sum(r['code'] == 0 for r in rows),
+                                          median=statistics.median(times), p10=spread[0], p90=spread[8], min=min(times), max=max(times)))
+          print(json.dumps(summary, indent=2), flush=True)
+          (target / 'win-flakes-summary.json').write_text(json.dumps(summary, indent=2))
+          shutil.copy2(target / 'pair-fixed' / product.name, product)
+          PYTHON
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: win-flakes-${{ matrix.os }}
+          path: ${{ runner.temp }}/tgt-win-flakes/win-flakes-*.json

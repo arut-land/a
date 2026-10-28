@@ -178,34 +178,37 @@ fn an_upgrade_hands_running_work_to_the_newer_build() {
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
     let gate = format!("exec 3<>/dev/tcp/127.0.0.1/{port}; printf ready >&3; read -r reply <&3");
-    let job = format!("$ echo now; ({gate}; echo late) &");
-    let ran = TestProcess::spawn(&mut env.command_at(&older, &["--mode", "auto", "-p", &job]))
-        .collect(deadline())
-        .unwrap();
+    let launching = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    launching.set_nonblocking(true).unwrap();
+    let launch_port = launching.local_addr().unwrap().port();
+    // Hold the launcher past detachment too: its outcome must not be
+    // mistaken for the separate call's outcome on a slow runner.
+    let job = format!(
+        "$ echo now; ({gate}; echo late) & exec 4<>/dev/tcp/127.0.0.1/{launch_port}; printf ready >&4; read -r reply <&4"
+    );
+    let launcher = TestProcess::spawn(&mut env.command_at(&older, &["--mode", "auto", "-p", &job]));
+    let mut job_release = child_at_gate(&listener);
+    let mut launch_release = child_at_gate(&launching);
+    let job_session = env.logs().into_keys().next().unwrap();
+    wait_for_session_log(&env, &job_session, r#""kind":"detached""#);
+    launch_release.write_all(b"done\n").unwrap();
+    let ran = launcher.collect(deadline()).unwrap();
     assert!(
         ran.status.success(),
         "{}",
         String::from_utf8_lossy(&ran.stderr)
     );
-    eprintln!("handover {:?}: job gate", measured.elapsed());
-    let mut job_release = child_at_gate(&listener);
     // Its client waits for the call's outcome, through the upgrade.
     let call = format!("$ echo start; {gate}; echo end; exit 7");
     let waiting = TestProcess::spawn(&mut env.command_at(&older, &["--mode", "auto", "-p", &call]));
     eprintln!("handover {:?}: call gate", measured.elapsed());
     let mut call_release = child_at_gate(&listener);
-    let detached = Instant::now() + Duration::from_secs(30);
-    while !env
+    let call_session = env
         .logs()
-        .values()
-        .any(|log| String::from_utf8_lossy(log).contains(r#""kind":"detached""#))
-    {
-        assert!(
-            Instant::now() < detached,
-            "the call never went on in the background"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
+        .into_keys()
+        .find(|id| *id != job_session)
+        .unwrap();
+    wait_for_session_log(&env, &call_session, r#""kind":"detached""#);
     eprintln!("handover {:?}: detached", measured.elapsed());
     let older_pid = env.pid();
     let older_build = env.home.runtime().current().unwrap();
@@ -229,23 +232,20 @@ fn an_upgrade_hands_running_work_to_the_newer_build() {
         "where the newer build serves"
     );
     eprintln!("handover {:?}: successor ready", measured.elapsed());
-    let logged = |text: &str| {
-        env.logs()
-            .values()
-            .any(|log| String::from_utf8_lossy(log).contains(text))
-    };
-    assert!(!logged(r#""purpose":"job""#), "the gated job ended early");
+    let logged =
+        |session: &str, text: &str| String::from_utf8_lossy(&env.logs()[session]).contains(text);
     assert!(
-        !logged(r#""purpose":"detached""#),
-        "the gated call ended early: {:?}", env.logs().values().map(|log| String::from_utf8_lossy(log)).collect::<Vec<_>>()
+        !logged(&job_session, r#""purpose":"job""#),
+        "the gated job ended early"
+    );
+    assert!(
+        !logged(&call_session, r#""purpose":"detached""#),
+        "the gated call ended early"
     );
     job_release.write_all(b"done\n").unwrap();
     call_release.write_all(b"done\n").unwrap();
-    let ended = Instant::now() + Duration::from_secs(30);
-    while !(logged(r#""purpose":"job""#) && logged(r#""purpose":"detached""#)) {
-        assert!(Instant::now() < ended, "the work's ends never came");
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    wait_for_session_log(&env, &job_session, r#""purpose":"job""#);
+    wait_for_session_log(&env, &call_session, r#""purpose":"detached""#);
     let waited = waiting.collect(deadline()).unwrap();
     let said = String::from_utf8_lossy(&waited.stdout);
     assert!(said.contains(r#""output":"start\nend\n""#), "{said}");
@@ -266,6 +266,27 @@ fn an_upgrade_hands_running_work_to_the_newer_build() {
         committed,
         "the successor's outcomes were not durable"
     );
+}
+
+fn wait_for_session_log(env: &Isolated, session: &str, text: &str) {
+    let path = env.home.sessions_dir().join(session).join("log.jsonl");
+    let reactor = rt::Reactor::AsyncIo;
+    let written = rt::Async::for_reading(&reactor, sys::write_watch(&path).unwrap()).unwrap();
+    rt::block_on(rt::or(
+        async {
+            loop {
+                written.get_ref().clear();
+                if fs::read_to_string(&path).unwrap().contains(text) {
+                    return;
+                }
+                written.readable().await;
+            }
+        },
+        async {
+            reactor.sleep(Duration::from_secs(30)).await;
+            panic!("session {session} never logged {text}");
+        },
+    ));
 }
 
 fn child_at_gate(listener: &TcpListener) -> std::net::TcpStream {
