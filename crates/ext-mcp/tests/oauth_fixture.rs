@@ -145,7 +145,10 @@ impl State {
             });
             let needs_auth = (self.expired || !authorized)
                 || (matches!(self.scenario.as_str(), "refresh" | "revoked") && self.calls == 3);
-            let step_up = (self.scenario == "stepup" && self.calls == 3)
+            let step_up = (matches!(
+                self.scenario.as_str(),
+                "stepup" | "declined-stepup" | "failed-stepup"
+            ) && self.calls == 3)
                 || (self.scenario == "during-call-stepup" && self.calls == 2)
                 || (self.scenario == "rotating-stepup" && self.expired)
                 || (self.scenario == "paginated"
@@ -241,9 +244,13 @@ impl State {
         if self.scenario == "no-scope" {
             assert!(!params.contains_key("scope"));
         }
-        self.scope = params.get("scope").cloned().unwrap_or_default();
-        let denied =
-            matches!(self.scenario.as_str(), "rotating" | "rotating-denied") && self.tokens > 0;
+        let denied = matches!(
+            self.scenario.as_str(),
+            "rotating" | "rotating-denied" | "failed-stepup"
+        ) && self.tokens > 0;
+        if !denied {
+            self.scope = params.get("scope").cloned().unwrap_or_default();
+        }
         let query = form_urlencoded::Serializer::new(String::new())
             .extend_pairs([
                 (

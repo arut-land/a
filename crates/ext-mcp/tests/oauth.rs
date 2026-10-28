@@ -25,6 +25,7 @@ struct Browser {
     credentials: sys::credentials::Credentials,
     approvals: Arc<AtomicUsize>,
     threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
+    decline_write: bool,
 }
 impl Extension for Browser {
     const NAME: &'static str = "oauth-test-browser";
@@ -32,6 +33,7 @@ impl Extension for Browser {
     fn contribute(&self, r: &mut Registrar) {
         let approvals = Arc::clone(&self.approvals);
         let threads = Arc::clone(&self.threads);
+        let decline_write = self.decline_write;
         r.provide(Arc::new(self.credentials.clone()))
             .on::<ext::point::Approve>(move |_, call| {
                 if call.tool != "mcp_authorize" {
@@ -40,6 +42,16 @@ impl Extension for Browser {
                 let input: serde_json::Value = call.input.parse().unwrap();
                 let url = input["url"].as_str().unwrap().to_owned();
                 approvals.fetch_add(1, Ordering::SeqCst);
+                let uri: http::Uri = url.parse().unwrap();
+                if decline_write
+                    && form_urlencoded::parse(uri.query().unwrap().as_bytes()).any(
+                        |(key, value)| {
+                            key == "scope" && value.split_whitespace().any(|scope| scope == "write")
+                        },
+                    )
+                {
+                    return Answer::Now(Some(false));
+                }
                 threads.lock().unwrap().push(std::thread::spawn(move || {
                     let response = get(&url);
                     let redirect = response
@@ -145,6 +157,7 @@ fn exercise(scenario: &str) {
         credentials: sys::credentials::Credentials::isolated(root.dir.join("credentials")),
         approvals: Arc::default(),
         threads: Arc::default(),
+        decline_write: false,
     };
     let mcp = configured(&root, &origin, scenario);
     let rig = Rig::new(
@@ -306,6 +319,12 @@ fn oauth_engine_process() {
             ),
             approvals: Arc::default(),
             threads: Arc::default(),
+            decline_write: config
+                .ext
+                .table("oauth-test-browser")
+                .flag("decline_write")
+                .unwrap()
+                .unwrap_or(false),
         };
         Registry::default()
             .with(&Mcp::configure(&table)?)?
@@ -335,8 +354,9 @@ impl Engine {
         let (fixture, origin) = serve(&root.dir.join("endpoint"), scenario);
         let home = sys::Home::from(root.dir.clone());
         std::fs::write(home.config_file(), format!(
-            "[ext.mcp]\nservers=[\"fixture\"]\nfixture_url=\"{origin}/mcp\"\n[ext.oauth-test-browser]\ncredentials={}\n",
+            "[ext.mcp]\nservers=[\"fixture\"]\nfixture_url=\"{origin}/mcp\"\n[ext.oauth-test-browser]\ncredentials={}\ndecline_write={}\n",
             serde_json::to_string(&root.dir.join("credentials")).unwrap(),
+            scenario == "declined-stepup",
         )).unwrap();
         let daemon = Peer(
             Command::new(std::env::current_exe().unwrap())
@@ -449,6 +469,57 @@ fn paginated_authorization_names_are_unique_in_the_engine() {
         std::fs::read_to_string(engine.root.dir.join("endpoint.scope")).unwrap(),
         "read write"
     );
+}
+
+fn rejected_step_up(scenario: &str) {
+    let mut engine = Engine::new(scenario);
+    let first = Client::attach(&engine.root.dir).list();
+    let credential = std::fs::read_dir(engine.root.dir.join("credentials"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let saved = std::fs::read(&credential).unwrap();
+    let upgrade = Client::attach(&engine.root.dir).list();
+    let preserved = std::fs::read(&credential).ok().as_deref() == Some(saved.as_slice());
+    let original_scope = Client::attach(&engine.root.dir).list();
+    assert!(get(&format!("{}/expire/1", engine.origin)).starts_with("HTTP/1.1 200"));
+    let refreshed = Client::attach(&engine.root.dir).list();
+    let issued = std::fs::read_to_string(engine.root.dir.join("endpoint.tokens")).unwrap();
+    let scope = std::fs::read_to_string(engine.root.dir.join("endpoint.scope")).unwrap();
+    engine.stop();
+    eprintln!(
+        "step_up_preserved={preserved} original_scope_cards={} refresh_cards={}",
+        original_scope.1, refreshed.1
+    );
+    assert_eq!(first, (json!({"ok":[]}), 1));
+    assert!(
+        upgrade.0["failed"]["transport"]
+            .as_str()
+            .unwrap()
+            .contains("declined"),
+        "{upgrade:?}"
+    );
+    assert_eq!(upgrade.1, 1);
+    assert!(
+        preserved,
+        "a rejected upgrade must leave the stored grant unchanged"
+    );
+    assert_eq!(original_scope, (json!({"ok":[]}), 0));
+    assert_eq!(refreshed, (json!({"ok":[]}), 0));
+    assert_eq!(issued, "2");
+    assert_eq!(scope, "read");
+}
+
+#[test]
+fn declining_scope_step_up_preserves_previously_granted_access() {
+    rejected_step_up("declined-stepup");
+}
+
+#[test]
+fn failing_scope_step_up_preserves_previously_granted_access() {
+    rejected_step_up("failed-stepup");
 }
 
 fn concurrent_refresh(scenario: &str) {
@@ -616,6 +687,7 @@ fn separately_composed_mcp_instances_share_the_same_credential_lifecycle() {
         credentials: sys::credentials::Credentials::isolated(root.dir.join("credentials")),
         approvals: Arc::default(),
         threads: Arc::default(),
+        decline_write: false,
     };
     let authorizations = ext_mcp::Authorizations::default();
     let rigs: Vec<_> = (0..2)

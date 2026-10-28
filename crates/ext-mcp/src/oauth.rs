@@ -140,6 +140,16 @@ enum Acquisition {
     },
 }
 impl Lifecycle {
+    fn available(&self) -> Option<Generation> {
+        let mut current = self.current.clone()?;
+        if current.credential.is_err()
+            && let Cached::Loaded(Some(credential)) = &self.cached
+        {
+            current.credential = Ok(credential.access.clone());
+        }
+        Some(current)
+    }
+
     fn acquire(&mut self, seen: Option<u64>) -> Acquisition {
         if let Some(running) = &self.running {
             return Acquisition::Waiting(Arc::clone(running));
@@ -417,7 +427,7 @@ impl Owner {
     async fn access(&self, cx: &Cx) -> std::io::Result<Option<Generation>> {
         let (current, running) = {
             let state = crate::lock(&self.lifecycle);
-            (state.current.clone(), state.running.clone())
+            (state.available(), state.running.clone())
         };
         if let Some(running) = running {
             let _participant = running.participate(cx);
@@ -536,7 +546,9 @@ impl Owner {
         let fresh = if let Some(fresh) = refreshed {
             fresh
         } else {
-            self.save(runtime, None).await?;
+            if request.status == http::StatusCode::UNAUTHORIZED {
+                self.save(runtime, None).await?;
+            }
             let presenter = renewal.presenter()?;
             network(
                 runtime,
@@ -940,7 +952,40 @@ mod tests {
 
     #[test]
     fn issued_generations_share_immutable_access_token_bytes() {
-        let credential = Arc::new(Credential {
+        let credential = credential();
+        let mut lifecycle = Lifecycle::default();
+        assert!(matches!(lifecycle.acquire(None), Acquisition::Start { .. }));
+        let generation = lifecycle.publish(Ok(Arc::clone(&credential)));
+        let first = generation.token().unwrap();
+        let second = generation.token().unwrap();
+        assert!(Arc::ptr_eq(&first.access_token, &second.access_token));
+        assert!(Arc::ptr_eq(
+            &first.access_token,
+            &credential.access.access_token
+        ));
+        assert_eq!(Arc::strong_count(&credential), 2);
+    }
+
+    #[test]
+    fn failed_upgrade_preserves_access_without_hiding_the_shared_failure() {
+        let mut lifecycle = Lifecycle::default();
+        assert!(matches!(lifecycle.acquire(None), Acquisition::Start { .. }));
+        let prior = lifecycle.publish(Ok(credential()));
+        assert!(matches!(
+            lifecycle.acquire(Some(prior.number)),
+            Acquisition::Start { .. }
+        ));
+        let failed = lifecycle.publish(Err(failure("authorization declined")));
+        assert!(failed.token().is_err());
+        assert!(lifecycle.available().unwrap().token().is_ok());
+        let Acquisition::Published(late) = lifecycle.acquire(Some(prior.number)) else {
+            panic!("old waiters must share the failed upgrade");
+        };
+        assert!(late.token().is_err());
+    }
+
+    fn credential() -> Arc<Credential> {
+        Arc::new(Credential {
             family: Family {
                 server: "fixture".parse().unwrap(),
                 resource: "https://fixture/mcp".into(),
@@ -953,18 +998,7 @@ mod tests {
                 expires_at: None,
             },
             refresh_token: Some("refresh".into()),
-        });
-        let mut lifecycle = Lifecycle::default();
-        assert!(matches!(lifecycle.acquire(None), Acquisition::Start { .. }));
-        let generation = lifecycle.publish(Ok(Arc::clone(&credential)));
-        let first = generation.token().unwrap();
-        let second = generation.token().unwrap();
-        assert!(Arc::ptr_eq(&first.access_token, &second.access_token));
-        assert!(Arc::ptr_eq(
-            &first.access_token,
-            &credential.access.access_token
-        ));
-        assert_eq!(Arc::strong_count(&credential), 2);
+        })
     }
 
     #[test]
