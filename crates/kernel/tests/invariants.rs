@@ -358,7 +358,12 @@ fn states() -> Vec<(&'static str, Session)> {
     state("waiting approval", asking, vec![user("$ x")]);
     let dialog = Event::Waits {
         call: id(2),
-        on: WaitOn::Dialog { ui: Json::null() },
+        on: WaitOn::Question {
+            request: Box::new(protocol::QuestionWait {
+                question: protocol::Question::confirm("pick".into()),
+                checkpoint: Some(Json::null()),
+            }),
+        },
     };
     state("waiting dialog", Reg::echo(), vec![user("$ x"), dialog]);
     let spawn = Event::Spawn {

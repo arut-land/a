@@ -538,7 +538,7 @@ impl Conn<'_> {
                 ClientMsg::Hello { .. }
                 | ClientMsg::Input { .. }
                 | ClientMsg::Withdraw { .. }
-                | ClientMsg::Approve { .. }
+                | ClientMsg::Answer { .. }
                 | ClientMsg::Interrupt { .. }
                 | ClientMsg::Query { .. }
                 | ClientMsg::Cancel { .. }
@@ -726,8 +726,8 @@ impl Conn<'_> {
             ClientMsg::Withdraw { input, .. } => {
                 (Request::Withdraw { input }, Rejection::NotWaiting)
             }
-            ClientMsg::Approve { call, approved, .. } => {
-                let value = protocol::Json::encode(&approved).unwrap_or_default();
+            ClientMsg::Answer { call, answer, .. } => {
+                let value = protocol::Json::encode(&answer).unwrap_or_default();
                 (Request::Answer { call, value }, Rejection::NotWaiting)
             }
             _ => return refused(Err((Rejection::Other, "not a mutation".into()))),
@@ -784,7 +784,7 @@ const fn writes(msg: &ClientMsg) -> bool {
     match msg {
         ClientMsg::Input { .. }
         | ClientMsg::Withdraw { .. }
-        | ClientMsg::Approve { .. }
+        | ClientMsg::Answer { .. }
         | ClientMsg::Interrupt { .. }
         | ClientMsg::Environment(_)
         | ClientMsg::Shutdown

@@ -282,6 +282,60 @@ fn tool_card<'a>(p: &'a Presented<'a>) -> impl Renderable {
                 span style=(style::MONO) { (p.title) }
                 span style=(status_style(p.glyph)) { (p.status) }
             }
+            @if let (Some(question), Some(id), protocol::view::Buttons::Approve(call)) = (p.question, p.question_seq, p.buttons) {
+                form novalidate data-call=(call.get()) data-question=(id.get())
+                    onsubmit="event.preventDefault(); const f=event.currentTarget,values={}; for(const e of f.querySelectorAll('[data-field]')) {const include=f.querySelector('[name=include_'+e.name+']');if(include&&!include.checked)continue;if(e.tagName==='SELECT'&&!e.multiple&&e.selectedOptions[0]?.disabled)continue;values[e.name]=e.multiple?JSON.stringify(Array.from(e.selectedOptions,x=>x.value)):e.value;} fetch('/api/answer',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({tab:f.querySelector('[name=tab]').value,call:Number(f.dataset.call),question:Number(f.dataset.question),action:event.submitter.value,values})});" {
+                    input type="hidden" name="tab" data-attr:value="$tab";
+                    p { "Requested by " (question.source) }
+                    @for (pi, prompt) in question.prompts.values().enumerate() {
+                        p { (prompt.message()) }
+                        @if question.prompts.len() > 1 {
+                            label { "Response for this prompt "
+                                select name=(format!("p{pi}")) data-field { option value="accept" { "Accept" } option value="decline" { "Decline" } option value="cancel" { "Cancel" } }
+                            }
+                        }
+                        @match prompt {
+                            protocol::Prompt::Url { url, .. } => {
+                                pre style=(style::OUTPUT) { (url) }
+                                a href=(url) target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer" { "Open URL in browser" }
+                            }
+                            protocol::Prompt::Form { fields, .. } => {
+                                @for (fi, field) in fields.iter().enumerate() {
+                                    div {
+                                        @if !field.required {
+                                            label { input type="checkbox" name=(format!("include_f{pi}_{fi}")) checked[field.default.is_some()]; "Include optional field " }
+                                        }
+                                        label for=(format!("field_{}_{}_{}",id.get(),pi,fi)) { (field.title.as_deref().unwrap_or(&field.name)) @if field.required { " (required)" } }
+                                        @if let Some(description) = &field.description { p { (description) } }
+                                        @match &field.kind {
+                                            protocol::FieldKind::Boolean => {
+                                                select id=(format!("field_{}_{}_{}",id.get(),pi,fi)) name=(format!("f{pi}_{fi}")) data-field {
+                                                    option value="" { "Choose…" } option value="true" selected[field.default.as_ref().is_some_and(|v| v.raw()=="true")] { "Yes" } option value="false" selected[field.default.as_ref().is_some_and(|v| v.raw()=="false")] { "No" }
+                                                }
+                                            }
+                                            protocol::FieldKind::Choice { options, selection } => {
+                                                select id=(format!("field_{}_{}_{}",id.get(),pi,fi)) name=(format!("f{pi}_{fi}")) data-field multiple[matches!(selection,protocol::Selection::Many { .. })] {
+                                                    @if matches!(selection, protocol::Selection::One) { option value="" disabled selected[field.default.is_none()] { "Choose…" } }
+                                                    @for option in options { option value=(option.value) selected[field.default.as_ref().is_some_and(|v| v.parse::<serde_json::Value>().is_ok_and(|v| v.as_str()==Some(option.value.as_str()) || v.as_array().is_some_and(|vs| vs.iter().any(|v| v.as_str()==Some(option.value.as_str())))))] { (option.title) } }
+                                                }
+                                            }
+                                            kind => {
+                                                input id=(format!("field_{}_{}_{}",id.get(),pi,fi)) name=(format!("f{pi}_{fi}")) data-field
+                                                    type=(if matches!(kind,protocol::FieldKind::Number { .. }) {"number"} else {"text"}) step="any"
+                                                    value=(field.default_text().unwrap_or_default());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    button type="submit" value="accept" { "Submit / Continue" }
+                    button type="submit" value="decline" { "Decline" }
+                    button type="submit" value="cancel" { "Cancel" }
+                }
+            }
             @for part in client::approval_parts(p) {
                 @match part {
                     client::ApprovalPart::Call { text } => { pre style=(style::OUTPUT) { (text) } }
@@ -394,6 +448,37 @@ fn group(text: &str) -> Vec<Group<'_>> {
 mod tests {
     use super::*;
     use protocol::{DaemonMsg, Decode};
+
+    #[test]
+    fn question_urls_are_explicit_links_and_answers_use_a_post_body() {
+        let mut view = SessionView::default();
+        view.fold(&DaemonMsg::Entry(protocol::Entry::new(
+            protocol::Seq::new(1).unwrap(),
+            protocol::Epoch(1),
+            protocol::Body::Question {
+                question: protocol::Question {
+                    source: "server <untrusted>".into(),
+                    prompts: std::collections::BTreeMap::from([(
+                        "url".into(),
+                        protocol::Prompt::Url {
+                            message: "Continue".into(),
+                            url: "https://example.com/authorize?secret=opaque&next=1".into(),
+                        },
+                    )]),
+                },
+            },
+        )));
+        let rendered = html(ItemRow {
+            item: &view.items[0],
+            view: &view,
+        });
+        assert!(rendered.contains("server &lt;untrusted&gt;"));
+        assert!(rendered.contains("noopener noreferrer"));
+        assert!(rendered.contains("no-referrer"));
+        assert!(rendered.contains("fetch('/api/answer'"));
+        assert!(!rendered.contains("window.open"));
+        assert!(!rendered.contains("/api/answer?"));
+    }
 
     #[test]
     fn every_summary_has_complete_effective_input_above_it_and_controls_below() {

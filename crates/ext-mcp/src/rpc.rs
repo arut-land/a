@@ -18,6 +18,53 @@ pub(crate) fn next_id() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
+/// The boot component prevents a resumed exchange from reusing its pre-crash ID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct RequestId {
+    boot: u128,
+    sequence: u64,
+}
+impl RequestId {
+    pub(crate) fn new() -> Self {
+        static BOOT: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+        Self {
+            boot: *BOOT.get_or_init(|| protocol::SessionId::new().0.as_u128()),
+            sequence: next_id(),
+        }
+    }
+    pub(crate) fn read(value: &Value) -> Option<Self> {
+        let (boot, sequence) = value.as_str()?.split_once(':')?;
+        if boot.len() != 32
+            || !boot
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || sequence.is_empty()
+            || !sequence.bytes().all(|b| b.is_ascii_digit())
+            || sequence.len() > 1 && sequence.starts_with('0')
+        {
+            return None;
+        }
+        Some(Self {
+            boot: u128::from_str_radix(boot, 16).ok()?,
+            sequence: sequence.parse().ok()?,
+        })
+    }
+    #[cfg(test)]
+    pub(crate) const fn test(sequence: u64) -> Self {
+        Self { boot: 0, sequence }
+    }
+}
+impl std::fmt::Display for RequestId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:032x}:{}", self.boot, self.sequence)
+    }
+}
+impl serde::Serialize for RequestId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
 pub(crate) struct Reply {
     pub value: Value,
     pub authorization: Option<crate::oauth::GenerationId>,
@@ -41,17 +88,17 @@ impl Reply {
     }
 }
 
-pub(crate) fn request(id: u64, method: &str, mut params: Value) -> Value {
+pub(crate) fn request(id: RequestId, method: &str, mut params: Value) -> Value {
     params["_meta"] = json!({
         "io.modelcontextprotocol/protocolVersion": VERSION,
-        "io.modelcontextprotocol/clientCapabilities": {},
+        "io.modelcontextprotocol/clientCapabilities": {"elicitation":{"form":{},"url":{}}},
         "io.modelcontextprotocol/clientInfo": {"name":"a","version":env!("CARGO_PKG_VERSION")},
         "progressToken": id
     });
     json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
 }
 
-pub(crate) fn decode(message: &Value, id: u64) -> Result<Option<Value>, Failure> {
+pub(crate) fn decode(message: &Value, id: Option<RequestId>) -> Result<Option<Value>, Failure> {
     if message["jsonrpc"] != "2.0" || !message.is_object() {
         return Err(Failure::Protocol("expected a JSON-RPC 2.0 object".into()));
     }
@@ -61,7 +108,7 @@ pub(crate) fn decode(message: &Value, id: u64) -> Result<Option<Value>, Failure>
             .ok_or_else(|| Failure::Protocol("notification has no method".into()))?;
         return Ok(None);
     }
-    if message["id"] != id
+    if RequestId::read(&message["id"]).is_none_or(|response| Some(response) != id)
         || message.get("method").is_some()
         || message.get("result").is_some() == message.get("error").is_some()
     {
@@ -80,8 +127,7 @@ pub(crate) fn decode(message: &Value, id: u64) -> Result<Option<Value>, Failure>
     }
     let result = message["result"].clone();
     match result["resultType"].as_str() {
-        Some("complete") => Ok(Some(result)),
-        Some("input_required") => Err(Failure::InputRequired),
+        Some("complete" | "input_required") => Ok(Some(result)),
         _ => Err(Failure::Protocol("unknown or missing resultType".into())),
     }
 }
@@ -174,7 +220,7 @@ async fn exchange_reply(
     headers: http::HeaderMap,
     cx: &Cx,
 ) -> Result<Reply, Failure> {
-    let id = next_id();
+    let id = RequestId::new();
     let message = request(id, method, params);
     let mut incoming = crate::incoming::Incoming::new(id);
     let bytes = serde_json::to_vec(&message).map_err(protocol)?;
@@ -354,7 +400,10 @@ mod tests {
             json!({"jsonrpc":"2.0","id":1,"result":{}}),
             json!({"jsonrpc":"2.0","id":1,"method":"sampling/createMessage"}),
         ] {
-            assert!(matches!(decode(&message, 1), Err(Failure::Protocol(_))));
+            assert!(matches!(
+                decode(&message, Some(RequestId::test(1))),
+                Err(Failure::Protocol(_))
+            ));
         }
     }
 

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use ext::host::Registry;
 use ext::testing::Rig;
-use ext::{Answer, Configured, Extension, Refused, Registrar, Table};
+use ext::{Configured, Extension, Refused, Registrar, Table};
 use ext_mcp::{Mcp, Server, Transport};
 use serde_json::json;
 
@@ -27,42 +27,63 @@ struct Browser {
     threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
     decline_write: bool,
 }
-impl Extension for Browser {
-    const NAME: &'static str = "oauth-test-browser";
-    const VERSION: u32 = 1;
-    fn contribute(&self, r: &mut Registrar) {
-        let approvals = Arc::clone(&self.approvals);
-        let threads = Arc::clone(&self.threads);
-        let decline_write = self.decline_write;
-        r.provide(Arc::new(self.credentials.clone()))
-            .on::<ext::point::Approve>(move |_, call| {
-                if call.tool != "mcp_authorize" {
-                    return Answer::Now(None);
-                }
-                let input: serde_json::Value = call.input.parse().unwrap();
-                let url = input["url"].as_str().unwrap().to_owned();
-                approvals.fetch_add(1, Ordering::SeqCst);
-                let uri: http::Uri = url.parse().unwrap();
-                if decline_write
-                    && form_urlencoded::parse(uri.query().unwrap().as_bytes()).any(
-                        |(key, value)| {
-                            key == "scope" && value.split_whitespace().any(|scope| scope == "write")
-                        },
-                    )
-                {
-                    return Answer::Now(Some(false));
-                }
-                threads.lock().unwrap().push(std::thread::spawn(move || {
+struct BrowserQuestions {
+    approvals: Arc<AtomicUsize>,
+    threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
+    decline_write: bool,
+}
+impl ext::host::QuestionPort for BrowserQuestions {
+    fn ask(
+        &self,
+        question: protocol::Question,
+    ) -> ext::BoxFuture<'static, Result<protocol::QuestionAnswer, String>> {
+        self.approvals.fetch_add(1, Ordering::SeqCst);
+        let (key, prompt) = question.prompts.iter().next().unwrap();
+        let protocol::Prompt::Url { url, .. } = prompt else {
+            panic!("expected URL consent")
+        };
+        let uri: http::Uri = url.parse().unwrap();
+        let decline = self.decline_write
+            && form_urlencoded::parse(uri.query().unwrap().as_bytes())
+                .any(|(k, v)| k == "scope" && v.split_whitespace().any(|s| s == "write"));
+        if !decline {
+            let url = url.clone();
+            self.threads
+                .lock()
+                .unwrap()
+                .push(std::thread::spawn(move || {
                     let response = get(&url);
                     let redirect = response
                         .lines()
                         .find_map(|line| line.strip_prefix("Location: "))
                         .unwrap();
-                    let response = get(redirect);
-                    assert!(response.starts_with("HTTP/1.1 200"));
+                    assert!(get(redirect).starts_with("HTTP/1.1 200"));
                 }));
-                Answer::Now(Some(true))
-            });
+        }
+        let answer = protocol::QuestionAnswer {
+            question: protocol::Seq::new(1).unwrap(),
+            responses: BTreeMap::from([(
+                key.clone(),
+                if decline {
+                    protocol::Response::Decline
+                } else {
+                    protocol::Response::accept()
+                },
+            )]),
+        };
+        Box::pin(std::future::ready(Ok(answer)))
+    }
+}
+impl Extension for Browser {
+    const NAME: &'static str = "oauth-test-browser";
+    const VERSION: u32 = 1;
+    fn contribute(&self, r: &mut Registrar) {
+        r.provide(Arc::new(self.credentials.clone()))
+            .provide::<dyn ext::host::QuestionPort>(Arc::new(BrowserQuestions {
+                approvals: self.approvals.clone(),
+                threads: self.threads.clone(),
+                decline_write: self.decline_write,
+            }));
     }
 }
 struct Settings(sys::config::Table);
@@ -417,6 +438,7 @@ impl Engine {
 struct Client {
     writer: sys::OwnedConnection,
     reader: std::io::BufReader<sys::OwnedConnection>,
+    decline_write: bool,
 }
 impl Client {
     fn attach(root: &Path) -> Self {
@@ -442,7 +464,13 @@ impl Client {
                 break;
             }
         }
-        Self { writer, reader }
+        Self {
+            writer,
+            reader,
+            decline_write: std::fs::read_to_string(sys::Home::from(root.to_owned()).config_file())
+                .unwrap()
+                .contains("decline_write=true"),
+        }
     }
 
     fn list(&mut self) -> (serde_json::Value, usize) {
@@ -468,7 +496,48 @@ impl Client {
                     Body::ToolCall { tool, .. } if tool == "mcp_list" => {
                         parent = Some(protocol::CallId(entry.seq));
                     }
-                    Body::ToolCall { tool, .. } if tool == "mcp_authorize" => authorizations += 1,
+                    Body::Question { question } => {
+                        authorizations += 1;
+                        let (key, prompt) = question.prompts.iter().next().unwrap();
+                        let protocol::Prompt::Url { url, .. } = prompt else {
+                            panic!("URL question expected")
+                        };
+                        let uri: http::Uri = url.parse().unwrap();
+                        let decline = self.decline_write
+                            && form_urlencoded::parse(uri.query().unwrap().as_bytes()).any(
+                                |(k, v)| k == "scope" && v.split_whitespace().any(|s| s == "write"),
+                            );
+                        let browser = (!decline).then(|| {
+                            let url = url.clone();
+                            std::thread::spawn(move || {
+                                let response = get(&url);
+                                let redirect = response
+                                    .lines()
+                                    .find_map(|line| line.strip_prefix("Location: "))
+                                    .unwrap();
+                                assert!(get(redirect).starts_with("HTTP/1.1 200"));
+                            })
+                        });
+                        let answer = protocol::QuestionAnswer {
+                            question: entry.seq,
+                            responses: BTreeMap::from([(
+                                key.clone(),
+                                if decline {
+                                    protocol::Response::Decline
+                                } else {
+                                    protocol::Response::accept()
+                                },
+                            )]),
+                        };
+                        write_frame(
+                            &mut self.writer,
+                            &ClientMsg::answer(protocol::CallId(entry.seq), answer),
+                        )
+                        .unwrap();
+                        if let Some(browser) = browser {
+                            browser.join().unwrap();
+                        }
+                    }
                     Body::ToolResult { call, outcome, .. } if Some(call) == parent => {
                         return (
                             match outcome {
@@ -1013,5 +1082,75 @@ fn engine_readiness_owns_the_daemon_record_before_client_discovery() {
         std::io::ErrorKind::WouldBlock
     );
     drop(record);
+    engine.stop();
+}
+
+#[test]
+fn interrupting_the_authorization_presenter_leaves_its_card_answerable_for_other_callers() {
+    use protocol::{Body, ClientMsg, DaemonMsg, read_frame, write_frame};
+    let mut engine = Engine::new("rotating");
+    let mut presenter = Client::attach(&engine.root.dir);
+    write_frame(
+        &mut presenter.writer,
+        &ClientMsg::Input {
+            segments: "call mcp_list {\"server\":\"fixture\"}".into(),
+            mode: protocol::Mode::default(),
+            force: false,
+            client_seq: None,
+        },
+    )
+    .unwrap();
+    let (id, question) = loop {
+        if let Some(DaemonMsg::Entry(entry)) =
+            read_frame::<DaemonMsg>(&mut presenter.reader).unwrap()
+            && let Body::Question { question } = entry.body
+        {
+            break (entry.seq, question);
+        }
+    };
+    write_frame(
+        &mut presenter.writer,
+        &ClientMsg::Interrupt { client_seq: None },
+    )
+    .unwrap();
+    loop {
+        if let Some(DaemonMsg::Entry(entry)) =
+            read_frame::<DaemonMsg>(&mut presenter.reader).unwrap()
+            && matches!(entry.body, Body::ToolResult { .. })
+        {
+            break;
+        }
+    }
+    let home = engine.root.dir.clone();
+    let waiter = std::thread::spawn(move || Client::attach(&home).list());
+    let (key, protocol::Prompt::Url { url, .. }) = question.prompts.iter().next().unwrap() else {
+        panic!("URL question");
+    };
+    let url = url.clone();
+    let browser = std::thread::spawn(move || {
+        let response = get(&url);
+        let redirect = response
+            .lines()
+            .find_map(|line| line.strip_prefix("Location: "))
+            .unwrap();
+        assert!(get(redirect).starts_with("HTTP/1.1 200"));
+    });
+    write_frame(
+        &mut presenter.writer,
+        &ClientMsg::answer(
+            protocol::CallId(id),
+            protocol::QuestionAnswer {
+                question: id,
+                responses: BTreeMap::from([(key.clone(), protocol::Response::accept())]),
+            },
+        ),
+    )
+    .unwrap();
+    browser.join().unwrap();
+    assert_eq!(waiter.join().unwrap(), (json!({"ok":[]}), 0));
+    assert_eq!(
+        std::fs::read_to_string(engine.root.dir.join("endpoint.tokens")).unwrap(),
+        "1"
+    );
     engine.stop();
 }

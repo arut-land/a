@@ -2011,3 +2011,87 @@ fn recall_uses_the_command_item_after_it_replaces_user_text() {
     press(&mut app, Key::Up);
     assert_eq!(app.editor.text(), "/model fast");
 }
+
+#[test]
+fn question_paste_stays_literal_and_its_draft_survives_until_the_answer_is_committed() {
+    let question = protocol::Question {
+        source: "fixture".into(),
+        prompts: std::collections::BTreeMap::from([(
+            "form".into(),
+            protocol::Prompt::Form {
+                message: "Your text".into(),
+                fields: vec![protocol::Field {
+                    name: "text".into(),
+                    title: None,
+                    description: None,
+                    required: true,
+                    default: None,
+                    kind: protocol::FieldKind::String {
+                        min: None,
+                        max: None,
+                        format: None,
+                    },
+                }],
+            },
+        )]),
+    };
+    let (mut app, _) = app(Viewport::Full, &[]);
+    keys(&mut app, "saved draft");
+    app.fold(&entry(1, Body::Question { question }));
+    let value = "literal\tvalue\n".repeat(100);
+    app.input(Input::Paste(value.clone()));
+    let Some(Effect::Cmd(Cmd::Answer { answer, .. })) = press(&mut app, Key::Ctrl('s')) else {
+        panic!("typed answer");
+    };
+    let protocol::Response::Submit(fields) = &answer.responses["form"] else {
+        panic!("form answer");
+    };
+    assert_eq!(fields["text"].parse::<String>().unwrap(), value);
+    assert_eq!(app.editor.text(), value);
+    assert!(app.question_edit.is_some());
+    app.fold(&entry(
+        2,
+        Body::Answer {
+            call: CallId::new(1).unwrap(),
+            value: Json::encode(&answer).unwrap(),
+            origin: None,
+        },
+    ));
+    assert_eq!(app.editor.text(), "saved draft");
+    assert!(app.question_edit.is_none());
+}
+
+#[test]
+fn every_url_in_a_question_requires_an_explicit_open_action() {
+    let question = protocol::Question {
+        source: "fixture".into(),
+        prompts: ["https://example.com/first", "https://example.com/second"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, url)| {
+                (
+                    index.to_string(),
+                    protocol::Prompt::Url {
+                        message: "Open".into(),
+                        url: url.into(),
+                    },
+                )
+            })
+            .collect(),
+    };
+    let (mut app, _) = app(Viewport::Full, &[entry(1, Body::Question { question })]);
+    for expected in [
+        "https://example.com/first",
+        "https://example.com/second",
+        "https://example.com/first",
+    ] {
+        let Some(Effect::OpenUrl(url)) = press(&mut app, Key::Ctrl('o')) else {
+            panic!("explicit open");
+        };
+        assert_eq!(url, expected);
+    }
+    assert!(matches!(
+        press(&mut app, Key::Esc),
+        Some(Effect::Cmd(Cmd::Answer { .. }))
+    ));
+}

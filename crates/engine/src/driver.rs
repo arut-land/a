@@ -475,6 +475,12 @@ enum Completion {
 }
 
 enum Msg {
+    Question {
+        fence: u64,
+        question: protocol::Question,
+        cancel: Cancel,
+        reply: oneshot::Sender<Result<protocol::QuestionAnswer, String>>,
+    },
     AwaitEnvelope {
         id: protocol::EnvelopeId,
         reply: oneshot::Sender<Opened>,
@@ -1181,6 +1187,14 @@ enum Waiter {
 #[derive(Default)]
 struct Replies {
     invocations: BTreeMap<Ticket, (oneshot::Sender<Called>, ext::point::InvocationContext)>,
+    opening_questions: BTreeMap<
+        Ticket,
+        (
+            Cancel,
+            oneshot::Sender<Result<protocol::QuestionAnswer, String>>,
+        ),
+    >,
+    questions: BTreeMap<CallId, oneshot::Sender<Result<protocol::QuestionAnswer, String>>>,
     contexts: BTreeMap<CallId, ext::point::InvocationContext>,
     invoked: BTreeMap<CallId, Vec<Waiter>>,
     clients: BTreeMap<Ticket, oneshot::Sender<Result<(), String>>>,
@@ -1520,6 +1534,21 @@ impl Actor {
         msg: Msg,
     ) -> Option<(Event, Option<oneshot::Sender<ext::MutationResult>>)> {
         let event = match msg {
+            Msg::Question {
+                fence,
+                question,
+                cancel,
+                reply,
+            } => {
+                if fence != self.live.session.fence.load(Ordering::SeqCst) || cancel.is_set() {
+                    return None;
+                }
+                let ticket = self.ticket();
+                self.replies
+                    .opening_questions
+                    .insert(ticket, (cancel, reply));
+                Event::Question { question, ticket }
+            }
             Msg::Flushed { .. } => unreachable!("mailbox admission"),
             Msg::Completed { fence, completion } => {
                 if fence != self.live.session.fence.load(Ordering::SeqCst) {
@@ -1532,11 +1561,22 @@ impl Actor {
                 }
                 match completion {
                     Completion::Event(event) => event,
-                    Completion::Tool { call, called } => Event::ToolDone {
-                        call,
-                        outcome: called.outcome,
-                        card: called.card,
-                        held: called.held,
+                    Completion::Tool { call, called } => match called.parked {
+                        Some(parked) => Event::Waits {
+                            call,
+                            on: WaitOn::Question {
+                                request: Box::new(protocol::QuestionWait {
+                                    question: parked.question,
+                                    checkpoint: Some(parked.checkpoint),
+                                }),
+                            },
+                        },
+                        None => Event::ToolDone {
+                            call,
+                            outcome: called.outcome,
+                            card: called.card,
+                            held: called.held,
+                        },
                     },
                     Completion::DeliveryLost { ticket } => {
                         self.transport_active = false;
@@ -1694,8 +1734,19 @@ impl Actor {
                 return None;
             }
         };
+        if let Event::Waits {
+            call,
+            on: WaitOn::Question { .. },
+        } = &event
+        {
+            self.live.session.cancelled(*call);
+        }
         // What was in flight reported, or was answered.
-        if let Event::ToolDone { call, .. }
+        if let Event::Waits {
+            call,
+            on: WaitOn::Question { .. },
+        }
+        | Event::ToolDone { call, .. }
         | Event::Gated { call, .. }
         | Event::Recovered { call, .. }
         | Event::Woke { call } = &event
@@ -2220,7 +2271,7 @@ impl Actor {
                 return true;
             }
             match effect {
-                Effect::RunTool { .. } | Effect::Resume { .. } => {
+                Effect::RunTool { .. } | Effect::Resume { .. } | Effect::Continue { .. } => {
                     cancelled = Some(true);
                 }
                 Effect::Prepare { .. } | Effect::Send { .. } => {
@@ -2488,6 +2539,64 @@ impl Actor {
         self.journal.writer.take();
     }
 
+    fn question_opened(&mut self, ticket: Ticket, question: CallId) {
+        if let Some((cancel, reply)) = self.replies.opening_questions.remove(&ticket) {
+            self.replies.questions.insert(question, reply);
+            let session = Arc::clone(&self.live.session);
+            let fence = session.fence.load(Ordering::SeqCst);
+            let prompts = self
+                .core
+                .ledger()
+                .independent_question(question)
+                .expect("committed question")
+                .prompts
+                .iter()
+                .map(|(key, prompt)| (key.clone(), prompt.cancel()))
+                .collect::<Vec<_>>();
+            self.live.session.shared.rt.spawn(Box::pin(async move {
+                cancel.wait().await;
+                let answer = protocol::QuestionAnswer {
+                    question: question.0,
+                    responses: prompts.into_iter().collect(),
+                };
+                session.emit(
+                    fence,
+                    Completion::Event(Event::Answer {
+                        call: question,
+                        value: Json::encode(&answer).expect("answer encodes"),
+                        origin: None,
+                        ticket: None,
+                    }),
+                );
+            }));
+        }
+    }
+    fn question_answered(&mut self, question: CallId, answer: protocol::QuestionAnswer) {
+        if let Some(reply) = self.replies.questions.remove(&question) {
+            reply.send(Ok(answer));
+        }
+    }
+
+    fn report(&self, outcome: protocol::ToolOutcome) {
+        if let (Some(parent), Some(daemon)) =
+            (self.live.parent, self.live.session.shared.daemon.upgrade())
+        {
+            let child = self.live.id;
+            self.live.session.spawn_work(
+                WorkId::Report(child),
+                Admission {
+                    through: self.journal.durable_seq,
+                    requirement: Requirement::Durable,
+                },
+                |cancel| {
+                    Box::pin(async move {
+                        unless(&cancel, daemon.report(parent.session, child, outcome)).await;
+                    })
+                },
+            );
+        }
+    }
+
     async fn effect(&mut self, effect: Effect) {
         let shared = Arc::clone(&self.live.session.shared);
         // A stopping session starts nothing: what it would have started is
@@ -2496,6 +2605,10 @@ impl Actor {
             return;
         }
         match effect {
+            Effect::QuestionOpened { ticket, question } => self.question_opened(ticket, question),
+            Effect::QuestionAnswered { question, answer } => {
+                self.question_answered(question, answer);
+            }
             Effect::Invocation { ticket, result } => self.invocation_reply(ticket, result).await,
             Effect::Delivery { ticket, result } => {
                 respond(&mut self.replies.deliveries, ticket, result);
@@ -2519,6 +2632,15 @@ impl Actor {
                 input,
                 value,
             } => self.resume_tool(call, tool, input, value),
+            Effect::Continue {
+                call,
+                tool,
+                input,
+                checkpoint,
+                answer,
+            } => {
+                self.continue_tool(call, tool, input, checkpoint, answer);
+            }
             Effect::Await { call, answer } => {
                 self.later(call, answer.0, move |gated| Event::Gated { call, gated });
             }
@@ -2556,24 +2678,7 @@ impl Actor {
                     daemon.interrupt(child);
                 }
             }
-            Effect::Report { outcome } => {
-                if let (Some(parent), Some(daemon)) = (self.live.parent, shared.daemon.upgrade()) {
-                    let child = self.live.id;
-                    self.live.session.spawn_work(
-                        WorkId::Report(child),
-                        Admission {
-                            through: self.journal.durable_seq,
-                            requirement: Requirement::Durable,
-                        },
-                        |cancel| {
-                            Box::pin(async move {
-                                unless(&cancel, daemon.report(parent.session, child, outcome))
-                                    .await;
-                            })
-                        },
-                    );
-                }
-            }
+            Effect::Report { outcome } => self.report(outcome),
             Effect::EndStream { stream, cut } => self.end_stream(stream, cut),
             Effect::DiscardStream { stream } => {
                 let store = Arc::clone(&shared.blobs);
@@ -2941,6 +3046,42 @@ impl Actor {
             request.generation.max_output_tokens = Some(spawn.request.budget.max_tokens);
         }
         Ok(request)
+    }
+
+    fn continue_tool(
+        &mut self,
+        call: CallId,
+        tool: String,
+        input: Json,
+        checkpoint: Json,
+        answer: protocol::QuestionAnswer,
+    ) {
+        self.inflight.insert(call, InFlight::Tool(Child::None));
+        let registry = Arc::clone(&self.registry);
+        let session = Arc::clone(&self.live.session);
+        let fence = session.fence.load(Ordering::SeqCst);
+        let origin = session.origin(call, fence).expect("actor generation");
+        let cx = session.cx(origin.clone(), &registry);
+        let recorded = if matches!(
+            self.core.ledger().call(call).map(|open| &open.call),
+            Some(protocol::ledger::Call::Tool {
+                invoke: Some(_),
+                ..
+            })
+        ) {
+            ext::host::Recorded::No
+        } else {
+            ext::host::Recorded::Yes
+        };
+        origin.spawn(&*self.live.session.shared.rt, async move {
+            let called = contain(
+                registry
+                    .tools()
+                    .answer(&tool, &input, checkpoint, answer, &cx, recorded),
+            )
+            .await;
+            session.emit(fence, Completion::Tool { call, called });
+        });
     }
 
     fn run_tool(&mut self, call: CallId, tool: String, input: Json, child: Child) {

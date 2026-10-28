@@ -70,6 +70,8 @@ pub struct Queued {
 
 #[derive(Clone, Debug, PartialEq, Serialize, serde::Deserialize)]
 struct ViewCall {
+    independent: bool,
+    question_seq: Option<Seq>,
     phase: Phase,
     progress: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -92,6 +94,29 @@ impl ViewCall {
 impl ViewState {
     fn call(&self, call: CallId) -> Option<&ViewCall> {
         self.calls.get(call)
+    }
+
+    pub fn question_id(&self, call: CallId) -> Option<Seq> {
+        let c = self.calls.get(call)?;
+        c.phase.asking().then_some(c.question_seq?)
+    }
+
+    pub fn awaiting_permission(&self, call: CallId) -> bool {
+        self.calls
+            .get(call)
+            .is_some_and(|c| matches!(c.phase, Phase::Waiting(WaitOn::Approval)))
+    }
+
+    pub fn question(&self, call: CallId) -> Option<(Seq, crate::Question)> {
+        let c = self.calls.get(call)?;
+        let question = match &c.phase {
+            Phase::Waiting(WaitOn::Approval) => {
+                crate::Question::confirm("Allow this tool call?".into())
+            }
+            Phase::Waiting(WaitOn::Question { request }) => request.question.clone(),
+            _ => return None,
+        };
+        Some((c.question_seq?, question))
     }
 
     pub fn inbox(&self) -> impl Iterator<Item = CallId> + '_ {
@@ -161,10 +186,29 @@ impl ViewState {
                     }
                 }
             }
+            Body::Question { question } => {
+                self.calls.insert(
+                    CallId(e.seq),
+                    ViewCall {
+                        independent: true,
+                        question_seq: Some(e.seq),
+                        phase: Phase::Waiting(WaitOn::Question {
+                            request: Box::new(crate::QuestionWait {
+                                question: question.clone(),
+                                checkpoint: None,
+                            }),
+                        }),
+                        progress: None,
+                        annotation: None,
+                    },
+                );
+            }
             Body::ToolCall { .. } | Body::ModelCall { .. } => {
                 self.calls.insert(
                     CallId(e.seq),
                     ViewCall {
+                        independent: false,
+                        question_seq: None,
                         phase: if matches!(e.body, Body::ToolCall { .. }) {
                             Phase::Gating { at: 0 }
                         } else {
@@ -185,17 +229,32 @@ impl ViewState {
             } => {
                 if let Some(c) = self.calls.get_mut(*call) {
                     c.phase.decide(d);
+                    if matches!(
+                        d,
+                        Verdict::Permission {
+                            permission: Permission::Ask(_)
+                        }
+                    ) {
+                        c.question_seq = Some(e.seq);
+                    }
                     c.discard_annotation();
                 }
             }
             Body::Wait { call, on } => {
                 if let Some(c) = self.calls.get_mut(*call) {
-                    c.phase.wait(on);
+                    let mut on = on.clone();
+                    if let WaitOn::Question { request } = &mut on {
+                        request.checkpoint = None;
+                    }
+                    c.phase.wait(&on);
+                    c.question_seq = Some(e.seq);
                     c.discard_annotation();
                 }
             }
             Body::Answer { call, value, .. } => {
-                if let Some(c) = self.calls.get_mut(*call) {
+                if self.calls.get(*call).is_some_and(|c| c.independent) {
+                    self.calls.remove(*call);
+                } else if let Some(c) = self.calls.get_mut(*call) {
                     c.phase.answer(value);
                     c.discard_annotation();
                 }
@@ -564,6 +623,10 @@ impl SessionView {
     /// replaces it, so attaching mid-call shows the same output as watching.
     pub fn present<'a>(&'a self, item: &'a Item) -> Presented<'a> {
         let mut shown = item.present();
+        shown.question_seq = self
+            .state
+            .call(CallId(item.key()))
+            .and_then(|c| c.question_seq);
         if let Item::Tool {
             call,
             outcome: None,
@@ -823,6 +886,22 @@ impl SessionView {
                 watch: None,
                 fired: None,
             },
+            Body::Question { question } => Item::Tool {
+                invoke: None,
+                call: CallId(seq),
+                tool: question.source.clone(),
+                input: Json::null(),
+                phase: Phase::Waiting(WaitOn::Question {
+                    request: Box::new(crate::QuestionWait {
+                        question: question.clone(),
+                        checkpoint: None,
+                    }),
+                }),
+                outcome: None,
+                reason: None,
+                card: None,
+                by: Audience::Plugin,
+            },
             Body::Environment(env) => Item::Environment {
                 seq,
                 cwd: env.cwd.clone(),
@@ -882,6 +961,13 @@ impl SessionView {
                 };
                 let now = self.state.call(*call).map(|open| &open.phase);
                 match (&*phase, now) {
+                    (Phase::Waiting(WaitOn::Question { .. }), None) => {
+                        *phase = Phase::Settled(OutcomeKind::Done);
+                        Some(Change::Updated {
+                            index: at,
+                            part: Part::Phase,
+                        })
+                    }
                     (Phase::Waiting(WaitOn::Approval), Some(now)) if !now.asking() => {
                         let approved = *now == Phase::Running;
                         *phase = now.clone();
@@ -1243,5 +1329,45 @@ impl io::Write for Fnv {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod question_tests {
+    use super::*;
+
+    #[test]
+    fn answering_a_service_question_releases_its_live_tracking() {
+        let mut view = SessionView::default();
+        let id = Seq::new(1).unwrap();
+        view.fold(&DaemonMsg::Entry(Entry::new(
+            id,
+            crate::Epoch(1),
+            Body::Question {
+                question: crate::Question::confirm("Continue?".into()),
+            },
+        )));
+        assert!(view.state.calls.iter().next().is_some());
+        view.fold(&DaemonMsg::Entry(Entry::new(
+            Seq::new(2).unwrap(),
+            crate::Epoch(1),
+            Body::Answer {
+                call: CallId(id),
+                value: Json::encode(&crate::QuestionAnswer::confirm(
+                    id,
+                    crate::Response::accept(),
+                ))
+                .unwrap(),
+                origin: None,
+            },
+        )));
+        assert!(view.state.calls.iter().next().is_none());
+        assert!(matches!(
+            view.items[0],
+            Item::Tool {
+                phase: Phase::Settled(_),
+                ..
+            }
+        ));
     }
 }

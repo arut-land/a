@@ -406,3 +406,16 @@ described in [the terminal backend rationale](perf/terminal.md).
 `/fork [seq]` copies the current conversation at a rest point and switches to it.
 Files stay as they are; this does not rewind or copy the workspace. The fork
 keeps its recorded cwd and environment. See [fork semantics](fork.md).
+
+## User questions
+
+Server questions use the main editor while preserving its conversation draft.
+Tab/Enter and Shift-Tab move between fields; Ctrl-S submits the complete form,
+Ctrl-N declines, and Esc answers Cancel. Strings are literal text; numbers and
+booleans use JSON values, and multiple choices use a JSON array of option
+values. Ctrl-U omits an optional field; Alt-I includes it, including an empty
+string. Defaults are editable. Invalid values leave the form open with an error.
+Batches include an accept/decline/cancel response field for each prompt.
+Ctrl-O explicitly opens the displayed URL through the native browser; repeated
+actions cycle through all URLs in a batch. Submit/Continue is separate from
+opening. Question paste preserves the literal value, including tabs/newlines.

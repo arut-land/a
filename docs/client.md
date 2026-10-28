@@ -280,3 +280,20 @@ Machine route resolution and multi-daemon session listing also use the
 shared runtime. `Sources::resolve_async` runs `ssh -G` jobs on Storage;
 `Daemons::sessions_async` opens and reads each member concurrently as tasks.
 Their blocking entry points drive the same futures.
+
+## User questions
+
+`ViewState::question(call)` supplies a typed question and its introducing
+sequence. `Offer::answer` and `Cmd::Answer` send that identity with keyed
+responses. The daemon rejects stale identities before logging an answer.
+`QuestionDraft` retains local text/defaults and parses one complete submission;
+optional absence differs from an empty string or false. Policy approval
+shortcuts build the same typed Confirm response. They only apply to gates.
+
+The line REPL prints a `/answer CALL JSON` template and a decline command.
+Form responses use `{"submit":{"field":"value"}}`, content-free confirmation
+and URL responses use `{"accept":{}}`, and each response can instead be
+`"decline"` or `"cancel"`. The envelope is
+`{"question":QUESTION_SEQ,"responses":{"SERVER_KEY":RESPONSE}}`.
+Client disconnect leaves questions open. Explicit Cancel is an answer; Stop
+is an interrupt. Opening a URL is local and never submits an answer.

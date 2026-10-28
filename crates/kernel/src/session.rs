@@ -156,6 +156,30 @@ impl Core {
         if load.created || logged.is_some_and(|logged| logged != installed) {
             self.append(&mut fx, Body::Extensions { installed });
         }
+        let abandoned: Vec<_> = self
+            .fold
+            .ledger
+            .independent_questions()
+            .map(|(id, q)| (id, q.clone()))
+            .collect();
+        for (call, question) in abandoned {
+            let answer = protocol::QuestionAnswer {
+                question: call.0,
+                responses: question
+                    .prompts
+                    .iter()
+                    .map(|(key, prompt)| (key.clone(), prompt.cancel()))
+                    .collect(),
+            };
+            self.append(
+                &mut fx,
+                Body::Answer {
+                    call,
+                    value: Json::encode(&answer).expect("question answer encodes"),
+                    origin: None,
+                },
+            );
+        }
         self.recover(load, &mut fx);
         self.finish(&mut fx);
         fx
@@ -166,6 +190,10 @@ impl Core {
     pub fn step(&mut self, event: Event) -> StepPlan {
         let mut fx = StepPlan::default();
         match event {
+            Event::Question { question, ticket } => {
+                let question = self.append(&mut fx, Body::Question { question });
+                fx.immediate.push(Work::QuestionOpened { ticket, question });
+            }
             Event::Invoke {
                 existing,
                 parent,
@@ -311,6 +339,7 @@ impl Core {
     /// anything, runs there, and nothing else is to happen until it ends.
     pub fn at_rest_but_background(&self) -> bool {
         self.turn == Turn::Idle
+            && self.fold.ledger.independent_questions().next().is_none()
             && self.failed.is_none()
             && self.fold.at_rest()
             && self.fold.ledger.untaken().iter().all(Queued::notice)
@@ -336,7 +365,8 @@ impl Core {
                 through,
                 durability: self.commit(
                     if fact { Facts::Changed } else { Facts::Notes },
-                    if fx.immediate.iter().any(Work::external) {
+                    if fx.immediate.iter().any(Work::external)
+                    {
                         Effects::External
                     } else {
                         Effects::Internal
@@ -347,13 +377,13 @@ impl Core {
         }
         for work in mem::take(&mut fx.immediate) {
             let requirement = match &work {
-                Work::RunTool { call, .. } | Work::Resume { call, .. } => {
-                    Some(if self.safe(*call) {
-                        Requirement::Ordered
-                    } else {
-                        Requirement::Durable
-                    })
-                }
+                Work::Continue { call, .. }
+                | Work::RunTool { call, .. }
+                | Work::Resume { call, .. } => Some(if self.safe(*call) {
+                    Requirement::Ordered
+                } else {
+                    Requirement::Durable
+                }),
                 Work::Prepare { .. } | Work::Send { .. } => {
                     Some(self.registry.model_contract().admission())
                 }
@@ -362,7 +392,9 @@ impl Core {
                 | Work::Recover { .. }
                 | Work::Adopt { .. }
                 | Work::EndStream { .. } => Some(Requirement::Ordered),
-                Work::Invocation { .. }
+                Work::QuestionOpened { .. }
+                | Work::QuestionAnswered { .. }
+                | Work::Invocation { .. }
                 | Work::Reply { .. }
                 | Work::Deliver { .. }
                 | Work::Delivery { .. }
@@ -752,9 +784,61 @@ impl Core {
         origin: Option<Author>,
         fx: &mut StepPlan,
     ) -> Result<(), String> {
+        if let Some(question) = self.fold.ledger.independent_question(call) {
+            let answer =
+                <protocol::QuestionAnswer as protocol::Decode>::from_json(value.raw().as_bytes())
+                    .map_err(|e| e.to_string())?;
+            if answer.question != call.0 {
+                return Err("question is no longer pending".into());
+            }
+            question.validate(&answer)?;
+            self.append(
+                fx,
+                Body::Answer {
+                    call,
+                    value,
+                    origin,
+                },
+            );
+            fx.immediate.push(Work::QuestionAnswered {
+                question: call,
+                answer,
+            });
+            return Ok(());
+        }
         let on = match self.fold.ledger.call(call).map(|open| &open.phase) {
             Some(Phase::Waiting(on)) if !matches!(on, WaitOn::Child { .. }) => on.clone(),
             _ => return Err(format!("call {call} is not waiting for an answer")),
+        };
+        let answered = if matches!(&on, WaitOn::Approval | WaitOn::Question { .. }) {
+            let answer =
+                <protocol::QuestionAnswer as protocol::Decode>::from_json(value.raw().as_bytes())
+                    .map_err(|e| format!("invalid answer: {e}"))?;
+            if self
+                .fold
+                .ledger
+                .call(call)
+                .and_then(|open| open.question_seq)
+                != Some(answer.question)
+            {
+                return Err("question is no longer pending".into());
+            }
+            match &on {
+                WaitOn::Approval => {
+                    protocol::Question::confirm("Allow this tool call?".into())
+                        .validate(&answer)?;
+                }
+                WaitOn::Question { request } => {
+                    request.question.validate(&answer)?;
+                    if request.checkpoint.is_none() {
+                        return Err("question has no continuation".into());
+                    }
+                }
+                _ => unreachable!(),
+            }
+            Some(answer)
+        } else {
+            None
         };
         self.append(
             fx,
@@ -765,11 +849,31 @@ impl Core {
             },
         );
         match on {
-            WaitOn::Approval if value.parse::<bool>().unwrap_or(false) => self.run(call, fx),
+            WaitOn::Approval
+                if answered
+                    .as_ref()
+                    .is_some_and(protocol::QuestionAnswer::accepted) =>
+            {
+                self.run(call, fx);
+            }
             WaitOn::Approval => {
                 self.close(call);
                 let error = "the user did not approve this call".to_owned();
                 self.settle(call, Outcome::Failed { error }, None, fx);
+            }
+            WaitOn::Question { request } => {
+                let checkpoint = request.checkpoint.expect("question continuation validated");
+                let Some((tool, input)) = self.tool_of(call) else {
+                    return Ok(());
+                };
+                self.set_step(call, Step::Running);
+                fx.immediate.push(Work::Continue {
+                    call,
+                    tool,
+                    input,
+                    checkpoint,
+                    answer: answered.expect("question answer validated"),
+                });
             }
             _ => self.resume_call(call, value, fx),
         }
@@ -1253,7 +1357,7 @@ impl Core {
         let acting = matches!(self.turn, Turn::Acting { .. });
         if !acting
             || self.step_of(call) != Some(Step::Running)
-            || !matches!(on, WaitOn::Dialog { .. } | WaitOn::Client { .. })
+            || !matches!(on, WaitOn::Question { .. } | WaitOn::Client { .. })
         {
             return;
         }

@@ -253,6 +253,8 @@ macro_rules! same {
 }
 
 same!(
+    crate::Question,
+    crate::QuestionAnswer,
     crate::Invocation,
     crate::Segments,
     crate::Envelope,
@@ -477,8 +479,9 @@ pub(crate) struct EntryFields {
     pub(crate) failure: Option<Json>,
     pub(crate) after_ms: Option<u64>,
     pub(crate) on: Option<Tag>,
+    pub(crate) question: Option<crate::Question>,
     #[serde(default, deserialize_with = "present")]
-    pub(crate) ui: Option<Json>,
+    pub(crate) checkpoint: Option<Json>,
     pub(crate) link: Option<Seq>,
     #[serde(default, deserialize_with = "present")]
     pub(crate) value: Option<Json>,
@@ -552,7 +555,7 @@ pub(crate) struct MsgFields {
     pub(crate) decl: Option<ClientDecl>,
     pub(crate) sites: Option<Vec<String>>,
     pub(crate) client_seq: Option<u64>,
-    pub(crate) approved: Option<bool>,
+    pub(crate) answer: Option<crate::QuestionAnswer>,
     pub(crate) change: Option<SettingsChange>,
     pub(crate) force: Option<bool>,
     // A withdrawal's seq; JSON, as other messages carry a tool's input.
@@ -646,6 +649,15 @@ fn read<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
 
 pub(crate) fn environment_entry(f: &mut EntryFields) -> Result<Body> {
     environment(f.cwd.take(), f.vars.take(), f.redacted.take(), f.tty.take()).map(Body::Environment)
+}
+
+pub(crate) fn question_wait(f: &mut EntryFields) -> Result<WaitOn> {
+    Ok(WaitOn::Question {
+        request: Box::new(crate::QuestionWait {
+            question: need(f.question.take(), "question")?,
+            checkpoint: def(f.checkpoint.take())?,
+        }),
+    })
 }
 
 pub(crate) fn wait_entry(f: &mut EntryFields) -> Result<Body> {

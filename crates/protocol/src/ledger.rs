@@ -20,6 +20,7 @@ pub struct Ledger {
     acknowledgements: Vec<(EnvelopeId, Option<InboxRefusal>)>,
     /// Model and tool calls with an intent and no outcome.
     open: Keyed<CallId, Open>,
+    questions: Keyed<CallId, crate::Question>,
     /// What is queued and not yet taken up, in order.
     untaken: Vec<Queued>,
     /// Calls detached as they ran whose outcome has not come back.
@@ -52,6 +53,7 @@ pub struct Ledger {
 pub struct Open {
     pub call: Call,
     pub phase: Phase,
+    pub question_seq: Option<Seq>,
     /// The process groups it started, with the boot each ran in.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub processes: Vec<(u32, String)>,
@@ -101,7 +103,10 @@ impl Phase {
     /// Whether the call waits for a user's approval: what every client
     /// attached is asked for.
     pub const fn asking(&self) -> bool {
-        matches!(self, Self::Waiting(WaitOn::Approval))
+        matches!(
+            self,
+            Self::Waiting(WaitOn::Approval | WaitOn::Question { .. })
+        )
     }
 
     pub(crate) fn decide(&mut self, d: &Verdict) {
@@ -142,7 +147,11 @@ impl Phase {
 
     pub(crate) fn answer(&mut self, value: &Json) {
         match self {
-            Self::Waiting(WaitOn::Approval) => self.approve(value.parse().unwrap_or_default()),
+            Self::Waiting(WaitOn::Approval) => self.approve(
+                value
+                    .parse::<crate::QuestionAnswer>()
+                    .is_ok_and(|a| a.accepted()),
+            ),
             Self::Waiting(_) => *self = Self::Running,
             _ => {}
         }
@@ -419,6 +428,13 @@ impl Ledger {
                     });
                 }
             }
+            Body::Question { question } => {
+                self.questions.insert(CallId(seq), question.clone());
+            }
+            Body::Answer { call, value, .. } => {
+                self.questions.remove(*call);
+                self.answer(*call, value);
+            }
             Body::ToolCall { .. }
             | Body::ModelCall { .. }
             | Body::ToolProcess { .. }
@@ -429,8 +445,7 @@ impl Ledger {
             | Body::Wait { .. }
             | Body::Watch { .. }
             | Body::Fired { .. }
-            | Body::Unwatch { .. }
-            | Body::Answer { .. } => self.track(CallId(seq), body),
+            | Body::Unwatch { .. } => self.track(CallId(seq), body),
             // What runs in the background ends with the interrupt.
             Body::Interrupt { .. } => {
                 self.detached.clear();
@@ -527,9 +542,24 @@ impl Ledger {
                 call: Some(call),
                 d,
                 ..
-            } => self.decide(*call, d),
-            Body::Wait { call, on } => self.wait(*call, on),
-            Body::Answer { call, value, .. } => self.answer(*call, value),
+            } => {
+                self.decide(*call, d);
+                if matches!(
+                    d,
+                    Verdict::Permission {
+                        permission: Permission::Ask(_)
+                    }
+                ) && let Some(open) = self.open.get_mut(*call)
+                {
+                    open.question_seq = Some(here.0);
+                }
+            }
+            Body::Wait { call, on } => {
+                self.wait(*call, on);
+                if let Some(open) = self.open.get_mut(*call) {
+                    open.question_seq = Some(here.0);
+                }
+            }
             Body::Watch { child } => {
                 self.armed.insert(here.0, *child);
                 if let Err(at) = self.watched.binary_search(&child.0.as_u128()) {
@@ -553,6 +583,7 @@ impl Ledger {
             Open {
                 call: what,
                 phase,
+                question_seq: None,
                 processes: Vec::new(),
                 progress: None,
             },
@@ -754,9 +785,19 @@ impl Ledger {
         self.turn
     }
 
+    pub fn independent_questions(&self) -> impl Iterator<Item = (CallId, &crate::Question)> {
+        self.questions.iter()
+    }
+    pub fn independent_question(&self, call: CallId) -> Option<&crate::Question> {
+        self.questions.get(call)
+    }
+
     /// What the session is doing, as its log says: what waits on someone
     /// first, then whether anything runs or waits to.
     pub fn activity(&self) -> Activity {
+        if !self.questions.is_empty() {
+            return Activity::Input;
+        }
         let waits = |on: fn(&WaitOn) -> bool| {
             self.open
                 .iter()
@@ -764,7 +805,7 @@ impl Ledger {
         };
         if waits(|w| *w == WaitOn::Approval) {
             Activity::Approval
-        } else if waits(|w| matches!(w, WaitOn::Dialog { .. })) {
+        } else if waits(|w| matches!(w, WaitOn::Question { .. })) {
             Activity::Input
         } else if waits(|w| matches!(w, WaitOn::Client { .. })) {
             Activity::Client

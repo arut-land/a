@@ -279,6 +279,8 @@ fn call(
             );
             return None;
         }
+        "ask" => question_round(request, marker),
+        "ask_state" => json!({"resultType":"input_required","requestState":"state-only"}),
         "input" => json!({"resultType":"input_required","inputRequests":{}}),
         _ => {
             json!({"resultType":"complete","content":[{"type":"text","text":request["params"]["arguments"].to_string()}]})
@@ -326,4 +328,45 @@ fn reorder(request: &Value) {
         );
         send(&json!({"jsonrpc":"2.0","id":id,"result":{"resultType":"complete","index":index}}));
     });
+}
+
+fn question_round(request: &Value, marker: &str) -> Value {
+    let params = &request["params"];
+    writeln!(
+        OpenOptions::new()
+            .append(true)
+            .open(format!("{marker}.rounds"))
+            .unwrap_or_else(|_| OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(format!("{marker}.rounds"))
+                .unwrap()),
+        "{request}"
+    )
+    .unwrap();
+    match params.get("inputResponses") {
+        None => {
+            json!({"resultType":"input_required","requestState":"opaque ☃","inputRequests":{
+                "$continue":{"method":"elicitation/create","params":{"message":"Contact","requestedSchema":{"type":"object","properties":{
+                    "name":{"type":"string","minLength":1},
+                    "age":{"type":"integer","minimum":18},
+                    "opt":{"type":"boolean","default":false},
+                    "color":{"type":"string","oneOf":[{"const":"red","title":"Red"},{"const":"blue","title":"Blue"}]},
+                    "tags":{"type":"array","minItems":1,"items":{"anyOf":[{"const":"one","title":"One"},{"const":"two","title":"Two"}]}}
+                },"required":["name","age","color","tags"]}}}
+            }})
+        }
+        Some(responses) if params.get("requestState").is_some() => {
+            assert_eq!(params["requestState"], "opaque ☃");
+            assert_eq!(
+                responses["$continue"]["content"],
+                json!({"name":"Ada","age":37,"opt":false,"color":"red","tags":["one"]})
+            );
+            json!({"resultType":"input_required","inputRequests":{"browser":{"method":"elicitation/create","params":{"mode":"url","message":"Finish in your browser","url":"https://example.com/consent"}}}})
+        }
+        Some(responses) => {
+            assert_eq!(responses["browser"], json!({"action":"accept"}));
+            json!({"resultType":"complete","content":[{"type":"text","text":"finished"}]})
+        }
+    }
 }

@@ -124,7 +124,7 @@ fn crashes_and_protocol_failures_are_logged_as_distinct_facts() {
             message: "bad arguments".into()
         }
     );
-    assert_eq!(failed(&rig, "input"), Failure::InputRequired);
+    assert!(matches!(failed(&rig, "input"), Failure::Protocol(_)));
     finish(rig);
 }
 
@@ -649,7 +649,7 @@ fn only_fresh_complete_lists_are_reused_and_every_page_limits_freshness() {
         let rig = peer.rig();
         let first = rig.done("mcp_list", &json!({"server":"fixture"}));
         if mode == "mrtr" {
-            assert_eq!(first["failed"], "input_required");
+            assert!(first["failed"].get("protocol").is_some(), "{first}");
         } else {
             assert!(first.get("ok").is_some(), "{mode}: {first}");
         }
@@ -1024,4 +1024,153 @@ fn a_hooked_session_cannot_reuse_an_already_admitted_shared_instance() {
     drop(cx);
     finish(hooked);
     finish(owner);
+}
+
+#[test]
+fn form_and_url_rounds_preserve_server_keys_and_state_without_restarting_the_call() {
+    use protocol::{Json, QuestionAnswer, Response, Seq};
+    use std::collections::BTreeMap;
+    let rig = rig("elicitation", Duration::from_secs(2));
+    let cx = rig.cx();
+    let input = Json::encode(&json!({"server":"fixture","tool":"ask","arguments":{}})).unwrap();
+    let tools = rig.registry.tools();
+    let tool = tools.get("mcp_call").unwrap();
+    let called = rt::block_on(tools.run("mcp_call", &input, None, &cx));
+    let first = called.parked.unwrap();
+    let values = json!({"name":"Ada","age":37,"opt":false,"color":"red","tags":["one"]})
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(k, v)| (k.clone(), Json::encode(v).unwrap()))
+        .collect();
+    let answer = QuestionAnswer {
+        question: Seq::new(1).unwrap(),
+        responses: BTreeMap::from([("$continue".into(), Response::Submit(values))]),
+    };
+    first.question.validate(&answer).unwrap();
+    // Human waiting has no exchange timer or retained request future.
+    std::thread::sleep(Duration::from_millis(2100));
+    let called =
+        rt::block_on(tool.answer(tool.parse(&input).unwrap(), first.checkpoint, answer, &cx));
+    let second = called.parked.unwrap();
+    assert!(matches!(
+        second.question.prompts["browser"],
+        protocol::Prompt::Url { .. }
+    ));
+    let answer = QuestionAnswer {
+        question: Seq::new(2).unwrap(),
+        responses: BTreeMap::from([("browser".into(), Response::accept())]),
+    };
+    let called =
+        rt::block_on(tool.answer(tool.parse(&input).unwrap(), second.checkpoint, answer, &cx));
+    assert!(called.parked.is_none());
+    assert!(matches!(called.outcome, protocol::Outcome::Done { .. }));
+    let rounds =
+        std::fs::read_to_string(rig.workspace().join("effects-elicitation.rounds")).unwrap();
+    let rounds: Vec<Value> = rounds
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rounds.len(), 3);
+    assert_ne!(rounds[0]["id"], rounds[1]["id"]);
+    assert_ne!(rounds[1]["id"], rounds[2]["id"]);
+    assert!(rounds[2]["params"].get("requestState").is_none());
+    finish(rig);
+}
+
+#[test]
+fn a_saved_continuation_is_refused_before_contacting_a_changed_server_configuration() {
+    let rig = rig("question-binding", Duration::from_secs(2));
+    let cx = rig.cx();
+    let input =
+        protocol::Json::encode(&json!({"server":"fixture","tool":"ask","arguments":{}})).unwrap();
+    let first = rt::block_on(rig.registry.tools().run("mcp_call", &input, None, &cx))
+        .parked
+        .unwrap();
+    let changed = Mcp::new(
+        vec![Server {
+            name: "fixture".parse().unwrap(),
+            description: "changed".into(),
+            transport: Transport::Stdio(vec!["must-not-be-started".into()]),
+            env: BTreeMap::new(),
+        }],
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    let registry = Registry::default().with(&changed).unwrap();
+    let tool = registry.tools().get("mcp_call").unwrap();
+    let answer = protocol::QuestionAnswer {
+        question: protocol::Seq::new(1).unwrap(),
+        responses: first
+            .question
+            .prompts
+            .keys()
+            .map(|key| (key.clone(), protocol::Response::Decline))
+            .collect(),
+    };
+    let result =
+        rt::block_on(tool.answer(tool.parse(&input).unwrap(), first.checkpoint, answer, &cx));
+    let protocol::Outcome::Done {
+        output: protocol::Payload::Inline(output),
+    } = result.outcome
+    else {
+        panic!("expected typed configuration refusal")
+    };
+    let output: Value = output.parse().unwrap();
+    assert!(output["failed"].get("configuration").is_some(), "{output}");
+    let rounds =
+        std::fs::read_to_string(rig.workspace().join("effects-question-binding.rounds")).unwrap();
+    assert_eq!(rounds.lines().count(), 1);
+    finish(rig);
+}
+
+#[test]
+fn declining_or_cancelling_a_state_only_round_sends_no_invented_input_key() {
+    for action in [
+        protocol::ContinueAnswer::Decline,
+        protocol::ContinueAnswer::Cancel,
+    ] {
+        let rig = rig("state-only", Duration::from_secs(2));
+        let cx = rig.cx();
+        let input =
+            protocol::Json::encode(&json!({"server":"fixture","tool":"ask_state","arguments":{}}))
+                .unwrap();
+        let tools = rig.registry.tools();
+        let tool = tools.get("mcp_call").unwrap();
+        let first = rt::block_on(tools.run("mcp_call", &input, None, &cx))
+            .parked
+            .unwrap();
+        let answer = protocol::QuestionAnswer {
+            question: protocol::Seq::new(1).unwrap(),
+            responses: first
+                .question
+                .prompts
+                .keys()
+                .map(|key| (key.clone(), protocol::Response::Continue(action.clone())))
+                .collect(),
+        };
+        first.question.validate(&answer).unwrap();
+        let result =
+            rt::block_on(tool.answer(tool.parse(&input).unwrap(), first.checkpoint, answer, &cx));
+        assert!(result.parked.is_none());
+        let protocol::Outcome::Done {
+            output: protocol::Payload::Inline(output),
+        } = result.outcome
+        else {
+            panic!("typed cancellation");
+        };
+        assert_eq!(
+            output.parse::<Value>().unwrap(),
+            json!({"failed":"cancelled"})
+        );
+        let effects = std::fs::read_to_string(rig.workspace().join("effects-state-only")).unwrap();
+        assert_eq!(
+            effects
+                .lines()
+                .filter(|line| line.starts_with("call "))
+                .count(),
+            1
+        );
+        finish(rig);
+    }
 }
