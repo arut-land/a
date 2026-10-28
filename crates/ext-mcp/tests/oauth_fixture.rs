@@ -78,6 +78,8 @@ impl State<'_> {
             if needs_auth || step_up {
                 let (status, extra) = if step_up {
                     (403, ", error=\"insufficient_scope\", scope=\"write\"")
+                } else if self.scenario == "no-scope" {
+                    (401, "")
                 } else {
                     (401, ", scope=\"read\"")
                 };
@@ -97,11 +99,11 @@ impl State<'_> {
             );
         }
         if target == "/metadata" {
-            return (
-                200,
-                String::new(),
-                json!({"resource":format!("{origin}/mcp"),"authorization_servers":[format!("{origin}/issuer")],"scopes_supported":["read"]}),
-            );
+            let mut metadata = json!({"resource":format!("{origin}/mcp"),"authorization_servers":[format!("{origin}/issuer")],"scopes_supported":["read"]});
+            if self.scenario == "no-scope" {
+                metadata.as_object_mut().unwrap().remove("scopes_supported");
+            }
+            return (200, String::new(), metadata);
         }
         if target == "/.well-known/oauth-authorization-server/issuer" {
             return (
@@ -136,7 +138,10 @@ impl State<'_> {
         assert_eq!(params["resource"], format!("{}/mcp", self.origin));
         assert_eq!(params["code_challenge_method"], "S256");
         self.challenge.clone_from(&params["code_challenge"]);
-        self.scope.clone_from(&params["scope"]);
+        if self.scenario == "no-scope" {
+            assert!(!params.contains_key("scope"));
+        }
+        self.scope = params.get("scope").cloned().unwrap_or_default();
         let query = form_urlencoded::Serializer::new(String::new())
             .extend_pairs([
                 ("code", "fixture-code"),
@@ -200,5 +205,5 @@ impl State<'_> {
 fn local_document(id: &str) -> Value {
     assert_eq!(id, ext_mcp::OAUTH_CLIENT_ID);
     // RFC 8252 native loopback redirect matching permits an ephemeral port.
-    json!({"client_id":id,"client_name":"a","redirect_uris":["http://127.0.0.1/oauth/callback"],"grant_types":["authorization_code","refresh_token"],"response_types":["code"],"token_endpoint_auth_method":"none"})
+    json!({"client_id":id,"client_name":"a","application_type":"native","redirect_uris":["http://127.0.0.1/oauth/callback"],"grant_types":["authorization_code","refresh_token"],"response_types":["code"],"token_endpoint_auth_method":"none"})
 }

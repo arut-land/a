@@ -345,7 +345,7 @@ On the M3, Rust nightly-2026-10-17, `opt-level=z`, fat LTO, one codegen unit,
 stripped, a standalone Secret Service reader using `secret-service` 5.2.0 with
 `default-features=false, features=["rt-async-io-crypto-rust"]` linked **1,222,320
 bytes**. Its normal dependency graph contained **96 distinct packages including
-the probe**, with no crate named `tokio`. The same probe using `std::fs::read`
+the probe** on macOS and **97** for Linux, with no crate named `tokio` in either. The same probe using `std::fs::read`
 linked **286,368 bytes**. The **935,952-byte** difference is an isolated reader
 comparison, not a predicted change to `a`; it does not include shared-dependency
 elimination in `a`. It establishes the substantial D-Bus/crypto surface needed
@@ -361,7 +361,8 @@ Only `http-auth` is a new package in the workspace lock resolution; its `memchr`
 dependency, `form_urlencoded` and `percent-encoding` were already present.
 
 There is no OAuth background task, connection, poller or refresh timer. Credentials
-are loaded only inside an HTTP operation, and discovery/refresh/browser interaction
-happen only after an authorization challenge. Payload clones share their existing
+are loaded only after an authorization challenge, then shared in memory for that
+registry. Public servers and successful authenticated calls perform no credential
+I/O. Discovery, refresh and browser interaction happen only after a challenge. Payload clones share their existing
 `Arc` pieces while authentication retries, rather than copying the request body.
 Shipped size and interleaved idle observations are recorded after main integration.

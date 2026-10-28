@@ -10,6 +10,7 @@ mod incoming;
 mod name;
 mod oauth;
 pub use name::{ServerName, ToolName};
+mod redirect;
 mod rpc;
 mod stdio;
 
@@ -49,6 +50,7 @@ struct Inner {
     timeout: Duration,
     clients: Mutex<HashMap<(SessionId, ServerName), stdio::Client>>,
     registrations: BTreeMap<ServerName, oauth::Registration>,
+    auth: Arc<oauth::State>,
 }
 
 struct RemoteTool {
@@ -96,6 +98,7 @@ impl Mcp {
             timeout,
             clients: Mutex::default(),
             registrations: BTreeMap::new(),
+            auth: Arc::default(),
         })))
     }
 
@@ -169,6 +172,7 @@ impl Mcp {
                         params,
                         headers,
                         self.0.registrations.get(&server.name),
+                        &self.0.auth,
                         cx,
                     )
                     .await
@@ -602,7 +606,7 @@ mod publication_tests {
     }
 
     #[test]
-    fn http_only_mcp_needs_no_process_provider() {
+    fn public_http_needs_neither_a_process_provider_nor_credential_access() {
         let mcp = Mcp::new(
             vec![Server {
                 name: ServerName::try_from("http-only".to_owned()).unwrap(),
@@ -614,6 +618,7 @@ mod publication_tests {
         )
         .unwrap();
         let home = Rig::new("mcp-home", Registry::default());
+        std::fs::write(home.dir.join("credentials"), b"not a credential directory").unwrap();
         let registry = Registry::default()
             .with(&IsolatedCredentials(
                 sys::credentials::Credentials::isolated(home.dir.join("credentials")),

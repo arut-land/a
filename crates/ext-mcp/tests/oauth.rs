@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::path::Path;
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -89,31 +90,8 @@ fn get(url: &str) -> String {
     response
 }
 
-fn exercise(scenario: &str) {
-    let root = Rig::new("oauth-home", Registry::default());
-    let marker = root.dir.join("endpoint");
-    let _peer = Peer(
-        Command::new(env!("CARGO_BIN_EXE_mcp-fixture"))
-            .arg("--http")
-            .arg(&marker)
-            .arg(scenario)
-            .spawn()
-            .unwrap(),
-    );
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let origin = loop {
-        if let Ok(url) = std::fs::read_to_string(&marker) {
-            break url;
-        }
-        assert!(Instant::now() < deadline, "fixture did not bind");
-        std::thread::sleep(Duration::from_millis(5));
-    };
-    let browser = Browser {
-        credentials: sys::credentials::Credentials::isolated(root.dir.join("credentials")),
-        approvals: Arc::default(),
-        threads: Arc::default(),
-    };
-    let mcp = if matches!(scenario, "preregistered" | "wrong-registration-issuer") {
+fn configured(root: &Rig, origin: &str, scenario: &str) -> Mcp {
+    if matches!(scenario, "preregistered" | "wrong-registration-issuer") {
         let path = root.dir.join("config.toml");
         let issuer = if scenario == "wrong-registration-issuer" {
             "wrong"
@@ -136,7 +114,39 @@ fn exercise(scenario: &str) {
             Duration::from_secs(10),
         )
         .unwrap()
+    }
+}
+
+fn serve(marker: &Path, scenario: &str) -> (Peer, String) {
+    let peer = Peer(
+        Command::new(env!("CARGO_BIN_EXE_mcp-fixture"))
+            .arg("--http")
+            .arg(marker)
+            .arg(scenario)
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let origin = loop {
+        if let Ok(url) = std::fs::read_to_string(marker) {
+            break url;
+        }
+        assert!(Instant::now() < deadline, "fixture did not bind");
+        std::thread::sleep(Duration::from_millis(5));
     };
+    (peer, origin)
+}
+
+fn exercise(scenario: &str) {
+    let root = Rig::new("oauth-home", Registry::default());
+    let marker = root.dir.join("endpoint");
+    let (_peer, origin) = serve(&marker, scenario);
+    let browser = Browser {
+        credentials: sys::credentials::Credentials::isolated(root.dir.join("credentials")),
+        approvals: Arc::default(),
+        threads: Arc::default(),
+    };
+    let mcp = configured(&root, &origin, scenario);
     let rig = Rig::new(
         "oauth",
         Registry::default()
@@ -161,12 +171,30 @@ fn exercise(scenario: &str) {
             json!([]),
             "authorization must finish: {result}"
         );
+        if scenario == "cached" {
+            std::fs::remove_dir_all(root.dir.join("credentials")).unwrap();
+            std::fs::write(root.dir.join("credentials"), b"store unavailable").unwrap();
+        }
         let result = rig.done("mcp_list", &json!({"server":"fixture"}));
         assert_eq!(
             result["ok"],
             json!([]),
             "later operation must finish: {result}"
         );
+        if scenario == "basic" {
+            let fresh = Rig::new(
+                "oauth-restarted",
+                Registry::default()
+                    .with(&configured(&root, &origin, scenario))
+                    .unwrap()
+                    .with(&browser)
+                    .unwrap(),
+            );
+            assert_eq!(
+                fresh.done("mcp_list", &json!({"server":"fixture"}))["ok"],
+                json!([])
+            );
+        }
         let expected = usize::from(matches!(
             scenario,
             "stepup" | "during-call-stepup" | "revoked"
@@ -174,10 +202,13 @@ fn exercise(scenario: &str) {
         assert_eq!(browser.approvals.load(Ordering::SeqCst), expected);
         assert_eq!(
             std::fs::read_to_string(marker.with_extension("tokens")).unwrap(),
-            if matches!(scenario, "basic" | "preregistered") {
-                "1"
-            } else {
+            if matches!(
+                scenario,
+                "refresh" | "revoked" | "stepup" | "during-call-stepup"
+            ) {
                 "2"
+            } else {
+                "1"
             }
         );
         if matches!(scenario, "stepup" | "during-call-stepup") {
@@ -241,4 +272,14 @@ fn a_pre_registered_client_id_is_used_when_metadata_documents_are_unavailable() 
 #[test]
 fn a_pre_registered_client_id_cannot_be_sent_to_another_issuer() {
     exercise("wrong-registration-issuer");
+}
+
+#[test]
+fn authorization_omits_scope_when_neither_challenge_nor_metadata_names_one() {
+    exercise("no-scope");
+}
+
+#[test]
+fn successful_protected_calls_reuse_credentials_without_reopening_the_store() {
+    exercise("cached");
 }

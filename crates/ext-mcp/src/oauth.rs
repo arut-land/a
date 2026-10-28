@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::poll_fn;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use base64::Engine;
 use ext::{Cx, Tool};
@@ -35,7 +35,11 @@ pub(crate) struct Client {
     pub inner: Arc<dyn Http>,
     pub cx: Cx,
     pub registration: Option<Registration>,
+    pub state: Arc<State>,
 }
+
+#[derive(Default)]
+pub(super) struct State(Mutex<BTreeMap<String, Arc<Credential>>>);
 
 // No Debug: the token endpoint response is a secret, including refresh tokens.
 #[derive(Serialize, Deserialize)]
@@ -74,6 +78,7 @@ struct Authorization<'a> {
     resource: String,
     registration: Option<&'a Registration>,
     store: sys::credentials::Credentials,
+    state: &'a State,
 }
 
 impl Http for Client {
@@ -84,23 +89,14 @@ impl Http for Client {
         let inner = Arc::clone(&self.inner);
         let cx = self.cx.clone();
         let registration = self.registration.clone();
+        let state = Arc::clone(&self.state);
         Box::pin(async move {
-            let authorization = Authorization {
-                client: &*inner,
-                cx: &cx,
-                runtime: cx
-                    .service::<dyn rt::Runtime>()
-                    .ok_or_else(|| failure("no runtime"))?,
-                resource: request.uri().to_string(),
-                registration: registration.as_ref(),
-                store: match cx.service::<sys::credentials::Credentials>() {
-                    Some(store) => store.clone(),
-                    None => sys::credentials::Credentials::from_env()?,
-                },
-            };
-            let mut credential = authorization.load().await?;
+            let resource = request.uri().to_string();
+            let mut credential = crate::lock(&state.0).get(&resource).cloned();
+            let mut loaded = credential.is_some();
+            let mut authorizations = 0;
             let (parts, body) = request.into_parts();
-            for attempt in 0..3 {
+            loop {
                 let mut request = http::Request::builder()
                     .method(parts.method.clone())
                     .uri(parts.uri.clone())
@@ -134,23 +130,44 @@ impl Http for Client {
                 {
                     return Ok(response);
                 }
-                if attempt == 2 {
+                drop(response);
+                let authorization = Authorization {
+                    client: &*inner,
+                    cx: &cx,
+                    runtime: cx
+                        .service::<dyn rt::Runtime>()
+                        .ok_or_else(|| failure("no runtime"))?,
+                    resource: resource.clone(),
+                    registration: registration.as_ref(),
+                    store: match cx.service::<sys::credentials::Credentials>() {
+                        Some(store) => store.clone(),
+                        None => sys::credentials::Credentials::from_env()?,
+                    },
+                    state: &state,
+                };
+                if !loaded {
+                    loaded = true;
+                    credential = authorization.load().await?;
+                    if credential.is_some() {
+                        continue;
+                    }
+                }
+                if authorizations == 2 {
                     return Err(failure("authorization rejected after retry"));
                 }
-                drop(response);
                 credential = Some(
                     authorization
-                        .renew(status, &challenge, credential, attempt)
+                        .renew(status, &challenge, credential, authorizations)
                         .await?,
                 );
+                authorizations += 1;
             }
-            Err(failure("authorization rejected"))
         })
     }
 }
 
 impl Authorization<'_> {
-    async fn load(&self) -> std::io::Result<Option<Credential>> {
+    async fn load(&self) -> std::io::Result<Option<Arc<Credential>>> {
         let store = self.store.clone();
         let resource = self.resource.clone();
         let saved = rt::unblock(self.runtime, move || store.load(&resource)).await?;
@@ -165,6 +182,10 @@ impl Authorization<'_> {
         {
             return Err(failure("stored resource mismatch"));
         }
+        let credential = credential.map(Arc::new);
+        if let Some(credential) = &credential {
+            crate::lock(&self.state.0).insert(self.resource.clone(), Arc::clone(credential));
+        }
         Ok(credential)
     }
 
@@ -175,16 +196,20 @@ impl Authorization<'_> {
             .map_err(|_| failure("credential encoding failed"))?;
         let store = self.store.clone();
         let key = self.resource.clone();
-        rt::unblock(self.runtime, move || store.save(&key, encoded.as_deref())).await
+        rt::unblock(self.runtime, move || store.save(&key, encoded.as_deref())).await?;
+        if credential.is_none() {
+            crate::lock(&self.state.0).remove(&self.resource);
+        }
+        Ok(())
     }
 
     async fn renew(
         &self,
         status: http::StatusCode,
         challenge: &BTreeMap<String, String>,
-        previous: Option<Credential>,
+        previous: Option<Arc<Credential>>,
         attempt: usize,
-    ) -> std::io::Result<Credential> {
+    ) -> std::io::Result<Arc<Credential>> {
         let (resource_metadata, server) =
             discover(self.client, &self.resource, challenge, self.registration).await?;
         let client_id = if let Some(registration) = self.registration {
@@ -257,6 +282,8 @@ impl Authorization<'_> {
             refresh_token: fresh.refresh_token.or(refresh_token),
         };
         self.save(Some(&credential)).await?;
+        let credential = Arc::new(credential);
+        crate::lock(&self.state.0).insert(self.resource.clone(), Arc::clone(&credential));
         Ok(credential)
     }
 }
@@ -316,13 +343,12 @@ async fn discover(
     let urls = if let Some(url) = challenge.get("resource_metadata") {
         vec![url.clone()]
     } else {
-        vec![
-            format!(
-                "{origin}/.well-known/oauth-protected-resource{}",
-                if uri.path() == "/" { "" } else { uri.path() }
-            ),
-            format!("{origin}/.well-known/oauth-protected-resource"),
-        ]
+        let root = format!("{origin}/.well-known/oauth-protected-resource");
+        if uri.path() == "/" {
+            vec![root]
+        } else {
+            vec![format!("{root}{}", uri.path()), root]
+        }
     };
     let value = first_metadata(client, &urls).await?;
     let metadata: ProtectedResource = serde_json::from_value(value)
@@ -462,7 +488,7 @@ async fn authorize(
     let runtime = cx
         .service::<dyn rt::Runtime>()
         .ok_or_else(|| failure("no runtime"))?;
-    let listener = rt::OAuthRedirect::bind(&runtime.reactor())?;
+    let listener = crate::redirect::Redirect::bind(&runtime.reactor())?;
     let redirect = listener.uri();
     let verifier =
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sys::credentials::oauth_nonce()?);
@@ -471,16 +497,19 @@ async fn authorize(
     let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode(Sha256::digest(verifier.as_bytes()));
     let params = form_urlencoded::Serializer::new(String::new())
-        .extend_pairs([
-            ("response_type", "code"),
-            ("client_id", client_id),
-            ("redirect_uri", &redirect),
-            ("resource", resource),
-            ("scope", scopes),
-            ("state", &state),
-            ("code_challenge", &challenge),
-            ("code_challenge_method", "S256"),
-        ])
+        .extend_pairs(
+            [
+                ("response_type", "code"),
+                ("client_id", client_id),
+                ("redirect_uri", &redirect),
+                ("resource", resource),
+                ("state", &state),
+                ("code_challenge", &challenge),
+                ("code_challenge_method", "S256"),
+            ]
+            .into_iter()
+            .chain((!scopes.is_empty()).then_some(("scope", scopes))),
+        )
         .finish();
     let url = format!(
         "{}{}{params}",

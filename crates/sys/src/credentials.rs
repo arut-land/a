@@ -222,9 +222,7 @@ mod native {
         let data = Owned(unsafe {
             CFDataCreate(ptr::null(), secret.as_ptr(), secret.len().cast_signed())
         });
-        // SAFETY: the empty dictionary borrows values kept alive below.
-        let attributes =
-            Owned(unsafe { CFDictionaryCreateMutable(ptr::null(), 0, ptr::null(), ptr::null()) });
+        let attributes = dictionary();
         // SAFETY: dictionaries and their borrowed keys/values are live throughout.
         let status = unsafe {
             CFDictionarySetValue(attributes.0, kSecValueData, data.0);
@@ -414,6 +412,7 @@ mod tests {
     }
     #[cfg(any(target_os = "macos", windows))]
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support native credential stores")]
     fn native_credentials_round_trip_tokens_larger_than_a_windows_blob() {
         struct Lease(Credentials);
         impl Drop for Lease {

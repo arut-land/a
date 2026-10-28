@@ -1,38 +1,23 @@
-//! Ephemeral OAuth loopback callbacks use the runtime's existing reactor.
+//! OAuth callback framing stays with the extension; rt owns socket readiness.
 use std::io::{self, Read};
-use std::net::{TcpListener, TcpStream};
 
-use crate::{Async, Reactor};
-
-/// An owned listener: cancelling authorization closes its socket immediately.
-pub struct OAuthRedirect {
-    listener: Async<TcpListener>,
-    reactor: Reactor,
-    port: u16,
+pub(super) struct Redirect {
+    listener: rt::LoopbackListener,
 }
 
-impl OAuthRedirect {
-    /// Binds an unused IPv4 loopback port, never a public interface.
-    pub fn bind(reactor: &Reactor) -> io::Result<Self> {
-        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
-        let port = listener.local_addr()?.port();
+impl Redirect {
+    pub fn bind(reactor: &rt::Reactor) -> io::Result<Self> {
         Ok(Self {
-            listener: Async::socket(reactor, listener)?,
-            reactor: reactor.clone(),
-            port,
+            listener: rt::LoopbackListener::bind(reactor)?,
         })
     }
-
-    /// The redirect URI advertised to the authorization server.
     pub fn uri(&self) -> String {
-        format!("http://127.0.0.1:{}/oauth/callback", self.port)
+        format!("http://127.0.0.1:{}/oauth/callback", self.listener.port())
     }
-
     /// Returns a callback query. The caller validates issuer and state before exchange.
     pub async fn receive(&self) -> io::Result<String> {
         loop {
-            let (stream, _) = self.listener.read_with(TcpListener::accept).await?;
-            let stream: Async<TcpStream> = Async::socket(&self.reactor, stream)?;
+            let stream = self.listener.accept().await?;
             let mut bytes = Vec::new();
             while !bytes.ends_with(b"\r\n\r\n") {
                 let mut buffer = [0; 1024];
