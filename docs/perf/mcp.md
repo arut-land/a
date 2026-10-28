@@ -365,4 +365,48 @@ are loaded only after an authorization challenge, then shared in memory for that
 registry. Public servers and successful authenticated calls perform no credential
 I/O. Discovery, refresh and browser interaction happen only after a challenge. Payload clones share their existing
 `Arc` pieces while authentication retries, rather than copying the request body.
-Shipped size and interleaved idle observations are recorded after main integration.
+The protected-server invariant failed on the original release client with
+`expected a JSON-RPC 2.0 object`, before OAuth was implemented. Tests also caught
+and removed an eager credential-read dependency: a public server now succeeds even
+when the credential directory is unavailable. Warm protected calls reuse validated
+credentials without storage I/O, and a new MCP instance restores them from storage.
+
+### Release and idle observations
+
+Both shipped builds passed `mise run size` and its fixture scan. Baseline product
+source is `7318ef3f`, candidate product source is `8c4942e3`; the later main merge
+through `9370a19c` changes tooling/scripts/docs only, with no product Rust,
+manifest, lockfile, release-profile or Rust-toolchain changes. The same native
+M3, nightly-2026-10-17, `CARGO_BUILD_JOBS=2`, and shipped release profile were used.
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| Shipped bytes (exact) | 6,789,424 | 6,873,712 |
+| Idle daemon RSS, KiB | 10,632 [10,576–10,704] | 10,560 [10,480–10,624] |
+| Idle daemon CPU over 3 seconds, ms | 0 [0–0] | 0 [0–0] |
+| Daemon threads | 7 [7–7] | 7 [7–7] |
+
+Size increases **84,288 bytes (82.31 KiB, 1.24%)**. Size is deterministic, with
+zero observed spread. RSS and CPU are medians [minimum–maximum] from six samples
+per build. Order alternates AB/BA across six rounds. Every sample starts a fresh
+isolated home and plain client with one configured loopback HTTP MCP server,
+waits 12 seconds for blocking workers to retire, then observes CPU for three
+seconds. Provider variables are removed and replaced with a loopback URL and
+dummy credentials. The loopback server received zero requests. Each daemon was
+stopped with its isolated `A_HOME` before deleting the home.
+
+CPU accounting had only floating-point residuals below 10^-12 seconds; values
+above are rounded to milliseconds. The overlapping RSS ranges do not establish a
+memory improvement or an exact zero-byte cost. The observation establishes no
+added idle CPU or threads in this workload, alongside the absence of OAuth-owned
+background tasks. These shared-host macOS observations are not cross-platform
+performance guarantees.
+
+After main integration, touched-crate checks and all **305 tests** passed (two
+existing tests skipped), as did formatting, all-target clippy with `-D warnings`,
+documentation generation and workspace Windows lint. The normal all-target
+dependency graph contains no crate named `tokio`. No wire or recorded-provider
+fixture changed. Verification and builds used an external source mirror because
+`Cargo.lock` is outside this task's owned paths. Its generated companion patch
+adds only the two direct dependency edges and `http-auth` 0.1.10; the owner must
+apply that lockfile update before CI. CI remains deferred for independent review.
