@@ -47,13 +47,56 @@ hardware and toolchain metadata. Failed prep commands keep their argv, exit
 status, stdout and stderr separately from the idle line client's stderr.
 These captures and native map diagnostics run outside timing windows.
 
-The mbx store and Cargo downloads are cached by OS, architecture and
-configuration. Rustup installs an explicitly native host toolchain in a private runner-local
-directory outside the cache, so a
-cancelled installation cannot leave a partial toolchain in subsequent runs. Intel macOS uses rust-cache for native Cargo artifacts because
-mbx 1.24.1 publishes no Intel macOS executable. Windows ARM installs native
-Hyperfine and mbx from the checked-in mise lockfile. Release and benchmark
-builds use LLVM; they do not need a Cranelift component.
+Cargo downloads are cached by OS, architecture and configuration. Rustup
+installs an explicitly native host toolchain in a private runner-local directory
+outside the cache, so a cancelled installation cannot leave a partial toolchain
+in subsequent runs. After mise installs the measurement tools, the toolchain's
+bin directory is written once to `GITHUB_PATH`, before tests, Cargo-consuming
+cache actions and cargo-bloat installation. Every later step inherits that
+PATH, including nested Cargo calls made by cargo-bloat and metadata consumers.
+The measurement steps do not re-enter `mise exec`, which would select its Cargo
+wrapper again. Compiler versions and release arguments stay the same.
+
+Intel macOS retains its rust-cache artifact cache. The measurement job does not
+install mbx or cache its action store: builds use native Cargo on every runner.
+Windows ARM installs native Hyperfine from the checked-in mise lockfile. Release
+and benchmark builds use LLVM; they do not need a Cranelift component.
+
+### Native PATH verification, round 3
+
+The dedicated [Intel macOS run](https://github.com/arut-land/a/actions/runs/40507437634)
+and [Linux x64 run](https://github.com/arut-land/a/actions/runs/40507442561)
+both completed successfully. They used nightly-2026-10-17, native
+`x86_64-apple-darwin` and `x86_64-unknown-linux-gnu` respectively. The Intel
+rust-cache metadata step and both runners' production crate/function bloat
+collection succeeded.
+
+Five alternating AB/BA rounds ran `cargo metadata --no-deps --format-version=1`
+against the same measured checkout with the original mise PATH and the inherited
+native PATH. Times are milliseconds, median [min–max], including all five calls:
+
+| Runner | Original PATH | Inherited native PATH |
+| --- | --- | --- |
+| Intel macOS | 0/5 successful; 51.807 [49.629–1,148.763] | 5/5; 35.140 [32.621–46.446] |
+| Linux x64 | 5/5; 43.931 [42.478–44.246] | 5/5; 18.348 [18.184–20.119] |
+
+Every original Intel metadata call failed on missing mbx; Linux had mbx installed
+for the control. Both fixed environments selected Cargo from the explicitly
+native toolchain directory, including from a descendant Python process.
+
+Five additional fixed-PATH bloat calls passed on each runner. Their median
+[min–max] times were 1,416.923 [1,360.180–479,978.117] ms on Intel and 781.991
+[764.660–265,359.079] ms on Linux. The first call rebuilt into a separate default
+Cargo target directory; its full cost remains in the range. The saved control
+PATH predates cargo-bloat installation, so all five control bloat calls on each
+runner failed to find the subcommand. Those calls do **not** reproduce the
+original nested-wrapper failure and do not establish an A/B bloat timing gain.
+The original survey log supplies that failure; the successful production bloat
+steps and repeated fixed-PATH calls supply recovery evidence.
+
+These are harness reliability and overhead observations, with no claimed product
+speed, size or memory reduction. `native-tools-ab.json` retains every command,
+selected Cargo, exit status, stdout, stderr and elapsed time in the run artifacts.
 
 Hyperfine 2.0.0 collects wall time, process CPU and Unix peak RSS.
 On Windows, five separate launches per workload retain the child handle

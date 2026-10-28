@@ -26,8 +26,6 @@ ROOT = Path(__file__).resolve().parents[2]
 def run(argv, **kwargs):
     print("+", argv, flush=True)
     argv = list(map(str, argv))
-    if argv[0] == "cargo" and "PERF_CARGO" in os.environ:
-        argv[0] = os.environ["PERF_CARGO"]
     try:
         # Bound each sample rather than the total time of a benchmark suite.
         bounded = argv[0] == "hyperfine" or "timeout" in kwargs
@@ -39,6 +37,11 @@ def run(argv, **kwargs):
         if error.stderr:
             print(error.stderr, file=sys.stderr, flush=True)
         raise
+
+
+def native_toolchain():
+    """Select Cargo and its siblings together, including descendant lookups."""
+    return Path(subprocess.check_output(["rustup", "which", "cargo"], text=True).strip()).parent
 
 
 def load_task(name):
@@ -365,7 +368,7 @@ def sessions(source, output, variant, reference=""):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--phase", choices=["all", "build", "measure", "paired", "sessions", "evidence", "memory", "survey"], default="all")
+    parser.add_argument("--phase", choices=["toolchain", "all", "build", "measure", "paired", "sessions", "evidence", "memory", "survey"], default="all")
     parser.add_argument("--source", type=Path, default=ROOT)
     parser.add_argument("--output", type=Path, default=ROOT / "target/hosted-perf")
     parser.add_argument("--variant", default="{}", help='JSON: {"rustflags": [...], "config": [...]}')
@@ -374,6 +377,10 @@ def main():
     parser.add_argument("--build-only", action="store_true", help="diagnose a build variant without timing")
     parser.add_argument("--bloat", action="store_true", help="also collect crate/function size attribution")
     args = parser.parse_args()
+    if args.phase == "toolchain":
+        with open(os.environ["GITHUB_PATH"], "a") as path:
+            path.write(str(native_toolchain()) + "\n")
+        return
     output, source = args.output.resolve(), args.source.resolve()
     if args.phase in ["all", "build"] and output.exists() and any(p.name != "host.json" for p in output.iterdir()):
         parser.error("measurement output must be empty; select a new --output directory")

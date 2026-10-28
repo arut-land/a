@@ -1,5 +1,6 @@
 //! The input: multi-line text with a cursor, readline keys, and history.
 
+use std::borrow::Cow;
 use std::ops::Range;
 
 use protocol::{Segment, Segments};
@@ -14,7 +15,6 @@ pub struct Editor {
     text: String,
     /// A byte offset into `text`, on a char boundary.
     cursor: usize,
-    history: Vec<String>,
     /// While browsing history: the entry shown, and the draft it replaced.
     browsing: Option<(usize, String, Vec<Paste>)>,
     /// Long pastes, shown in `text` as `[Pasted text #n +m lines]` and sent
@@ -37,6 +37,35 @@ pub enum Edit {
     Ignored,
 }
 
+/// History borrows its owning session until a recalled entry becomes editable.
+pub enum HistoryEntry<'a> {
+    Text(&'a str),
+    Segments(&'a Segments),
+    Command {
+        tool: &'a str,
+        input: &'a protocol::Json,
+    },
+}
+
+impl<'a> From<HistoryEntry<'a>> for Cow<'a, str> {
+    fn from(entry: HistoryEntry<'a>) -> Self {
+        match entry {
+            HistoryEntry::Text(text) => Self::Borrowed(text),
+            HistoryEntry::Segments(segments) => Self::Owned(segments.text()),
+            HistoryEntry::Command { tool, input } => {
+                Self::Owned(protocol::view::command(input).map_or_else(
+                    || {
+                        format!("/{tool} {}", protocol::view::Item::args(input))
+                            .trim_end()
+                            .to_owned()
+                    },
+                    |command| format!("$ {command}"),
+                ))
+            }
+        }
+    }
+}
+
 impl Editor {
     pub fn text(&self) -> &str {
         &self.text
@@ -47,18 +76,10 @@ impl Editor {
     }
 
     pub fn clear(&mut self) {
-        self.pastes.clear();
-        self.text.clear();
+        self.pastes = Vec::new();
+        self.text = String::new();
         self.cursor = 0;
         self.browsing = None;
-    }
-
-    /// Earlier inputs, oldest first, for Up to recall.
-    pub fn remember(&mut self, entry: &str) {
-        let entry = entry.trim();
-        if !entry.is_empty() && self.history.last().is_none_or(|last| last != entry) {
-            self.history.push(entry.to_owned());
-        }
     }
 
     pub fn insert(&mut self, text: &str) {
@@ -81,17 +102,25 @@ impl Editor {
     }
 
     /// The input as typed text and pastes, its ends trimmed.
-    fn segments(&self) -> Segments {
+    fn segments(&mut self) -> Segments {
+        if self.pastes.is_empty() {
+            let mut text = std::mem::take(&mut self.text);
+            text.truncate(text.trim_end().len());
+            let start = text.len() - text.trim_start().len();
+            text.drain(..start);
+            return Segments(vec![Segment::Text(text)]);
+        }
         let mut out = Vec::new();
         let mut at = 0;
-        for paste in &self.pastes {
+        for paste in std::mem::take(&mut self.pastes) {
             out.push(Segment::Text(self.text[at..paste.range.start].to_owned()));
-            out.push(Segment::Paste(paste.text.clone()));
+            out.push(Segment::Paste(paste.text));
             at = paste.range.end;
         }
         out.push(Segment::Text(self.text[at..].to_owned()));
         if let Some(Segment::Text(first)) = out.first_mut() {
-            *first = first.trim_start().to_owned();
+            let start = first.len() - first.trim_start().len();
+            first.drain(..start);
         }
         if let Some(Segment::Text(last)) = out.last_mut() {
             last.truncate(last.trim_end().len());
@@ -132,7 +161,16 @@ impl Editor {
         self.cursor = range.start + text.len();
     }
 
+    #[cfg(test)]
     pub fn key(&mut self, key: Key) -> Edit {
+        self.key_with_history(key, std::iter::empty::<&str>)
+    }
+
+    pub fn key_with_history<'a, T: Into<Cow<'a, str>>, I: Iterator<Item = T>>(
+        &mut self,
+        key: Key,
+        history: impl Fn() -> I,
+    ) -> Edit {
         match key {
             Key::Char(c) => {
                 let mut utf8 = [0; 4];
@@ -140,12 +178,17 @@ impl Editor {
             }
             Key::Newline => self.insert("\n"),
             Key::Enter => {
-                let input = self.segments();
-                let text = input.text();
-                if text.trim().is_empty() {
+                let mut at = 0;
+                let blank = self.pastes.iter().all(|paste| {
+                    let blank = self.text[at..paste.range.start].trim().is_empty()
+                        && paste.text.trim().is_empty();
+                    at = paste.range.end;
+                    blank
+                }) && self.text[at..].trim().is_empty();
+                if blank {
                     return Edit::Ignored;
                 }
-                self.remember(&text);
+                let input = self.segments();
                 self.clear();
                 return Edit::Submit(input);
             }
@@ -178,12 +221,12 @@ impl Editor {
             }
             Key::Up | Key::Ctrl('p') => {
                 if !self.vertical(-1) {
-                    self.recall(-1);
+                    self.recall(-1, &history);
                 }
             }
             Key::Down | Key::Ctrl('n') => {
                 if !self.vertical(1) {
-                    self.recall(1);
+                    self.recall(1, &history);
                 }
             }
             _ => return Edit::Ignored,
@@ -249,20 +292,29 @@ impl Editor {
         true
     }
 
-    fn recall(&mut self, dir: i32) {
-        let len = self.history.len();
-        let at = match (&self.browsing, dir < 0) {
-            (None, true) if len > 0 => len - 1,
-            (None, _) => return,
-            (Some((i, _, _)), true) => i.saturating_sub(1),
-            (Some((i, _, _)), false) if i + 1 < len => i + 1,
-            (Some(_), false) => {
-                let (_, draft, pastes) = self.browsing.take().unwrap_or_default();
+    fn recall<'a, T: Into<Cow<'a, str>>, I: Iterator<Item = T>>(
+        &mut self,
+        dir: i32,
+        history: &impl Fn() -> I,
+    ) {
+        let entry = match (&self.browsing, dir < 0) {
+            (None, true) => history().enumerate().last(),
+            (None, false) => return,
+            (Some((i, _, _)), true) => {
+                let at = i.saturating_sub(1);
+                history().nth(at).map(|text| (at, text))
+            }
+            (Some((i, _, _)), false) => history().nth(i + 1).map(|text| (i + 1, text)),
+        };
+        let Some((at, entry)) = entry else {
+            if dir > 0
+                && let Some((_, draft, pastes)) = self.browsing.take()
+            {
                 self.text = draft;
                 self.pastes = pastes;
                 self.cursor = self.text.len();
-                return;
             }
+            return;
         };
         let (draft, pastes) = match self.browsing.take() {
             Some((_, draft, pastes)) => (draft, pastes),
@@ -272,7 +324,7 @@ impl Editor {
             ),
         };
         self.pastes.clear();
-        self.text.clone_from(&self.history[at]);
+        self.text = entry.into().into_owned();
         self.cursor = self.text.len();
         self.browsing = Some((at, draft, pastes));
     }
@@ -406,13 +458,13 @@ mod tests {
     #[test]
     fn history_preserves_a_draft_with_pastes_and_sends_history_as_text() {
         let mut e = Editor::default();
-        e.remember("old");
+        let history = || ["old"].into_iter();
         e.paste("a\nb\nc\nd");
-        e.key(Key::Up);
+        e.key_with_history(Key::Up, history);
         assert_eq!(e.text(), "old");
-        e.key(Key::Down);
+        e.key_with_history(Key::Down, history);
         assert_eq!(e.key(Key::Enter), sent(&[pasted("a\nb\nc\nd")]));
-        e.key(Key::Up);
+        e.key_with_history(Key::Up, || ["old", "a\nb\nc\nd"].into_iter());
         assert_eq!(e.text(), "a\nb\nc\nd");
     }
 
@@ -436,18 +488,17 @@ mod tests {
     #[test]
     fn up_and_down_move_between_lines_then_through_history() {
         let mut e = Editor::default();
-        e.remember("first");
-        e.remember("second");
+        let history = || ["first", "second"].into_iter();
         typed(&mut e, "ab\ncd");
-        e.key(Key::Up);
+        e.key_with_history(Key::Up, history);
         e.key(Key::Char('X'));
         assert_eq!(e.text(), "abX\ncd");
-        e.key(Key::Up);
+        e.key_with_history(Key::Up, history);
         assert_eq!(e.text(), "second");
-        e.key(Key::Up);
+        e.key_with_history(Key::Up, history);
         assert_eq!(e.text(), "first");
-        e.key(Key::Down);
-        e.key(Key::Down);
+        e.key_with_history(Key::Down, history);
+        e.key_with_history(Key::Down, history);
         assert_eq!(e.text(), "abX\ncd", "the draft comes back");
     }
 
@@ -462,5 +513,61 @@ mod tests {
         e.key(Key::Up);
         let (_, cursor) = e.lines(6, Style::new());
         assert_eq!(cursor, (3, 0));
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+
+    #[test]
+    fn clearing_and_submitting_release_input_storage() {
+        let mut editor = Editor::default();
+        editor.insert(&"x".repeat(1024 * 1024));
+        editor.clear();
+        assert_eq!(editor.text.capacity(), 0);
+        editor.insert(&"x".repeat(1024 * 1024));
+        assert!(matches!(editor.key(Key::Enter), Edit::Submit(_)));
+        assert_eq!(editor.text.capacity(), 0);
+    }
+}
+
+#[cfg(test)]
+mod growing_history_tests {
+    use super::*;
+
+    #[test]
+    fn appending_history_keeps_the_browsed_entry_and_draft_stable() {
+        let entries = ["first", "second", "third"];
+        let len = std::cell::Cell::new(2);
+        let history = || entries[..len.get()].iter().copied();
+        let mut editor = Editor::default();
+        editor.insert("draft");
+        editor.key_with_history(Key::Up, history);
+        assert_eq!(editor.text(), "second");
+        len.set(3);
+        editor.key_with_history(Key::Up, history);
+        assert_eq!(editor.text(), "first");
+        for expected in ["second", "third", "draft"] {
+            editor.key_with_history(Key::Down, history);
+            assert_eq!(editor.text(), expected);
+        }
+    }
+}
+
+#[cfg(test)]
+mod blank_paste_tests {
+    use super::*;
+
+    #[test]
+    fn blank_pastes_do_not_submit_their_placeholder_labels() {
+        let mut editor = Editor::default();
+        editor.insert("  ");
+        editor.paste("\n \n \n");
+        let draft = editor.text().to_owned();
+        assert_eq!(editor.key(Key::Enter), Edit::Ignored);
+        assert_eq!(editor.text(), draft);
+        editor.insert("message");
+        assert!(matches!(editor.key(Key::Enter), Edit::Submit(_)));
     }
 }

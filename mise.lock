@@ -2,150 +2,94 @@
 
 lockfile_version = 3
 
-[[tools."aqua:jdx/usage"]]
-version = "7.0.2"
-backend = "aqua:jdx/usage"
-specifiers = ["7.0.2"]
-
-[tools."aqua:jdx/usage"."platforms.linux-arm64"]
-checksum = "sha256:2950ac2fffc9be15b24991a785b5474745e14df8e7fffa8aa8715c4bd9c8cb58"
-url = "https://github.com/jdx/usage/releases/download/v7.0.2/usage-aarch64-unknown-linux-gnu.tar.gz"
-url_api = "https://api.github.com/repos/jdx/usage/releases/assets/650146088"
-
-[tools."aqua:jdx/usage"."platforms.linux-arm64-musl"]
-checksum = "sha256:49f414e6c41ba37ba9ad2fd31e2ad50263ff7332e3ffe9fa1bc2ef5673f553d3"
-url = "https://github.com/jdx/usage/releases/download/v7.0.2/usage-aarch64-unknown-linux-musl.tar.gz"
-url_api = "https://api.github.com/repos/jdx/usage/releases/assets/650146234"
-
-[tools."aqua:jdx/usage"."platforms.linux-x64"]
-checksum = "sha256:1006d9659fb0c9620525a8e750b3853177a3bf772454d5984c4d78c4aa130aaa"
-url = "https://github.com/jdx/usage/releases/download/v7.0.2/usage-x86_64-unknown-linux-gnu.tar.gz"
-url_api = "https://api.github.com/repos/jdx/usage/releases/assets/650145698"
-
-[tools."aqua:jdx/usage"."platforms.linux-x64-musl"]
-checksum = "sha256:a79a88c35175d4697188c43dac6e0bbea5943f4f1631a750c0f9d5b2149ef381"
-url = "https://github.com/jdx/usage/releases/download/v7.0.2/usage-x86_64-unknown-linux-musl.tar.gz"
-url_api = "https://api.github.com/repos/jdx/usage/releases/assets/650146532"
-
-[tools."aqua:jdx/usage"."platforms.macos-arm64"]
-checksum = "sha256:13fad4f828a7cb2ddc298f1dea38a3389d2144f63584134b9c3c7489944c3de3"
-url = "https://github.com/jdx/usage/releases/download/v7.0.2/usage-universal-apple-darwin.tar.gz"
-url_api = "https://api.github.com/repos/jdx/usage/releases/assets/650147104"
-
-[tools."aqua:jdx/usage"."platforms.windows-x64"]
-checksum = "sha256:91586495a99681b405c62a5c7c8f60dffca0d006834d3526520ced8527818cb5"
-url = "https://github.com/jdx/usage/releases/download/v7.0.2/usage-x86_64-pc-windows-msvc.zip"
-url_api = "https://api.github.com/repos/jdx/usage/releases/assets/650149210"
-
 [[tools."aqua:yonaskolb/XcodeGen"]]
 version = "2.46.0"
 backend = "aqua:yonaskolb/XcodeGen"
-specifiers = ["2.46.0"]
+specifiers = ["latest"]
 
 [tools."aqua:yonaskolb/XcodeGen"."platforms.macos-arm64"]
 checksum = "sha256:4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806"
 url = "https://github.com/yonaskolb/XcodeGen/releases/download/2.46.0/xcodegen.zip"
 url_api = "https://api.github.com/repos/yonaskolb/XcodeGen/releases/assets/478866069"
 
+[tools."aqua:yonaskolb/XcodeGen"."platforms.macos-x64"]
+checksum = "sha256:4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806"
+checksum_source = "mise-versions"
+url = "https://github.com/yonaskolb/XcodeGen/releases/download/2.46.0/xcodegen.zip"
+url_api = "https://api.github.com/repos/yonaskolb/XcodeGen/releases/assets/478866069"
+
 [[tools."cargo:cargo-bloat"]]
 version = "0.12.1"
 backend = "cargo:cargo-bloat"
-specifiers = [
-    "0.12.1",
-    "latest",
-]
+specifiers = ["latest"]
 
 [[tools."cargo:cargo-bolero"]]
 version = "0.13.5"
 backend = "cargo:cargo-bolero"
-specifiers = ["0.13.5"]
+specifiers = ["latest"]
 
 [[tools."cargo:cargo-deny"]]
 version = "0.20.2"
 backend = "cargo:cargo-deny"
-specifiers = ["0.20"]
+specifiers = ["latest"]
 
 [[tools."cargo:cargo-llvm-lines"]]
 version = "0.4.48"
 backend = "cargo:cargo-llvm-lines"
-specifiers = [
-    "0.4.48",
-    "latest",
-]
+specifiers = ["latest"]
 
 [[tools."cargo:cargo-machete"]]
 version = "0.9.2"
 backend = "cargo:cargo-machete"
-specifiers = ["0.9.2"]
+specifiers = ["latest"]
 
 [[tools."cargo:cargo-nextest"]]
-version = "0.9.148"
+version = "0.9.150"
 backend = "cargo:cargo-nextest"
-specifiers = [
-    "0.9",
-    "0.9.148",
-]
+specifiers = ["latest"]
 
 [[tools."github:boltffi/boltffi"]]
 version = "0.31.1"
 backend = "github:boltffi/boltffi"
 specifiers = ["0.31.1"]
 
-[tools."github:boltffi/boltffi"."platforms.linux-arm64"]
-checksum = "sha256:419acc2c4087ef5dc3d9fc8886d849a418349a58f9aa71ac67168e5eb79ddce7"
-url = "https://github.com/boltffi/boltffi/releases/download/v0.31.1/boltffi-linux-aarch64.tar.gz"
-url_api = "https://api.github.com/repos/boltffi/boltffi/releases/assets/640521156"
-
-[tools."github:boltffi/boltffi"."platforms.linux-arm64-musl"]
-checksum = "sha256:201b7a4c8eb54d4cec2d4ba5f9b77a0e2ec7f426622dd9b087d8be1dd7d525da"
-url = "https://github.com/boltffi/boltffi/releases/download/v0.31.1/boltffi-linux-aarch64-musl.tar.gz"
-url_api = "https://api.github.com/repos/boltffi/boltffi/releases/assets/640516314"
-
-[tools."github:boltffi/boltffi"."platforms.linux-x64"]
-checksum = "sha256:ae02515544f6553e72b2fd5ea99ed604b047d163dfb7fa2e1534dda92756cc28"
-url = "https://github.com/boltffi/boltffi/releases/download/v0.31.1/boltffi-linux-x86_64.tar.gz"
-url_api = "https://api.github.com/repos/boltffi/boltffi/releases/assets/640520840"
-
-[tools."github:boltffi/boltffi"."platforms.linux-x64-musl"]
-checksum = "sha256:7123525702683f39ce44ea045e7f4fc1386fa8b0d0a764650c15610dbaa8b8fe"
-url = "https://github.com/boltffi/boltffi/releases/download/v0.31.1/boltffi-linux-x86_64-musl.tar.gz"
-url_api = "https://api.github.com/repos/boltffi/boltffi/releases/assets/640522451"
-
 [tools."github:boltffi/boltffi"."platforms.macos-arm64"]
 checksum = "sha256:3837df80dae7d8d1d84f6b9c73890b9b6f79b3b74360d9b5a788524740b7bfdf"
 url = "https://github.com/boltffi/boltffi/releases/download/v0.31.1/boltffi-darwin-aarch64.tar.gz"
 url_api = "https://api.github.com/repos/boltffi/boltffi/releases/assets/640537186"
 
-[tools."github:boltffi/boltffi"."platforms.windows-x64"]
-checksum = "sha256:8a5cd4e01114432f40b80b90f5a7fe3e892e39f6a717a056595c41f0483b8e60"
-url = "https://github.com/boltffi/boltffi/releases/download/v0.31.1/boltffi-windows-x86_64.zip"
-url_api = "https://api.github.com/repos/boltffi/boltffi/releases/assets/640535775"
+[tools."github:boltffi/boltffi"."platforms.macos-x64"]
+checksum = "sha256:a2d180c6eef4bdd40535e7535a5627032e9d0d92a63c6fed302ebfd17ddddbc7"
+checksum_source = "mise-versions"
+url = "https://github.com/boltffi/boltffi/releases/download/v0.31.1/boltffi-darwin-x86_64.tar.gz"
+url_api = "https://api.github.com/repos/boltffi/boltffi/releases/assets/640544290"
 
 [[tools.hyperfine]]
 version = "2.0.0"
 backend = "aqua:sharkdp/hyperfine"
-specifiers = [
-    "2.0.0",
-    "latest",
-]
+specifiers = ["latest"]
 
 [tools.hyperfine."platforms.linux-arm64"]
 checksum = "sha256:f8244d1e17f8da23ee6b3ae2cdc04a6a185a450f6b74e09bff12e498038fcbc9"
+checksum_source = "mise-versions"
 url = "https://github.com/sharkdp/hyperfine/releases/download/v2.0.0/hyperfine-v2.0.0-aarch64-unknown-linux-gnu.tar.gz"
 url_api = "https://api.github.com/repos/sharkdp/hyperfine/releases/assets/619832203"
 
 [tools.hyperfine."platforms.linux-arm64-musl"]
 checksum = "sha256:f0591c2cb8f66f2d2624d23979cf96dc99a67cb935f9925c82b9a4e3ffe5b2e1"
+checksum_source = "mise-versions"
 url = "https://github.com/sharkdp/hyperfine/releases/download/v2.0.0/hyperfine-v2.0.0-aarch64-unknown-linux-musl.tar.gz"
 url_api = "https://api.github.com/repos/sharkdp/hyperfine/releases/assets/619832413"
 
 [tools.hyperfine."platforms.linux-x64"]
 checksum = "sha256:ae2beda2ac99c098427e4f755244552daf20e514422889cca6d44421e2d93c87"
+checksum_source = "mise-versions"
 url = "https://github.com/sharkdp/hyperfine/releases/download/v2.0.0/hyperfine-v2.0.0-x86_64-unknown-linux-gnu.tar.gz"
 url_api = "https://api.github.com/repos/sharkdp/hyperfine/releases/assets/619831673"
 
 [tools.hyperfine."platforms.linux-x64-musl"]
 checksum = "sha256:38e59087bd65520930a13cf513d8a493b7043741e8ad62349a8a9929eb61bc5c"
+checksum_source = "mise-versions"
 url = "https://github.com/sharkdp/hyperfine/releases/download/v2.0.0/hyperfine-v2.0.0-x86_64-unknown-linux-musl.tar.gz"
 url_api = "https://api.github.com/repos/sharkdp/hyperfine/releases/assets/619832904"
 
@@ -156,95 +100,97 @@ url_api = "https://api.github.com/repos/sharkdp/hyperfine/releases/assets/619831
 
 [tools.hyperfine."platforms.macos-x64"]
 checksum = "sha256:8afe204926afefa406ad320cef0672b739e5f676c623fbd6d43d779bacd684e3"
+checksum_source = "mise-versions"
 url = "https://github.com/sharkdp/hyperfine/releases/download/v2.0.0/hyperfine-v2.0.0-x86_64-apple-darwin.tar.gz"
 url_api = "https://api.github.com/repos/sharkdp/hyperfine/releases/assets/619836081"
 
 [tools.hyperfine."platforms.windows-arm64"]
 checksum = "sha256:c2d2568368d32d0f2a000e604e10cd9fa8d98e2d04cb78f2aa7ab1a8c11b8118"
+checksum_source = "mise-versions"
 url = "https://github.com/sharkdp/hyperfine/releases/download/v2.0.0/hyperfine-v2.0.0-aarch64-pc-windows-msvc.zip"
 url_api = "https://api.github.com/repos/sharkdp/hyperfine/releases/assets/619833800"
 
 [tools.hyperfine."platforms.windows-x64"]
 checksum = "sha256:3dec51acee1060908e67948838d6bc0a7aacde0774acebfa4afb220dcf0bc078"
+checksum_source = "mise-versions"
 url = "https://github.com/sharkdp/hyperfine/releases/download/v2.0.0/hyperfine-v2.0.0-x86_64-pc-windows-msvc.zip"
 url_api = "https://api.github.com/repos/sharkdp/hyperfine/releases/assets/619834237"
 
 [[tools.mold]]
 version = "3.0.0"
 backend = "aqua:rui314/mold"
-specifiers = [
-    "3.0.0",
-    "latest",
-]
+specifiers = ["latest"]
 
 [tools.mold."platforms.linux-arm64"]
 checksum = "sha256:52c759d3689babaea4c42af2f31062a74ab83e17ffb5a8090232534c67b70577"
+checksum_source = "mise-versions"
 url = "https://github.com/rui314/mold/releases/download/v3.0.0/mold-3.0.0-aarch64-linux.tar.gz"
 url_api = "https://api.github.com/repos/rui314/mold/releases/assets/612121952"
 
 [tools.mold."platforms.linux-arm64-musl"]
 checksum = "sha256:52c759d3689babaea4c42af2f31062a74ab83e17ffb5a8090232534c67b70577"
+checksum_source = "mise-versions"
 url = "https://github.com/rui314/mold/releases/download/v3.0.0/mold-3.0.0-aarch64-linux.tar.gz"
 url_api = "https://api.github.com/repos/rui314/mold/releases/assets/612121952"
 
 [tools.mold."platforms.linux-x64"]
 checksum = "sha256:6c90d4a474c7c0409dfb575be03a5345878ac14fdba18de8b40fa58c60121189"
+checksum_source = "mise-versions"
 url = "https://github.com/rui314/mold/releases/download/v3.0.0/mold-3.0.0-x86_64-linux.tar.gz"
 url_api = "https://api.github.com/repos/rui314/mold/releases/assets/612122001"
 
 [tools.mold."platforms.linux-x64-musl"]
 checksum = "sha256:6c90d4a474c7c0409dfb575be03a5345878ac14fdba18de8b40fa58c60121189"
+checksum_source = "mise-versions"
 url = "https://github.com/rui314/mold/releases/download/v3.0.0/mold-3.0.0-x86_64-linux.tar.gz"
 url_api = "https://api.github.com/repos/rui314/mold/releases/assets/612122001"
 
-[tools.mold."platforms.windows-x64"]
-checksum = "sha256:1421fccaf7efee77e53f1dc365f90acb791bedff6be486aed0c0313393e6b8ec"
-url = "https://github.com/rui314/mold/releases/download/v3.0.0/mold-3.0.0-x86_64-windows.zip"
-url_api = "https://api.github.com/repos/rui314/mold/releases/assets/612122004"
-
 [[tools.mr-boxington]]
-version = "1.24.1"
+version = "1.28.0"
 backend = "packslip:github.com/jdx/mr-boxington"
-specifiers = [
-    "1",
-    "1.24.1",
-    "latest",
-]
+specifiers = ["latest"]
 
 [tools.mr-boxington."platforms.linux-arm64"]
-checksum = "sha256:0699be8e61116ff6c8e45b95c031bf69e3781cccfee18072952d4efe81b35611"
-url = "https://github.com/jdx/mr-boxington/releases/download/v1.24.1/mbx-aarch64-unknown-linux-gnu.tar.gz"
+checksum = "sha256:9056d34520991f80c9f708d36008fcc732e500d735591a8649029d476cb566bd"
+url = "https://github.com/jdx/mr-boxington/releases/download/v1.28.0/mbx-aarch64-unknown-linux-gnu.tar.gz"
 signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
+repository_ids = { repository = "1340721957" }
 
 [tools.mr-boxington."platforms.linux-arm64-musl"]
-checksum = "sha256:2181e6f073adbb16d72d0b737c770c3eb7ec91e8f475fd22cc35622f4c270fe5"
-url = "https://github.com/jdx/mr-boxington/releases/download/v1.24.1/mbx-aarch64-unknown-linux-musl.tar.gz"
+checksum = "sha256:7b4336a5800847fee9e9f0082ca65091020bafdb4ff9d50f15d9ce4eaeb368b6"
+url = "https://github.com/jdx/mr-boxington/releases/download/v1.28.0/mbx-aarch64-unknown-linux-musl.tar.gz"
 signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
+repository_ids = { repository = "1340721957" }
 
 [tools.mr-boxington."platforms.linux-x64"]
-checksum = "sha256:d019fd3695d39549cd3eeb48b9518f0b43850d4d0bd9c49b955a8de9d30299fb"
-url = "https://github.com/jdx/mr-boxington/releases/download/v1.24.1/mbx-x86_64-unknown-linux-gnu.tar.gz"
+checksum = "sha256:50ce9360221d9274a73d70c9d2d5285dc2d8353a101de0845e3da5bb0083bcfb"
+url = "https://github.com/jdx/mr-boxington/releases/download/v1.28.0/mbx-x86_64-unknown-linux-gnu.tar.gz"
 signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
+repository_ids = { repository = "1340721957" }
 
 [tools.mr-boxington."platforms.linux-x64-musl"]
-checksum = "sha256:0e4b1594871625e9da2f7bedebceac0573ec19ebae90e05b759227f59cc0fcc4"
-url = "https://github.com/jdx/mr-boxington/releases/download/v1.24.1/mbx-x86_64-unknown-linux-musl.tar.gz"
+checksum = "sha256:0093c725fb031dd5b0db547298901aaffb1ff93ebf903f6adf9c72b0611f2bf0"
+url = "https://github.com/jdx/mr-boxington/releases/download/v1.28.0/mbx-x86_64-unknown-linux-musl.tar.gz"
 signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
+repository_ids = { repository = "1340721957" }
 
 [tools.mr-boxington."platforms.macos-arm64"]
-checksum = "sha256:3ddb7d86b644275db140c9ae76f57bf72c5a10b7657f930466aad5ff7e025a85"
-url = "https://github.com/jdx/mr-boxington/releases/download/v1.24.1/mbx-aarch64-apple-darwin.tar.gz"
+checksum = "sha256:ac73ba0637a443ba9c43354008f6bcd5d9e8a84b703e46f23202025c1f849472"
+url = "https://github.com/jdx/mr-boxington/releases/download/v1.28.0/mbx-aarch64-apple-darwin.tar.gz"
 signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
+repository_ids = { repository = "1340721957" }
 
 [tools.mr-boxington."platforms.windows-arm64"]
-checksum = "sha256:2a54f605f16176a085af617cd9bd9cb4d34c9b65eec3bdd840bd4be887d6fbe3"
-url = "https://github.com/jdx/mr-boxington/releases/download/v1.24.1/mbx-aarch64-pc-windows-msvc.zip"
+checksum = "sha256:3e91984ceb002cc252523455d341ace499156c48544ed0147eee5ea713ee4936"
+url = "https://github.com/jdx/mr-boxington/releases/download/v1.28.0/mbx-aarch64-pc-windows-msvc.zip"
 signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
+repository_ids = { repository = "1340721957" }
 
 [tools.mr-boxington."platforms.windows-x64"]
-checksum = "sha256:635aa5ca037739b16a72e1f1e754beff86bdfa63e905ec300f32125cc5a4fe7f"
-url = "https://github.com/jdx/mr-boxington/releases/download/v1.24.1/mbx-x86_64-pc-windows-msvc.zip"
+checksum = "sha256:3fdecc44d68f37215079f6b6fa8c1e2ad95ee9dd30668759ed9dfd98e02bc95d"
+url = "https://github.com/jdx/mr-boxington/releases/download/v1.28.0/mbx-x86_64-pc-windows-msvc.zip"
 signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
+repository_ids = { repository = "1340721957" }
 
 [[tools.rust]]
 version = "nightly-2026-10-17"

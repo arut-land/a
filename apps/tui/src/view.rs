@@ -12,6 +12,10 @@ use super::text::{Action, Color, Line, Modifier, Span, Style, sanitize, wrap, wr
 
 /// How much of a card's output shows unless everything is expanded.
 const TAIL: usize = 10;
+// Index in small source batches, storing one seek position per roughly a page
+// of rows. Neither limit restricts the source or its scrollable history.
+const INDEX_BYTES: usize = 4096;
+const CHECKPOINT_ROWS: usize = 128;
 
 pub const MUTED: Style = Style::new().fg(Color::DarkGray);
 pub const USER: Style = Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD);
@@ -147,6 +151,17 @@ pub fn mark_reply(rows: &mut [Line]) {
     }
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum Layout {
+    #[default]
+    Reply,
+    User,
+    Output {
+        base: Style,
+        diff: bool,
+    },
+}
+
 /// Completed display rows stay in the caller's cache. Inline state and
 /// pending spaces advance once; only the unfinished visible row rewraps.
 #[derive(Default)]
@@ -154,6 +169,8 @@ pub struct Live {
     identity: Option<(CallId, u16, usize)>,
     seen: usize,
     kept: usize,
+    base: usize,
+    layout: Layout,
     fenced: bool,
     sanitizer: Option<client::Sanitizer>,
     open: String,
@@ -165,7 +182,7 @@ pub struct Live {
     parsed: usize,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Continuation {
     first: Vec<Span>,
     rest: Vec<Span>,
@@ -179,7 +196,7 @@ struct Continuation {
     leading: Leading,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 enum Leading {
     #[default]
     Keep,
@@ -266,20 +283,32 @@ impl Continuation {
 impl Live {
     /// Brings `rows` (empty, or as this left them) up to the live text.
     pub fn update(&mut self, rows: &mut Vec<Line>, stream: &protocol::view::Stream, width: usize) {
-        let identity = Some((stream.call, stream.attempt, width));
-        if self.identity != identity || rows.is_empty() || stream.text.len() < self.seen {
+        self.update_text(rows, &stream.text, width, stream.call, stream.attempt);
+    }
+
+    fn update_text(
+        &mut self,
+        rows: &mut Vec<Line>,
+        text: &str,
+        width: usize,
+        call: CallId,
+        attempt: u16,
+    ) {
+        let identity = Some((call, attempt, width));
+        if self.identity != identity || rows.is_empty() || text.len() < self.seen {
             *self = Self {
                 identity,
                 kept: 1,
+                layout: self.layout,
                 ..Self::default()
             };
             rows.clear();
             rows.push(Line::default());
-        } else if stream.text.len() == self.seen {
+        } else if text.len() == self.seen {
             return;
         }
         rows.truncate(self.kept);
-        let added = &stream.text[self.seen..];
+        let added = &text[self.seen..];
         let added =
             if self.sanitizer.is_some() || added.chars().any(|c| c.is_control() && c != '\n') {
                 Cow::Owned(
@@ -297,9 +326,13 @@ impl Live {
                 {
                     self.parsed += part.len() + usize::from(c.star);
                 }
-                c.push(part, width);
+                if self.layout == Layout::Reply {
+                    c.push(part, width);
+                } else {
+                    c.push_text(part, c.style, width);
+                }
             } else {
-                let part = if !self.fenced && self.open.is_empty() {
+                let part = if self.layout == Layout::Reply && !self.fenced && self.open.is_empty() {
                     let spaces = part.bytes().take_while(|&b| b == b' ').count();
                     self.leading += spaces;
                     &part[spaces..]
@@ -309,7 +342,10 @@ impl Live {
                 self.open.push_str(part);
             }
             if parts.peek().is_some() {
-                self.fenced = if self.continuation.is_some() || self.leading > 0 {
+                self.fenced = if self.layout != Layout::Reply
+                    || self.continuation.is_some()
+                    || self.leading > 0
+                {
                     self.wrap_open(rows, width)
                 } else {
                     markdown_into(rows, &self.open, width, Style::new(), self.fenced)
@@ -322,70 +358,133 @@ impl Live {
                 self.wrap_open(rows, width);
             }
         }
-        if let Some(last) = rows.last_mut() {
+        if self.layout == Layout::Reply
+            && let Some(last) = rows.last_mut()
+        {
             last.spans.push(Span::new("▍", MUTED));
         }
-        mark_reply(rows);
-        self.seen = stream.text.len();
+        if self.layout == Layout::Reply && self.base == 0 {
+            mark_reply(rows);
+        }
+        self.seen = text.len();
+    }
+
+    fn start_plain(&mut self, rows: &mut Vec<Line>, width: usize) -> bool {
+        let first = if self.layout == Layout::User && self.base == 0 && self.kept == 1 {
+            "❯ "
+        } else if self.layout == Layout::User {
+            "  "
+        } else {
+            "     "
+        };
+        let pen = if self.layout == Layout::User {
+            USER
+        } else {
+            MUTED
+        };
+        let style = match self.layout {
+            Layout::User => Style::new().bold(),
+            Layout::Output { base, diff } => match self.open.as_bytes().first() {
+                Some(b'@') if diff => CODE,
+                Some(b'+') if diff => OK,
+                Some(b'-') if diff => BAD,
+                _ => base,
+            },
+            Layout::Reply => unreachable!(),
+        };
+        if self.open.is_empty() {
+            rows.push(Line::from([Span::new(first, pen)]));
+            return false;
+        }
+        let mut c = Continuation {
+            first: vec![Span::new(first, pen)],
+            rest: vec![Span::new(
+                if self.layout == Layout::User {
+                    "  "
+                } else {
+                    "     "
+                },
+                pen,
+            )],
+            style,
+            ..Continuation::default()
+        };
+        c.push_text(&self.open, c.style, width);
+        self.open = String::new();
+        self.continuation = Some(c);
+        true
+    }
+
+    fn start_markdown(&mut self, rows: &mut Vec<Line>, width: usize) -> Option<bool> {
+        // Block indentation is a u8; paragraph indentation can only
+        // occupy one row. Keep the full count until the block is known.
+        let source = if self.leading == 0 {
+            Cow::Borrowed(self.open.as_str())
+        } else {
+            Cow::Owned(format!(
+                "{}{open}",
+                " ".repeat(self.leading.min(width.max(usize::from(u8::MAX)))),
+                open = self.open
+            ))
+        };
+        #[cfg(test)]
+        {
+            self.parsed += source.len();
+        }
+        let block = md::blocks(&source)
+            .fenced(self.fenced)
+            .next()
+            .expect("a logical line always has one block");
+        match block {
+            Block::Fence(line) => {
+                rows.push(Line::plain(format!("  {line}"), CODE.dim()));
+                return Some(!self.fenced);
+            }
+            Block::Code(line) => {
+                rows.push(Line::plain(format!("  {line}"), CODE));
+                return Some(self.fenced);
+            }
+            block => {
+                let trimmed = source.trim_start();
+                let ambiguous = trimmed.is_empty()
+                    || matches!(trimmed, "-" | "*" | "`" | "``")
+                    || (trimmed.len() <= 6 && trimmed.bytes().all(|b| b == b'#'));
+                if ambiguous {
+                    markdown_into(rows, &source, width, Style::new(), self.fenced);
+                    return Some(self.fenced);
+                }
+                let (first, rest, body, style) = layout(block, Style::new());
+                let mut continuation = Continuation {
+                    first,
+                    rest,
+                    style,
+                    leading: if matches!(block, Block::Quote("")) {
+                        Leading::Trim
+                    } else {
+                        Leading::Keep
+                    },
+                    ..Continuation::default()
+                };
+                continuation.push(body, width);
+                self.continuation = Some(continuation);
+            }
+        }
+        self.open.clear();
+        self.leading = 0;
+        None
     }
 
     fn wrap_open(&mut self, rows: &mut Vec<Line>, width: usize) -> bool {
-        if self.continuation.is_none() {
-            // Block indentation is a u8; paragraph indentation can only
-            // occupy one row. Keep the full count until the block is known.
-            let source = if self.leading == 0 {
-                Cow::Borrowed(self.open.as_str())
-            } else {
-                Cow::Owned(format!(
-                    "{}{open}",
-                    " ".repeat(self.leading.min(width.max(usize::from(u8::MAX)))),
-                    open = self.open
-                ))
-            };
-            #[cfg(test)]
-            {
-                self.parsed += source.len();
-            }
-            let block = md::blocks(&source)
-                .fenced(self.fenced)
-                .next()
-                .expect("a logical line always has one block");
-            match block {
-                Block::Fence(line) => {
-                    rows.push(Line::plain(format!("  {line}"), CODE.dim()));
-                    return !self.fenced;
-                }
-                Block::Code(line) => {
-                    rows.push(Line::plain(format!("  {line}"), CODE));
-                    return self.fenced;
-                }
-                block => {
-                    let trimmed = source.trim_start();
-                    let ambiguous = trimmed.is_empty()
-                        || matches!(trimmed, "-" | "*" | "`" | "``")
-                        || (trimmed.len() <= 6 && trimmed.bytes().all(|b| b == b'#'));
-                    if ambiguous {
-                        markdown_into(rows, &source, width, Style::new(), self.fenced);
-                        return self.fenced;
-                    }
-                    let (first, rest, body, style) = layout(block, Style::new());
-                    let mut continuation = Continuation {
-                        first,
-                        rest,
-                        style,
-                        leading: if matches!(block, Block::Quote("")) {
-                            Leading::Trim
-                        } else {
-                            Leading::Keep
-                        },
-                        ..Continuation::default()
-                    };
-                    continuation.push(body, width);
-                    self.continuation = Some(continuation);
-                }
-            }
-            self.open.clear();
-            self.leading = 0;
+        if self.layout != Layout::Reply
+            && self.continuation.is_none()
+            && !self.start_plain(rows, width)
+        {
+            return self.fenced;
+        }
+        if self.continuation.is_none()
+            && let Some(fenced) = self.start_markdown(rows, width)
+        {
+            return fenced;
         }
         let c = self
             .continuation
@@ -434,6 +533,291 @@ impl Live {
             self.kept += checkpoint.rows;
         }
         self.fenced
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Caret {
+    Visible,
+    Hidden,
+}
+
+/// Sparse parser positions, rather than an owning copy of every display row.
+/// Checkpoints keep the unfinished wrap so seeking never changes word placement.
+#[derive(Default)]
+pub(super) struct Cursor {
+    state: Live,
+    tail: Vec<Line>,
+    checkpoints: Vec<(Live, Vec<Line>)>,
+}
+
+impl Cursor {
+    pub fn new(layout: Layout) -> Self {
+        Self {
+            state: Live {
+                layout,
+                ..Live::default()
+            },
+            ..Self::default()
+        }
+    }
+
+    pub fn update(
+        &mut self,
+        text: &str,
+        width: usize,
+        call: CallId,
+        attempt: u16,
+        height: usize,
+    ) -> bool {
+        let changed =
+            self.state.identity != Some((call, attempt, width)) || self.state.seen != text.len();
+        if self.state.identity != Some((call, attempt, width)) || text.len() < self.state.seen {
+            *self = Self::new(self.state.layout);
+        }
+        if self.tail.is_empty() {
+            self.state
+                .update_text(&mut self.tail, "", width, call, attempt);
+        }
+        while self.state.seen < text.len() {
+            let mut end = (self.state.seen + INDEX_BYTES).min(text.len());
+            while !text.is_char_boundary(end) {
+                end += 1;
+            }
+            self.state
+                .update_text(&mut self.tail, &text[..end], width, call, attempt);
+            self.state.retain(&mut self.tail, height.max(1));
+            if self
+                .checkpoints
+                .last()
+                .is_none_or(|(state, _)| self.state.base >= state.base + CHECKPOINT_ROWS)
+            {
+                let mut state = self.state.checkpoint();
+                let drop = state.kept.saturating_sub(1);
+                let rows = self.tail[drop..].to_vec();
+                state.base += drop;
+                state.kept -= drop;
+                self.checkpoints.push((state, rows));
+            }
+        }
+        self.state.retain(&mut self.tail, height.max(1));
+        changed
+    }
+
+    pub fn len(&self) -> usize {
+        self.state.base + self.tail.len()
+    }
+
+    pub fn window(&self, text: &str, range: std::ops::Range<usize>, caret: Caret) -> Vec<Line> {
+        let end = range.end.min(self.len());
+        let mut rows = if range.start >= self.state.base {
+            self.tail[range.start - self.state.base..end - self.state.base].to_vec()
+        } else {
+            let (mut state, mut rows) = self
+                .checkpoints
+                .iter()
+                .rev()
+                .find(|(state, _)| state.base <= range.start)
+                .map_or_else(
+                    || {
+                        (
+                            Live {
+                                layout: self.state.layout,
+                                ..Live::default()
+                            },
+                            Vec::new(),
+                        )
+                    },
+                    |(state, rows)| (state.checkpoint(), rows.clone()),
+                );
+            let (call, attempt, width) =
+                self.state.identity.expect("an indexed cursor has a layout");
+            if self.state.sanitizer.is_some() && state.seen > 0 {
+                let mut sanitizer = client::Sanitizer::default();
+                sanitizer.push(&text.as_bytes()[..state.seen]);
+                state.sanitizer = Some(sanitizer);
+            }
+            while state.seen < text.len() && state.base + state.kept < end {
+                let mut next = (state.seen + INDEX_BYTES).min(text.len());
+                while !text.is_char_boundary(next) {
+                    next += 1;
+                }
+                state.update_text(&mut rows, &text[..next], width, call, attempt);
+                // Keep the requested interval and its unfinished row.
+                let drop = state
+                    .kept
+                    .saturating_sub(1)
+                    .min(range.start.saturating_sub(state.base));
+                rows.drain(..drop);
+                state.base += drop;
+                state.kept -= drop;
+            }
+            rows[range.start - state.base..end - state.base].to_vec()
+        };
+        if caret == Caret::Hidden
+            && self.state.layout == Layout::Reply
+            && end == self.len()
+            && let Some(last) = rows.last_mut()
+            && last.spans.last().is_some_and(|span| span.text == "▍")
+        {
+            last.spans.pop();
+        }
+        rows
+    }
+}
+
+impl Live {
+    fn retain(&mut self, rows: &mut Vec<Line>, keep: usize) {
+        let drop = self.kept.saturating_sub(keep);
+        rows.drain(..drop);
+        self.base += drop;
+        self.kept -= drop;
+    }
+
+    fn checkpoint(&self) -> Self {
+        Self {
+            identity: self.identity,
+            seen: self.seen,
+            kept: self.kept,
+            base: self.base,
+            layout: self.layout,
+            fenced: self.fenced,
+            sanitizer: None,
+            open: self.open.clone(),
+            leading: self.leading,
+            continuation: self.continuation.clone(),
+            #[cfg(test)]
+            rewrapped: 0,
+            #[cfg(test)]
+            parsed: 0,
+        }
+    }
+}
+
+/// A card's small header and indexes into its input/output, without owning
+/// another copy of either source or its wrapped rows.
+pub(super) struct CardCursor {
+    head: Vec<Line>,
+    input: Option<Cursor>,
+    body: Option<Cursor>,
+    hidden: usize,
+    total: usize,
+}
+
+impl CardCursor {
+    pub fn new(item: &Item, p: &Presented<'_>, width: usize, look: Look, height: usize) -> Self {
+        let input = card_input(item, p).filter(|_| look.verbose).map(|text| {
+            let mut cursor = Cursor::new(Layout::Output {
+                base: MUTED,
+                diff: false,
+            });
+            cursor.update(text.raw(), width, CallId(item.key()), 0, height);
+            cursor
+        });
+        let body = (!matches!(p.body, Shown::None)).then(|| {
+            let mut cursor = Cursor::new(Layout::Output {
+                base: Style::new(),
+                diff: matches!(p.body, Shown::Diff(_)),
+            });
+            cursor.update(&output_text(&p.body), width, CallId(item.key()), 0, height);
+            cursor
+        });
+        let count =
+            input.as_ref().map_or(0, |c| c.len() - 1) + body.as_ref().map_or(0, |c| c.len() - 1);
+        let mut header = p.clone();
+        header.body = Shown::None;
+        let mut head = card(item.key(), &header, None, width, look);
+        let hidden = if look.collapsed {
+            count
+        } else if look.verbose {
+            0
+        } else {
+            count.saturating_sub(TAIL)
+        };
+        if look.collapsed && count > 0 {
+            head.push(Line::plain(format!("     {count} lines"), MUTED));
+        } else if hidden > 0 {
+            head.push(Line::from([Span::button(
+                format!("     … +{hidden} lines (ctrl-o to expand)"),
+                MUTED,
+                Action::Toggle(item.key()),
+            )]));
+        }
+        let total = head.len() + count - hidden;
+        Self {
+            head,
+            input,
+            body,
+            hidden,
+            total,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.total
+    }
+
+    pub fn window(
+        &self,
+        item: &Item,
+        p: &Presented<'_>,
+        range: std::ops::Range<usize>,
+    ) -> Vec<Line> {
+        let mut out =
+            self.head[range.start.min(self.head.len())..range.end.min(self.head.len())].to_vec();
+        let mut offset = 0;
+        for (part, cursor) in [self.input.as_ref(), self.body.as_ref()]
+            .into_iter()
+            .enumerate()
+        {
+            let Some(cursor) = cursor else { continue };
+            let count = cursor.len() - 1;
+            let start = (range.start.saturating_sub(self.head.len()) + self.hidden).max(offset);
+            let end = (range.end.saturating_sub(self.head.len()) + self.hidden).min(offset + count);
+            if start < end {
+                let text = if part == 0 {
+                    Cow::Borrowed(
+                        card_input(item, p)
+                            .expect("an indexed input has source text")
+                            .raw(),
+                    )
+                } else {
+                    output_text(&p.body)
+                };
+                out.extend(cursor.window(
+                    &text,
+                    start - offset + 1..end - offset + 1,
+                    Caret::Hidden,
+                ));
+            }
+            offset += count;
+        }
+        if range.contains(&2)
+            && let Some(first) = out
+                .get_mut(2 - range.start)
+                .and_then(|row| row.spans.first_mut())
+        {
+            first.text = format!("  ⎿  {}", first.text.trim_start_matches(' ')).into();
+        }
+        out
+    }
+}
+
+fn output_text<'a>(body: &'a Shown<'_>) -> Cow<'a, str> {
+    match body {
+        Shown::Json(json) => Cow::Borrowed(json.raw()),
+        body => body.text(),
+    }
+}
+
+fn card_input<'a>(item: &'a Item, p: &Presented<'_>) -> Option<&'a Json> {
+    match item {
+        Item::Tool { input, .. }
+            if p.kind == Kind::Tool && protocol::view::command(input).is_none() =>
+        {
+            Some(input)
+        }
+        _ => None,
     }
 }
 
@@ -1056,5 +1440,143 @@ mod tests {
             rows_of(&item, Look::default())[1..],
             ["⏺ /model  ✗ failed", "  ⎿  no command /model"]
         );
+    }
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+
+    #[test]
+    fn sparse_seeks_and_resize_equal_whole_item_rendering() {
+        for user in [false, true] {
+            let text = ("# Heading\n  - **bold** `code` words 日本語 \n```\nraw\n```\n"
+                .repeat(200))
+                + &"one **bold** word 日本語 ".repeat(2000)
+                + "\x1b[31mred\x1b[0m\nend";
+            let item = if user {
+                Item::User {
+                    seq: protocol::Seq::new(1).unwrap(),
+                    text: text.clone(),
+                }
+            } else {
+                Item::Assistant {
+                    seq: protocol::Seq::new(1).unwrap(),
+                    text: text.clone(),
+                }
+            };
+            let mut cursor = Cursor::new(if user { Layout::User } else { Layout::Reply });
+            for width in [100, 23, 1, 200] {
+                cursor.update(&text, width, CallId::new(1).unwrap(), 0, 30);
+                let expected = rows(&item, width, Look::default());
+                assert_eq!(cursor.len(), expected.len(), "user {user}, width {width}");
+                for start in (0..expected.len()).step_by(29) {
+                    let end = (start + 30).min(expected.len());
+                    assert_eq!(
+                        cursor.window(&text, start..end, Caret::Hidden),
+                        expected[start..end],
+                        "user {user}, width {width}, row {start}"
+                    );
+                }
+                assert!(cursor.tail.len() <= 31);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod card_cursor_tests {
+    use super::*;
+
+    #[test]
+    fn card_windows_equal_expanded_collapsed_and_tail_rows() {
+        for diff in [false, true] {
+            let mut item = Item::Tool {
+                invoke: None,
+                call: CallId::new(1).unwrap(),
+                tool: "custom".into(),
+                input: Json::encode(&serde_json::json!({"body": "input ".repeat(500)})).unwrap(),
+                phase: protocol::ledger::Phase::Running,
+                reason: None,
+                outcome: None,
+                card: Some(protocol::Card {
+                    title: "custom".into(),
+                    body: ("-old **literal** `code` 日本語\n+new\n@@ heading\n".repeat(300))
+                        + &"one word ".repeat(3000),
+                    ..protocol::Card::default()
+                }),
+                by: protocol::Audience::Model,
+            };
+            if diff && let Item::Tool { tool, .. } = &mut item {
+                *tool = "edit".into();
+            }
+            for look in [
+                Look::default(),
+                Look {
+                    verbose: true,
+                    ..Look::default()
+                },
+                Look {
+                    collapsed: true,
+                    ..Look::default()
+                },
+            ] {
+                for width in [20, 100] {
+                    let mut p = item.present();
+                    if diff
+                        && let Item::Tool {
+                            card: Some(card), ..
+                        } = &item
+                    {
+                        p.body = Shown::Diff(&card.body);
+                    }
+                    let cursor = CardCursor::new(&item, &p, width, look, 30);
+                    let expected = presented_rows(&item, &p, width, look);
+                    assert_eq!(cursor.len(), expected.len());
+                    for start in (0..expected.len()).step_by(29) {
+                        let end = (start + 30).min(expected.len());
+                        assert_eq!(
+                            cursor.window(&item, &p, start..end),
+                            expected[start..end],
+                            "diff {diff}, width {width}, row {start}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod streaming_cursor_tests {
+    use super::*;
+
+    #[test]
+    fn streamed_windows_keep_only_the_viewport_and_match_whole_markdown() {
+        let text = "# Heading\n".to_owned() + &"plain **bold** `code` 日本語 ".repeat(3000);
+        let mut cursor = Cursor::new(Layout::Reply);
+        let mut end = 0;
+        while end < text.len() {
+            end = (end + 4093).min(text.len());
+            while !text.is_char_boundary(end) {
+                end += 1;
+            }
+            cursor.update(&text[..end], 100, CallId::new(1).unwrap(), 0, 3);
+            let mut expected = vec![Line::default()];
+            expected.extend(markdown(&text[..end], 100, Style::new()));
+            mark_reply(&mut expected);
+            expected
+                .last_mut()
+                .unwrap()
+                .spans
+                .push(Span::new("▍", MUTED));
+            let start = expected.len().saturating_sub(3);
+            assert_eq!(
+                cursor.window(&text[..end], start..expected.len(), Caret::Visible),
+                expected[start..]
+            );
+            assert!(cursor.tail.len() <= 4);
+            assert!(cursor.checkpoints.iter().all(|(_, rows)| rows.len() <= 2));
+        }
     }
 }
