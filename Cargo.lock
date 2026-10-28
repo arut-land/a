@@ -905,8 +905,10 @@ name = "ext-mcp"
 version = "0.0.0"
 dependencies = [
  "base64",
+ "engine",
  "ext",
  "ext-derive",
+ "ext-fixtures",
  "ext-policy",
  "ext-shell",
  "form_urlencoded",
