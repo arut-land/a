@@ -704,6 +704,82 @@ mod tests {
     }
 
     #[test]
+    fn retirement_can_close_creation_without_terminating_existing_members() {
+        use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+        use windows_sys::Win32::System::JobObjects::JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+        let mut command = Command::new("cmd.exe");
+        command
+            .args(["/D", "/C", "ping -n 60 127.0.0.1 >NUL"])
+            .envs(std::env::vars_os());
+        let output = File::options().write(true).open("NUL").unwrap();
+        let input = File::open("NUL").unwrap();
+        let mut child = spawn_group(&mut command, output.try_clone().unwrap()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let watches = loop {
+            let watches = child.group.exit_watches().unwrap();
+            if watches.len() >= 2 {
+                break watches;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shell never launched its child"
+            );
+            std::thread::yield_now();
+        };
+        // SAFETY: zero is valid for all fields before the explicit flags are set.
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        limits.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+        // SAFETY: live job and complete limits buffer remain borrowed for the call.
+        ok(unsafe {
+            SetInformationJobObject(
+                child.group.handle.as_raw_handle(),
+                JobObjectExtendedLimitInformation,
+                (&raw const limits).cast(),
+                u32::try_from(size_of_val(&limits)).unwrap(),
+            )
+        })
+        .unwrap();
+        for process in &watches {
+            assert_eq!(
+                // SAFETY: owned handles include synchronization rights.
+                unsafe { WaitForSingleObject(process.as_raw_handle(), 0) },
+                WAIT_TIMEOUT
+            );
+        }
+        let result = spawn::SpawnPlan {
+            command: &command,
+            io: [&input, &output, &output],
+            inherited: &[],
+            job: Some(&child.group.handle),
+            flags: CREATE_NO_WINDOW,
+            environment: super::super::SpawnEnvironment::Exact,
+        }
+        .spawn();
+        let refused = match result {
+            Ok(mut unexpected) => {
+                unexpected.kill().unwrap();
+                unexpected.wait().unwrap();
+                false
+            }
+            Err(error) => {
+                eprintln!("WIN_REAP sealed creation: {error}");
+                true
+            }
+        };
+        child.group.signal(Signal::Kill).unwrap();
+        for process in watches {
+            assert_eq!(
+                // SAFETY: only waits on this test's retained child handles.
+                unsafe { WaitForSingleObject(process.as_raw_handle(), 5000) },
+                0
+            );
+        }
+        child.wait().unwrap();
+        assert!(refused, "retiring job admitted another child");
+    }
+
+    #[test]
     fn termination_retains_watches_for_members_still_exiting() {
         use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
         let mut command = Command::new("cmd.exe");

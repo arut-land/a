@@ -80,6 +80,7 @@ jobs:
         with:
           path: ${{ runner.temp }}/win-reap-target
           key: win-reap-native-${{ matrix.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: win-reap-${{ matrix.os }}-
       - name: Install native Rust
         run: |
           $channel = (Select-String -Path rust-toolchain.toml -Pattern '^channel = "(.*)"').Matches.Groups[1].Value
@@ -93,6 +94,7 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $records = Get-Content "$env:RUNNER_TEMP/native.jsonl" | ForEach-Object { $_ | ConvertFrom-Json }
           $exe = ($records | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'sys' -and $_.executable }).executable
+          & $exe --exact proc::imp::tests::retirement_can_close_creation_without_terminating_existing_members --nocapture
           $failures = 0
           for ($i = 1; $i -le 100; $i++) {
             & $exe --exact proc::imp::tests::termination_retains_watches_for_members_still_exiting --nocapture
