@@ -10,6 +10,7 @@ mod incoming;
 mod name;
 mod oauth;
 pub use name::{ServerName, ToolName};
+pub use oauth::Authorizations;
 mod redirect;
 mod rpc;
 mod stdio;
@@ -50,7 +51,7 @@ struct Inner {
     timeout: Duration,
     clients: Mutex<HashMap<(SessionId, ServerName), stdio::Client>>,
     registrations: BTreeMap<ServerName, oauth::Registration>,
-    auth: Arc<oauth::State>,
+    auth: Authorizations,
 }
 
 struct RemoteTool {
@@ -64,6 +65,15 @@ fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl Mcp {
     pub fn new(servers: Vec<Server>, timeout: Duration) -> Result<Self, Refused> {
+        Self::with_authorizations(servers, timeout, Authorizations::default())
+    }
+
+    /// Composes MCP instances that share one daemon's credential lifecycles.
+    pub fn with_authorizations(
+        servers: Vec<Server>,
+        timeout: Duration,
+        authorizations: Authorizations,
+    ) -> Result<Self, Refused> {
         if servers.len() > 64 {
             return Err(Refused("ext.mcp: at most 64 servers".into()));
         }
@@ -98,7 +108,7 @@ impl Mcp {
             timeout,
             clients: Mutex::default(),
             registrations: BTreeMap::new(),
-            auth: Arc::default(),
+            auth: authorizations,
         })))
     }
 
@@ -171,8 +181,12 @@ impl Mcp {
                         method,
                         params,
                         headers,
-                        self.0.registrations.get(&server.name),
-                        &self.0.auth,
+                        oauth::Connection {
+                            server: server.name.clone(),
+                            registration: self.0.registrations.get(&server.name).cloned(),
+                            authorizations: self.0.auth.clone(),
+                            timeout: self.0.timeout,
+                        },
                         cx,
                     )
                     .await

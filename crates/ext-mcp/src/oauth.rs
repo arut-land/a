@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::poll_fn;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine;
 use ext::{Cx, Tool};
@@ -14,7 +15,7 @@ use sha2::{Digest, Sha256};
 
 use crate::OAUTH_CLIENT_ID;
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct Registration {
     pub id: String,
     pub issuer: String,
@@ -32,25 +33,198 @@ impl Registration {
     }
 }
 
+/// One daemon's credential lifecycles, independent of sessions and connections.
+/// Share this value when composing multiple MCP instances in the same daemon.
+#[derive(Clone, Default)]
+pub struct Authorizations(Arc<Mutex<Families>>);
+
+#[derive(Default)]
+struct Families {
+    active: BTreeMap<Identity, Arc<Owner>>,
+    owners: BTreeMap<Family, Arc<Owner>>,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Identity {
+    server: crate::ServerName,
+    resource: String,
+    registration: Option<Registration>,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+struct Family {
+    server: crate::ServerName,
+    resource: String,
+    issuer: String,
+    client_id: String,
+}
+
+pub(crate) struct Connection {
+    pub server: crate::ServerName,
+    pub registration: Option<Registration>,
+    pub authorizations: Authorizations,
+    pub timeout: Duration,
+}
+
 pub(crate) struct Client {
     pub inner: Arc<dyn Http>,
     pub cx: Cx,
-    pub registration: Option<Registration>,
-    pub state: Arc<State>,
+    pub connection: Connection,
+}
+
+// No Debug: persisted and in-memory credentials contain secrets.
+#[derive(Serialize, Deserialize)]
+struct Credential {
+    family: Family,
+    scope: String,
+    #[serde(flatten)]
+    access: AccessToken,
+    refresh_token: Option<String>,
+}
+
+// Requests receive only this generation's access token, never its refresh token.
+#[derive(Clone, Serialize, Deserialize)]
+struct AccessToken {
+    access_token: Arc<str>,
+    expires_at: Option<SystemTime>,
+}
+impl AccessToken {
+    fn expired(&self) -> bool {
+        self.expires_at
+            .is_some_and(|expiry| SystemTime::now() >= expiry)
+    }
+}
+
+#[derive(Clone)]
+struct Generation {
+    number: u64,
+    credential: Result<AccessToken, Arc<std::io::Error>>,
+}
+impl Generation {
+    fn token(&self) -> std::io::Result<AccessToken> {
+        self.credential
+            .clone()
+            .map_err(|error| std::io::Error::new(error.kind(), error.to_string()))
+    }
+}
+
+struct Owner {
+    family: Family,
+    server: Server,
+    scopes: Vec<String>,
+    store: sys::credentials::Credentials,
+    key: String,
+    lifecycle: Mutex<Lifecycle>,
 }
 
 #[derive(Default)]
-pub(super) struct State(Mutex<BTreeMap<String, Arc<Credential>>>);
+struct Lifecycle {
+    current: Option<Generation>,
+    cached: Cached,
+    running: Option<Arc<Renewal>>,
+}
 
-// No Debug: the token endpoint response is a secret, including refresh tokens.
-#[derive(Serialize, Deserialize)]
-struct Credential {
-    issuer: String,
-    resource: String,
-    client_id: String,
-    scope: String,
-    access_token: String,
-    refresh_token: Option<String>,
+#[derive(Clone, Default)]
+enum Cached {
+    #[default]
+    Unread,
+    Loaded(Option<Arc<Credential>>),
+}
+
+enum Acquisition {
+    Published(Generation),
+    Waiting(Arc<Renewal>),
+    Start {
+        renewal: Arc<Renewal>,
+        previous: Cached,
+    },
+}
+impl Lifecycle {
+    fn acquire(&mut self, seen: Option<u64>) -> Acquisition {
+        if let Some(running) = &self.running {
+            return Acquisition::Waiting(Arc::clone(running));
+        }
+        if let Some(current) = &self.current
+            && seen != Some(current.number)
+        {
+            return Acquisition::Published(current.clone());
+        }
+        let renewal = Arc::new(Renewal::default());
+        self.running = Some(Arc::clone(&renewal));
+        Acquisition::Start {
+            renewal,
+            previous: self.cached.clone(),
+        }
+    }
+
+    fn publish(&mut self, result: std::io::Result<Arc<Credential>>) -> Generation {
+        if let Ok(credential) = &result {
+            self.cached = Cached::Loaded(Some(Arc::clone(credential)));
+        }
+        let published = Generation {
+            number: self
+                .current
+                .as_ref()
+                .map_or(1, |current| current.number + 1),
+            credential: result
+                .map(|credential| credential.access.clone())
+                .map_err(Arc::new),
+        };
+        self.running = None;
+        self.current = Some(published.clone());
+        published
+    }
+}
+
+#[derive(Default)]
+struct Renewal {
+    result: Mutex<Option<Generation>>,
+    done: rt::Notify,
+    callers: Mutex<Vec<(Arc<()>, Cx)>>,
+}
+struct Participation {
+    renewal: Arc<Renewal>,
+    token: Arc<()>,
+}
+impl Drop for Participation {
+    fn drop(&mut self) {
+        let removed = {
+            let mut callers = crate::lock(&self.renewal.callers);
+            callers
+                .iter()
+                .position(|(token, _)| Arc::ptr_eq(token, &self.token))
+                .map(|index| callers.swap_remove(index))
+        };
+        drop(removed);
+    }
+}
+
+impl Renewal {
+    fn participate(self: &Arc<Self>, cx: &Cx) -> Participation {
+        let token = Arc::new(());
+        crate::lock(&self.callers).push((Arc::clone(&token), cx.clone()));
+        Participation {
+            renewal: Arc::clone(self),
+            token,
+        }
+    }
+
+    fn presenter(&self) -> std::io::Result<Cx> {
+        crate::lock(&self.callers)
+            .iter()
+            .find(|(_, cx)| !cx.cancel.is_set())
+            .map(|(_, cx)| cx.clone())
+            .ok_or_else(|| failure("authorization has no waiting caller"))
+    }
+    async fn wait(&self) -> Generation {
+        self.done
+            .until(|| crate::lock(&self.result).is_some())
+            .await;
+        crate::lock(&self.result)
+            .as_ref()
+            .expect("completed renewal")
+            .clone()
+    }
 }
 
 #[derive(Deserialize)]
@@ -72,16 +246,6 @@ struct Server {
     authorization_response_iss_parameter_supported: bool,
 }
 
-struct Authorization<'a> {
-    client: &'a dyn Http,
-    cx: &'a Cx,
-    runtime: &'a dyn rt::Runtime,
-    resource: String,
-    registration: Option<&'a Registration>,
-    store: sys::credentials::Credentials,
-    state: &'a State,
-}
-
 impl Http for Client {
     fn send(
         &self,
@@ -89,20 +253,51 @@ impl Http for Client {
     ) -> llm::http::BoxFuture<'static, std::io::Result<llm::http::Response>> {
         let inner = Arc::clone(&self.inner);
         let cx = self.cx.clone();
-        let registration = self.registration.clone();
-        let state = Arc::clone(&self.state);
+        let identity = Identity {
+            server: self.connection.server.clone(),
+            resource: request.uri().to_string(),
+            registration: self.connection.registration.clone(),
+        };
+        let owners = self.connection.authorizations.clone();
+        let timeout = self.connection.timeout;
         Box::pin(async move {
-            let resource = request.uri().to_string();
-            let mut credential = crate::lock(&state.0).get(&resource).cloned();
-            let mut loaded = credential.is_some();
-            let mut authorizations = 0;
+            let mut owner = crate::lock(&owners.0).active.get(&identity).cloned();
+            let mut generation = if let Some(owner) = &owner {
+                owner.access(&cx).await?
+            } else {
+                None
+            };
             let (parts, body) = request.into_parts();
+            let mut authorizations = 0;
             loop {
-                let mut request = http::Request::builder()
-                    .method(parts.method.clone())
-                    .uri(parts.uri.clone())
-                    .version(parts.version);
-                *request.headers_mut().expect("valid HTTP request") = parts.headers.clone();
+                let mut credential = generation
+                    .as_ref()
+                    .and_then(|g| g.credential.as_ref().ok())
+                    .cloned();
+                if credential.as_ref().is_some_and(AccessToken::expired) {
+                    generation = Some(
+                        owner
+                            .as_ref()
+                            .expect("issued generation")
+                            .renew(
+                                generation.as_ref().map(|g| g.number),
+                                RenewalRequest {
+                                    status: http::StatusCode::UNAUTHORIZED,
+                                    challenge: BTreeMap::new(),
+                                    client: Arc::clone(&inner),
+                                    cx: cx.clone(),
+                                    deadline: Instant::now() + timeout,
+                                },
+                            )
+                            .await?,
+                    );
+                    credential = Some(generation.as_ref().expect("renewed generation").token()?);
+                }
+                let mut request = http::Request::new(body.clone());
+                *request.method_mut() = parts.method.clone();
+                *request.uri_mut() = parts.uri.clone();
+                *request.version_mut() = parts.version;
+                *request.headers_mut() = parts.headers.clone();
                 if let Some(credential) = &credential {
                     let mut header =
                         http::HeaderValue::from_str(&format!("Bearer {}", credential.access_token))
@@ -110,16 +305,9 @@ impl Http for Client {
                     header.set_sensitive(true);
                     request
                         .headers_mut()
-                        .expect("valid HTTP request")
                         .insert(http::header::AUTHORIZATION, header);
                 }
-                let response = inner
-                    .send(
-                        request
-                            .body(body.clone())
-                            .map_err(|_| failure("invalid request"))?,
-                    )
-                    .await?;
+                let response = inner.send(request).await?;
                 let status = response.status();
                 if status != http::StatusCode::UNAUTHORIZED && status != http::StatusCode::FORBIDDEN
                 {
@@ -132,100 +320,188 @@ impl Http for Client {
                     return Ok(response);
                 }
                 drop(response);
-                let authorization = Authorization {
-                    client: &*inner,
-                    cx: &cx,
-                    runtime: cx
-                        .service::<dyn rt::Runtime>()
-                        .ok_or_else(|| failure("no runtime"))?,
-                    resource: resource.clone(),
-                    registration: registration.as_ref(),
-                    store: match cx.service::<sys::credentials::Credentials>() {
-                        Some(store) => store.clone(),
-                        None => sys::credentials::Credentials::from_env()?,
-                    },
-                    state: &state,
-                };
-                if !loaded {
-                    loaded = true;
-                    credential = authorization.load().await?;
-                    if credential.is_some() {
-                        continue;
-                    }
-                }
                 if authorizations == 2 {
                     return Err(failure("authorization rejected after retry"));
                 }
-                credential = Some(authorization.renew(status, &challenge, credential).await?);
-                authorizations += 1;
+                let next = owners.owner(&identity, &*inner, &cx, &challenge).await?;
+                let seen = owner
+                    .as_ref()
+                    .filter(|old| Arc::ptr_eq(old, &next))
+                    .and(generation.as_ref())
+                    .map(|g| g.number);
+                generation = Some(
+                    next.renew(
+                        seen,
+                        RenewalRequest {
+                            status,
+                            challenge,
+                            client: Arc::clone(&inner),
+                            cx: cx.clone(),
+                            deadline: Instant::now() + timeout,
+                        },
+                    )
+                    .await?,
+                );
+                owner = Some(next);
+                if credential.is_some() {
+                    authorizations += 1;
+                }
             }
         })
     }
 }
 
-impl Authorization<'_> {
-    async fn load(&self) -> std::io::Result<Option<Arc<Credential>>> {
-        let store = self.store.clone();
-        let resource = self.resource.clone();
-        let saved = rt::unblock(self.runtime, move || store.load(&resource)).await?;
-        let credential: Option<Credential> = saved
-            .map(|bytes| {
-                serde_json::from_slice(&bytes).map_err(|_| failure("invalid stored credential"))
-            })
-            .transpose()?;
-        if credential
-            .as_ref()
-            .is_some_and(|c| c.resource != self.resource)
-        {
-            return Err(failure("stored resource mismatch"));
-        }
-        let credential = credential.map(Arc::new);
-        if let Some(credential) = &credential {
-            crate::lock(&self.state.0).insert(self.resource.clone(), Arc::clone(credential));
-        }
-        Ok(credential)
-    }
-
-    async fn save(&self, credential: Option<&Credential>) -> std::io::Result<()> {
-        let encoded = credential
-            .map(serde_json::to_vec)
-            .transpose()
-            .map_err(|_| failure("credential encoding failed"))?;
-        let store = self.store.clone();
-        let key = self.resource.clone();
-        rt::unblock(self.runtime, move || store.save(&key, encoded.as_deref())).await?;
-        if credential.is_none() {
-            crate::lock(&self.state.0).remove(&self.resource);
-        }
-        Ok(())
-    }
-
-    async fn renew(
+impl Authorizations {
+    async fn owner(
         &self,
-        status: http::StatusCode,
+        identity: &Identity,
+        client: &dyn Http,
+        cx: &Cx,
         challenge: &BTreeMap<String, String>,
-        previous: Option<Arc<Credential>>,
-    ) -> std::io::Result<Arc<Credential>> {
-        let (resource_metadata, server) =
-            discover(self.client, &self.resource, challenge, self.registration).await?;
-        let client_id = if let Some(registration) = self.registration {
+    ) -> std::io::Result<Arc<Owner>> {
+        let (metadata, server) = discover(
+            client,
+            &identity.resource,
+            challenge,
+            identity.registration.as_ref(),
+        )
+        .await?;
+        let client_id = if let Some(registration) = &identity.registration {
             if registration.issuer != server.issuer {
                 return Err(failure("pre-registered issuer mismatch"));
             }
-            registration.id.as_str()
+            registration.id.clone()
         } else {
             if !server.client_id_metadata_document_supported {
                 return Err(failure("server requires a pre-registered client id"));
             }
-            OAUTH_CLIENT_ID
+            OAUTH_CLIENT_ID.into()
         };
-        let previous = previous.filter(|c| c.issuer == server.issuer && c.client_id == client_id);
-        let scopes = challenge.get("scope").cloned().unwrap_or_else(|| {
-            resource_metadata
-                .scopes_supported
-                .unwrap_or_default()
-                .join(" ")
-        });
+        let family = Family {
+            server: identity.server.clone(),
+            resource: identity.resource.clone(),
+            issuer: server.issuer.clone(),
+            client_id,
+        };
+        let store = match cx.service::<sys::credentials::Credentials>() {
+            Some(store) => store.clone(),
+            None => sys::credentials::Credentials::from_env()?,
+        };
+        let key = serde_json::to_string(&family)
+            .map_err(|_| failure("credential identity encoding failed"))?;
+        let mut families = crate::lock(&self.0);
+        let owner = Arc::clone(families.owners.entry(family.clone()).or_insert_with(|| {
+            Arc::new(Owner {
+                family,
+                server,
+                scopes: metadata.scopes_supported.unwrap_or_default(),
+                store,
+                key,
+                lifecycle: Mutex::default(),
+            })
+        }));
+        families.active.insert(identity.clone(), Arc::clone(&owner));
+        Ok(owner)
+    }
+}
+
+struct RenewalRequest {
+    status: http::StatusCode,
+    challenge: BTreeMap<String, String>,
+    client: Arc<dyn Http>,
+    cx: Cx,
+    deadline: Instant,
+}
+
+impl Owner {
+    async fn access(&self, cx: &Cx) -> std::io::Result<Option<Generation>> {
+        let (current, running) = {
+            let state = crate::lock(&self.lifecycle);
+            (state.current.clone(), state.running.clone())
+        };
+        if let Some(running) = running {
+            let _participant = running.participate(cx);
+            let result = running.wait().await;
+            result.token()?;
+            return Ok(Some(result));
+        }
+        Ok(current)
+    }
+
+    async fn renew(
+        self: &Arc<Self>,
+        seen: Option<u64>,
+        request: RenewalRequest,
+    ) -> std::io::Result<Generation> {
+        let runtime = request
+            .cx
+            .service_arc::<dyn rt::Runtime>()
+            .ok_or_else(|| failure("no runtime"))?;
+        let acquired = crate::lock(&self.lifecycle).acquire(seen);
+        let (renewal, start) = match acquired {
+            Acquisition::Published(current) => {
+                current.token()?;
+                return Ok(current);
+            }
+            Acquisition::Waiting(renewal) => (renewal, None),
+            Acquisition::Start { renewal, previous } => (renewal, Some(previous)),
+        };
+        let _participant = renewal.participate(&request.cx);
+        if let Some(previous) = start {
+            let owner = Arc::clone(self);
+            let done = Arc::clone(&renewal);
+            let work_runtime = Arc::clone(&runtime);
+            // The daemon runtime owns renewal; dropping any caller only drops its wait.
+            runtime.spawn(Box::pin(async move {
+                let result = owner
+                    .replace(previous, &request, &done, &*work_runtime)
+                    .await;
+                let published = crate::lock(&owner.lifecycle).publish(result);
+                *crate::lock(&done.result) = Some(published);
+                done.done.notify();
+            }));
+        }
+        let result = renewal.wait().await;
+        result.token()?;
+        Ok(result)
+    }
+
+    async fn replace(
+        &self,
+        previous: Cached,
+        request: &RenewalRequest,
+        renewal: &Renewal,
+        runtime: &dyn rt::Runtime,
+    ) -> std::io::Result<Arc<Credential>> {
+        let previous = if let Cached::Loaded(previous) = previous {
+            previous
+        } else {
+            let store = self.store.clone();
+            let key = self.key.clone();
+            let bytes = rt::unblock(runtime, move || store.load(&key)).await?;
+            let credential: Option<Credential> = bytes
+                .map(|bytes| {
+                    serde_json::from_slice(&bytes).map_err(|_| failure("invalid stored credential"))
+                })
+                .transpose()?;
+            if credential.as_ref().is_some_and(|c| c.family != self.family) {
+                return Err(failure("stored credential identity mismatch"));
+            }
+            let credential = credential.map(Arc::new);
+            {
+                let mut state = crate::lock(&self.lifecycle);
+                state.cached = Cached::Loaded(credential.clone());
+            }
+            if let Some(credential) = credential.as_ref().filter(|c| !c.access.expired()) {
+                return Ok(Arc::clone(credential));
+            }
+            credential
+        };
+        let scopes = request
+            .challenge
+            .get("scope")
+            .cloned()
+            .unwrap_or_else(|| self.scopes.join(" "));
         let scopes = scopes
             .split_whitespace()
             .chain(previous.iter().flat_map(|c| c.scope.split_whitespace()))
@@ -233,14 +509,18 @@ impl Authorization<'_> {
             .into_iter()
             .collect::<Vec<_>>()
             .join(" ");
-        let refreshed = if status == http::StatusCode::UNAUTHORIZED {
+        let refreshed = if request.status == http::StatusCode::UNAUTHORIZED {
             if let Some(refresh) = previous.as_ref().and_then(|c| c.refresh_token.as_deref()) {
-                token(
-                    self.client,
-                    &server,
-                    &self.resource,
-                    client_id,
-                    &[("grant_type", "refresh_token"), ("refresh_token", refresh)],
+                network(
+                    runtime,
+                    request.deadline,
+                    token(
+                        &*request.client,
+                        &self.server,
+                        &self.family.resource,
+                        &self.family.client_id,
+                        &[("grant_type", "refresh_token"), ("refresh_token", refresh)],
+                    ),
                 )
                 .await?
             } else {
@@ -256,31 +536,75 @@ impl Authorization<'_> {
         let fresh = if let Some(fresh) = refreshed {
             fresh
         } else {
-            // A revoked credential must not survive a cancelled new authorization.
-            self.save(None).await?;
-            authorize(
-                self.client,
-                self.cx,
-                &server,
-                &self.resource,
-                client_id,
-                &scopes,
+            self.save(runtime, None).await?;
+            let presenter = renewal.presenter()?;
+            network(
+                runtime,
+                request.deadline,
+                authorize(
+                    &*request.client,
+                    &presenter,
+                    &self.server,
+                    &self.family.resource,
+                    &self.family.client_id,
+                    &scopes,
+                ),
             )
             .await?
         };
-        let credential = Credential {
-            issuer: server.issuer,
-            resource: self.resource.clone(),
-            client_id: client_id.to_owned(),
+        let expires_at = fresh
+            .expires_in
+            .map(|seconds| {
+                SystemTime::now()
+                    .checked_add(Duration::from_secs(seconds))
+                    .ok_or_else(|| failure("invalid token expiry"))
+            })
+            .transpose()?;
+        let credential = Arc::new(Credential {
+            family: self.family.clone(),
             scope: fresh.scope.unwrap_or(scopes),
-            access_token: fresh.access_token,
+            access: AccessToken {
+                access_token: fresh.access_token.into(),
+                expires_at,
+            },
             refresh_token: fresh.refresh_token.or(refresh_token),
-        };
-        self.save(Some(&credential)).await?;
-        let credential = Arc::new(credential);
-        crate::lock(&self.state.0).insert(self.resource.clone(), Arc::clone(&credential));
+        });
+        // Native storage completion precedes publication to every waiter.
+        self.save(runtime, Some(&credential)).await?;
         Ok(credential)
     }
+
+    async fn save(
+        &self,
+        runtime: &dyn rt::Runtime,
+        credential: Option<&Credential>,
+    ) -> std::io::Result<()> {
+        let encoded = credential
+            .map(serde_json::to_vec)
+            .transpose()
+            .map_err(|_| failure("credential encoding failed"))?;
+        let store = self.store.clone();
+        let key = self.key.clone();
+        rt::unblock(runtime, move || store.save(&key, encoded.as_deref())).await?;
+        if credential.is_none() {
+            crate::lock(&self.lifecycle).cached = Cached::Loaded(None);
+        }
+        Ok(())
+    }
+}
+
+async fn network<T>(
+    runtime: &dyn rt::Runtime,
+    deadline: Instant,
+    future: impl Future<Output = std::io::Result<T>>,
+) -> std::io::Result<T> {
+    rt::or(future, async {
+        runtime
+            .sleep(deadline.saturating_duration_since(Instant::now()))
+            .await;
+        Err(failure("authorization timed out"))
+    })
+    .await
 }
 
 fn challenge(headers: &http::HeaderMap) -> std::io::Result<BTreeMap<String, String>> {
@@ -430,6 +754,7 @@ struct Tokens {
     token_type: String,
     refresh_token: Option<String>,
     scope: Option<String>,
+    expires_in: Option<u64>,
 }
 
 async fn token(
@@ -607,4 +932,67 @@ impl Tool for Authorize {
 
 fn failure(message: &str) -> std::io::Error {
     std::io::Error::other(format!("MCP OAuth: {message}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn issued_generations_share_immutable_access_token_bytes() {
+        let credential = Arc::new(Credential {
+            family: Family {
+                server: "fixture".parse().unwrap(),
+                resource: "https://fixture/mcp".into(),
+                issuer: "https://fixture/issuer".into(),
+                client_id: OAUTH_CLIENT_ID.into(),
+            },
+            scope: "read".into(),
+            access: AccessToken {
+                access_token: "access".into(),
+                expires_at: None,
+            },
+            refresh_token: Some("refresh".into()),
+        });
+        let mut lifecycle = Lifecycle::default();
+        assert!(matches!(lifecycle.acquire(None), Acquisition::Start { .. }));
+        let generation = lifecycle.publish(Ok(Arc::clone(&credential)));
+        let first = generation.token().unwrap();
+        let second = generation.token().unwrap();
+        assert!(Arc::ptr_eq(&first.access_token, &second.access_token));
+        assert!(Arc::ptr_eq(
+            &first.access_token,
+            &credential.access.access_token
+        ));
+        assert_eq!(Arc::strong_count(&credential), 2);
+    }
+
+    #[test]
+    fn old_generation_rejections_share_the_published_outcome() {
+        let mut state = Lifecycle::default();
+        let Acquisition::Start { renewal, .. } = state.acquire(None) else {
+            panic!("first caller must start renewal");
+        };
+        let Acquisition::Waiting(joined) = state.acquire(None) else {
+            panic!("next caller must join renewal");
+        };
+        assert!(Arc::ptr_eq(&renewal, &joined));
+        let published = state.publish(Err(failure("authorization declined")));
+        *crate::lock(&renewal.result) = Some(published);
+        renewal.done.notify();
+        let result = rt::block_on(joined.wait());
+        assert!(result.token().is_err());
+        let Acquisition::Published(late) = state.acquire(None) else {
+            panic!("late rejection must reuse publication");
+        };
+        assert_eq!(late.number, result.number);
+        assert!(Arc::ptr_eq(
+            late.credential.as_ref().err().unwrap(),
+            result.credential.as_ref().err().unwrap()
+        ));
+        assert!(matches!(
+            state.acquire(Some(result.number)),
+            Acquisition::Start { .. }
+        ));
+    }
 }

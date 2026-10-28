@@ -78,8 +78,7 @@ pub(crate) async fn http_authorized(
     method: &str,
     params: Value,
     headers: http::HeaderMap,
-    registration: Option<&crate::oauth::Registration>,
-    state: &std::sync::Arc<crate::oauth::State>,
+    connection: crate::oauth::Connection,
     cx: &Cx,
 ) -> Result<Value, Failure> {
     let client = crate::oauth::Client {
@@ -88,8 +87,7 @@ pub(crate) async fn http_authorized(
             .expect("engine HTTP clients")
             .client(transport::RedirectPolicy::Refuse),
         cx: cx.clone(),
-        registration: registration.cloned(),
-        state: std::sync::Arc::clone(state),
+        connection,
     };
     exchange(&client, url, method, params, headers, cx).await
 }

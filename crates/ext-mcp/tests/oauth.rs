@@ -322,90 +322,354 @@ fn oauth_engine_process() {
     .unwrap();
 }
 
-#[test]
-fn paginated_authorization_names_are_unique_in_the_engine() {
-    use protocol::{Body, ClientMsg, DaemonMsg, Outcome, read_frame, write_frame};
+struct Engine {
+    root: Rig,
+    fixture: Peer,
+    daemon: Peer,
+    origin: String,
+}
 
-    let root = Rig::new("oauth-engine", Registry::default());
-    let marker = root.dir.join("endpoint");
-    let (_fixture, origin) = serve(&marker, "paginated");
-    let home = sys::Home::from(root.dir.clone());
-    std::fs::write(home.config_file(), format!(
-        "[ext.mcp]\nservers=[\"fixture\"]\nfixture_url=\"{origin}/mcp\"\n[ext.oauth-test-browser]\ncredentials={}\n",
-        serde_json::to_string(&root.dir.join("credentials")).unwrap(),
-    )).unwrap();
-    let mut daemon = Peer(
-        Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "oauth_engine_process", "--nocapture"])
-            .env("A_MCP_TEST_HOME", &root.dir)
-            .spawn()
-            .unwrap(),
-    );
-    let mut writer = connect(&home);
-    let mut reader = std::io::BufReader::new(writer.try_clone().unwrap());
-    write_frame(
-        &mut writer,
-        &ClientMsg::Attach {
-            target: protocol::Target::New,
-            workspace: Some(root.dir.clone().try_into().unwrap()),
-            since: 0,
-            env: Some(protocol::Environment::default()),
-            decl: protocol::ClientDecl::default(),
-        },
-    )
-    .unwrap();
-    loop {
-        if matches!(
-            read_frame::<DaemonMsg>(&mut reader).unwrap(),
-            Some(DaemonMsg::Synced { .. })
-        ) {
-            break;
+impl Engine {
+    fn new(scenario: &str) -> Self {
+        let root = Rig::new("oauth-engine", Registry::default());
+        let (fixture, origin) = serve(&root.dir.join("endpoint"), scenario);
+        let home = sys::Home::from(root.dir.clone());
+        std::fs::write(home.config_file(), format!(
+            "[ext.mcp]\nservers=[\"fixture\"]\nfixture_url=\"{origin}/mcp\"\n[ext.oauth-test-browser]\ncredentials={}\n",
+            serde_json::to_string(&root.dir.join("credentials")).unwrap(),
+        )).unwrap();
+        let daemon = Peer(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "oauth_engine_process", "--nocapture"])
+                .env("A_MCP_TEST_HOME", &root.dir)
+                .spawn()
+                .unwrap(),
+        );
+        Self {
+            root,
+            fixture,
+            daemon,
+            origin,
         }
     }
-    write_frame(
-        &mut writer,
-        &ClientMsg::Input {
-            segments: "call mcp_list {\"server\":\"fixture\"}".into(),
-            mode: protocol::Mode::default(),
-            force: false,
-            client_seq: None,
-        },
-    )
-    .unwrap();
-    let mut parent = None;
-    let mut authorizations = 0;
-    let result = loop {
-        let message = read_frame::<DaemonMsg>(&mut reader)
-            .unwrap()
-            .expect("engine hung up");
-        match message {
-            DaemonMsg::Entry(entry) => match entry.body {
-                Body::ToolCall { tool, .. } if tool == "mcp_list" => {
-                    parent = Some(protocol::CallId(entry.seq));
-                }
-                Body::ToolCall { tool, .. } if tool == "mcp_authorize" => authorizations += 1,
-                Body::ToolResult { call, outcome, .. } if Some(call) == parent => break outcome,
-                _ => {}
+
+    fn stop(&mut self) {
+        let mut client = connect(&sys::Home::from(self.root.dir.clone()));
+        protocol::write_frame(&mut client, &protocol::ClientMsg::Shutdown).unwrap();
+        assert!(self.daemon.0.wait().unwrap().success());
+        self.fixture.0.kill().unwrap();
+        self.fixture.0.wait().unwrap();
+    }
+}
+
+struct Client {
+    writer: sys::OwnedConnection,
+    reader: std::io::BufReader<sys::OwnedConnection>,
+}
+impl Client {
+    fn attach(root: &Path) -> Self {
+        use protocol::{ClientMsg, DaemonMsg, read_frame, write_frame};
+        let mut writer = connect(&sys::Home::from(root.to_owned()));
+        let mut reader = std::io::BufReader::new(writer.try_clone().unwrap());
+        write_frame(
+            &mut writer,
+            &ClientMsg::Attach {
+                target: protocol::Target::New,
+                workspace: Some(root.to_owned().try_into().unwrap()),
+                since: 0,
+                env: Some(protocol::Environment::default()),
+                decl: protocol::ClientDecl::default(),
             },
-            DaemonMsg::Error { message } => panic!("{message}"),
-            _ => {}
+        )
+        .unwrap();
+        loop {
+            if matches!(
+                read_frame::<DaemonMsg>(&mut reader).unwrap(),
+                Some(DaemonMsg::Synced { .. })
+            ) {
+                break;
+            }
         }
-    };
-    write_frame(&mut writer, &ClientMsg::Shutdown).unwrap();
-    assert!(daemon.0.wait().unwrap().success());
-    assert_eq!(authorizations, 2, "{result:?}");
-    let Outcome::Done { output } = result else {
-        panic!("{result:?}");
-    };
-    let protocol::Payload::Inline(output) = output else {
-        panic!("expected inline result");
-    };
-    let output: serde_json::Value = output.parse().unwrap();
-    assert_eq!(output["ok"], json!([]), "{output}");
+        Self { writer, reader }
+    }
+
+    fn list(&mut self) -> (serde_json::Value, usize) {
+        use protocol::{Body, ClientMsg, DaemonMsg, Outcome, read_frame, write_frame};
+        write_frame(
+            &mut self.writer,
+            &ClientMsg::Input {
+                segments: "call mcp_list {\"server\":\"fixture\"}".into(),
+                mode: protocol::Mode::default(),
+                force: false,
+                client_seq: None,
+            },
+        )
+        .unwrap();
+        let mut parent = None;
+        let mut authorizations = 0;
+        loop {
+            let message = read_frame::<DaemonMsg>(&mut self.reader)
+                .unwrap()
+                .expect("engine hung up");
+            match message {
+                DaemonMsg::Entry(entry) => match entry.body {
+                    Body::ToolCall { tool, .. } if tool == "mcp_list" => {
+                        parent = Some(protocol::CallId(entry.seq));
+                    }
+                    Body::ToolCall { tool, .. } if tool == "mcp_authorize" => authorizations += 1,
+                    Body::ToolResult { call, outcome, .. } if Some(call) == parent => {
+                        return (
+                            match outcome {
+                                Outcome::Done {
+                                    output: protocol::Payload::Inline(output),
+                                } => output.parse().unwrap(),
+                                Outcome::Interrupted { .. } => json!({"interrupted":true}),
+                                other => panic!("{other:?}"),
+                            },
+                            authorizations,
+                        );
+                    }
+                    _ => {}
+                },
+                DaemonMsg::Error { message } => panic!("{message}"),
+                _ => {}
+            }
+        }
+    }
+}
+
+#[test]
+fn paginated_authorization_names_are_unique_in_the_engine() {
+    let mut engine = Engine::new("paginated");
+    let (result, authorizations) = Client::attach(&engine.root.dir).list();
+    engine.stop();
+    assert_eq!(authorizations, 2, "{result}");
+    assert_eq!(result["ok"], json!([]), "{result}");
     assert_eq!(
-        std::fs::read_to_string(marker.with_extension("scope")).unwrap(),
+        std::fs::read_to_string(engine.root.dir.join("endpoint.scope")).unwrap(),
         "read write"
     );
+}
+
+fn concurrent_refresh(scenario: &str) {
+    let mut engine = Engine::new(scenario);
+    let first = Client::attach(&engine.root.dir).list();
+    assert_eq!(first, (json!({"ok":[]}), 1));
+    let control = if scenario == "rotating-expiry" {
+        "wait-expiry"
+    } else {
+        "expire/16"
+    };
+    assert!(get(&format!("{}/{control}", engine.origin)).starts_with("HTTP/1.1 200"));
+    let workers: Vec<_> = (0..16)
+        .map(|_| {
+            let home = engine.root.dir.clone();
+            std::thread::spawn(move || Client::attach(&home).list())
+        })
+        .collect();
+    let results: Vec<_> = workers
+        .into_iter()
+        .map(std::thread::JoinHandle::join)
+        .collect();
+    let retried = if scenario == "rotating-transient" {
+        Some(Client::attach(&engine.root.dir).list())
+    } else {
+        None
+    };
+    engine.stop();
+    let results: Vec<_> = results.into_iter().map(Result::unwrap).collect();
+    let attempts = std::fs::read_to_string(engine.root.dir.join("endpoint.refreshes")).unwrap();
+    eprintln!("oauth_refresh_attempts={attempts}");
+    assert_eq!(
+        attempts,
+        if scenario == "rotating-transient" {
+            "2"
+        } else if scenario == "rotating-stepup" {
+            "0"
+        } else {
+            "1"
+        }
+    );
+    assert_eq!(
+        results.iter().map(|(_, cards)| cards).sum::<usize>(),
+        usize::from(matches!(
+            scenario,
+            "rotating-revoked" | "rotating-denied" | "rotating-stepup"
+        ))
+    );
+    if scenario == "rotating-expiry" {
+        assert_eq!(
+            std::fs::read_to_string(engine.root.dir.join("endpoint.old-requests")).unwrap(),
+            "0"
+        );
+    }
+    if let Some(retried) = retried {
+        assert_eq!(retried, (json!({"ok":[]}), 0));
+    }
+    for (result, _) in results {
+        if scenario == "rotating-transient" {
+            assert!(
+                result["failed"]["transport"]
+                    .as_str()
+                    .unwrap()
+                    .contains("token endpoint rejected"),
+                "{result}"
+            );
+        } else if scenario == "rotating-denied" {
+            assert!(
+                result["failed"]["transport"]
+                    .as_str()
+                    .unwrap()
+                    .contains("declined"),
+                "{result}"
+            );
+        } else {
+            assert_eq!(result["ok"], json!([]), "{result}");
+        }
+    }
+}
+
+#[test]
+fn rotating_refresh_tokens_are_redeemed_exactly_once() {
+    concurrent_refresh("rotating");
+}
+
+#[test]
+fn a_revoked_shared_refresh_token_presents_one_authorization_for_all_sessions() {
+    concurrent_refresh("rotating-revoked");
+}
+
+#[test]
+fn a_declined_shared_authorization_resumes_every_waiter_with_the_same_failure() {
+    concurrent_refresh("rotating-denied");
+}
+
+#[test]
+fn concurrent_scope_step_up_uses_one_authorization_transaction() {
+    concurrent_refresh("rotating-stepup");
+}
+
+#[test]
+fn transient_refresh_failure_preserves_the_credential_for_a_later_retry() {
+    concurrent_refresh("rotating-transient");
+}
+
+#[test]
+fn token_expiry_joins_renewal_before_sending_an_expired_generation() {
+    concurrent_refresh("rotating-expiry");
+}
+
+#[test]
+fn cancelling_the_refresh_starter_does_not_cancel_other_sessions_renewal() {
+    let mut engine = Engine::new("rotating-cancel");
+    assert_eq!(
+        Client::attach(&engine.root.dir).list(),
+        (json!({"ok":[]}), 1)
+    );
+    assert!(get(&format!("{}/expire/1", engine.origin)).starts_with("HTTP/1.1 200"));
+    let mut leader = Client::attach(&engine.root.dir);
+    let mut interrupt = leader.writer.try_clone().unwrap();
+    let leader = std::thread::spawn(move || leader.list());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !engine.root.dir.join("endpoint.refresh-start").exists() {
+        assert!(Instant::now() < deadline, "refresh did not start");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let workers: Vec<_> = (0..16)
+        .map(|_| {
+            let home = engine.root.dir.clone();
+            std::thread::spawn(move || Client::attach(&home).list())
+        })
+        .collect();
+    protocol::write_frame(
+        &mut interrupt,
+        &protocol::ClientMsg::Interrupt { client_seq: None },
+    )
+    .unwrap();
+    let cancelled = leader.join();
+    std::fs::write(engine.root.dir.join("endpoint.release"), b"ready").unwrap();
+    let results: Vec<_> = workers
+        .into_iter()
+        .map(std::thread::JoinHandle::join)
+        .collect();
+    engine.stop();
+    let cancelled = cancelled.unwrap().0;
+    assert!(
+        cancelled == json!({"interrupted":true}) || cancelled == json!({"failed":"cancelled"}),
+        "{cancelled}"
+    );
+    for result in results {
+        assert_eq!(result.unwrap(), (json!({"ok":[]}), 0));
+    }
+    assert_eq!(
+        std::fs::read_to_string(engine.root.dir.join("endpoint.refreshes")).unwrap(),
+        "1"
+    );
+}
+
+#[test]
+fn separately_composed_mcp_instances_share_the_same_credential_lifecycle() {
+    let root = Rig::new("oauth-shared-owner", Registry::default());
+    let marker = root.dir.join("endpoint");
+    let (mut fixture, origin) = serve(&marker, "rotating");
+    let browser = Browser {
+        credentials: sys::credentials::Credentials::isolated(root.dir.join("credentials")),
+        approvals: Arc::default(),
+        threads: Arc::default(),
+    };
+    let authorizations = ext_mcp::Authorizations::default();
+    let rigs: Vec<_> = (0..2)
+        .map(|_| {
+            let mcp = Mcp::with_authorizations(
+                vec![Server {
+                    name: "fixture".parse().unwrap(),
+                    description: String::new(),
+                    transport: Transport::Http(format!("{origin}/mcp")),
+                    env: BTreeMap::new(),
+                }],
+                Duration::from_secs(10),
+                authorizations.clone(),
+            )
+            .unwrap();
+            Arc::new(Rig::new(
+                "oauth-shared-client",
+                Registry::default()
+                    .with(&mcp)
+                    .unwrap()
+                    .with(&browser)
+                    .unwrap(),
+            ))
+        })
+        .collect();
+    assert_eq!(
+        rigs[0].done("mcp_list", &json!({"server":"fixture"})),
+        json!({"ok":[]})
+    );
+    assert!(get(&format!("{origin}/expire/2")).starts_with("HTTP/1.1 200"));
+    let workers: Vec<_> = rigs
+        .iter()
+        .map(|rig| {
+            let rig = Arc::clone(rig);
+            std::thread::spawn(move || rig.done("mcp_list", &json!({"server":"fixture"})))
+        })
+        .collect();
+    let results: Vec<_> = workers
+        .into_iter()
+        .map(std::thread::JoinHandle::join)
+        .collect();
+    fixture.0.kill().unwrap();
+    fixture.0.wait().unwrap();
+    for result in results {
+        assert_eq!(result.unwrap(), json!({"ok":[]}));
+    }
+    assert_eq!(
+        std::fs::read_to_string(marker.with_extension("refreshes")).unwrap(),
+        "1"
+    );
+    assert_eq!(browser.approvals.load(Ordering::SeqCst), 1);
+    for browser in browser.threads.lock().unwrap().drain(..) {
+        browser.join().unwrap();
+    }
 }
 
 fn connect(home: &sys::Home) -> sys::OwnedConnection {

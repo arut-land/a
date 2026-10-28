@@ -1,7 +1,9 @@
 //! Local authorization server and protected MCP endpoint; no live services.
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Barrier, Mutex};
+use std::time::Duration;
 
 use base64::Engine;
 use serde_json::{Value, json};
@@ -11,61 +13,129 @@ pub fn serve(marker: &str, scenario: &str) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     sys::fs::write_private(std::path::Path::new(marker), origin.as_bytes()).unwrap();
-    let mut state = State {
+    std::fs::write(format!("{marker}.refreshes"), "0").unwrap();
+    let state = Arc::new(Mutex::new(State {
         origin,
-        scenario,
-        marker,
+        scenario: scenario.into(),
+        marker: marker.into(),
         challenge: String::new(),
         scope: String::new(),
         tokens: 0,
         calls: 0,
-    };
+        refreshes: 0,
+        expired: false,
+        gate: None,
+        old_requests: 0,
+    }));
     for stream in listener.incoming() {
-        let mut stream = stream.unwrap();
-        let mut bytes = Vec::new();
-        while !bytes.ends_with(b"\r\n\r\n") {
-            let mut byte = [0];
-            stream.read_exact(&mut byte).unwrap();
-            bytes.push(byte[0]);
-        }
-        let head = String::from_utf8(bytes).unwrap();
-        let target = head
-            .lines()
-            .next()
-            .unwrap()
-            .split_whitespace()
-            .nth(1)
-            .unwrap();
-        let length = head
-            .lines()
-            .find_map(|line| {
-                line.to_ascii_lowercase()
-                    .strip_prefix("content-length: ")
-                    .map(|n| n.parse::<usize>().unwrap())
-            })
-            .unwrap_or(0);
-        let mut body = vec![0; length];
-        stream.read_exact(&mut body).unwrap();
-        let (status, headers, value) = state.reply(target, &head, &body);
-        let body = serde_json::to_vec(&value).unwrap();
-        write!(stream, "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
-        stream.write_all(&body).unwrap();
+        let state = Arc::clone(&state);
+        std::thread::spawn(move || exchange(stream.unwrap(), &state));
     }
 }
 
-struct State<'a> {
+fn exchange(mut stream: TcpStream, state: &Mutex<State>) {
+    let mut bytes = Vec::new();
+    while !bytes.ends_with(b"\r\n\r\n") {
+        let mut byte = [0];
+        stream.read_exact(&mut byte).unwrap();
+        bytes.push(byte[0]);
+    }
+    let head = String::from_utf8(bytes).unwrap();
+    let target = head
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap();
+    let length = head
+        .lines()
+        .find_map(|line| {
+            line.to_ascii_lowercase()
+                .strip_prefix("content-length: ")
+                .map(|n| n.parse::<usize>().unwrap())
+        })
+        .unwrap_or(0);
+    let mut body = vec![0; length];
+    stream.read_exact(&mut body).unwrap();
+    if target == "/wait-expiry" {
+        std::thread::sleep(Duration::from_millis(1250));
+    }
+    let (gate, late) = {
+        let mut state = state.lock().unwrap();
+        if target == "/mcp" && state.expired {
+            state.old_requests += 1;
+            std::fs::write(
+                format!("{}.old-requests", state.marker),
+                state.old_requests.to_string(),
+            )
+            .unwrap();
+            (
+                state.gate.clone(),
+                state.old_requests == 1 && state.scenario != "rotating-cancel",
+            )
+        } else {
+            (None, false)
+        }
+    };
+    if let Some(gate) = gate {
+        gate.wait();
+    }
+    if late {
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    if target == "/token" && body.starts_with(b"grant_type=refresh_token") {
+        let (scenario, marker) = {
+            let state = state.lock().unwrap();
+            (state.scenario.clone(), state.marker.clone())
+        };
+        if scenario.starts_with("rotating") {
+            std::fs::write(format!("{marker}.refresh-start"), b"ready").unwrap();
+            if scenario == "rotating-cancel" {
+                while !std::path::Path::new(&format!("{marker}.release")).exists() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(150));
+            }
+        }
+    }
+    let (status, headers, value) = state.lock().unwrap().reply(target, &head, &body);
+    let body = serde_json::to_vec(&value).unwrap();
+    write!(stream, "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+    let _ = stream.write_all(&body);
+}
+
+struct State {
     origin: String,
-    scenario: &'a str,
-    marker: &'a str,
+    scenario: String,
+    marker: String,
     challenge: String,
     scope: String,
     tokens: usize,
     calls: usize,
+    refreshes: usize,
+    expired: bool,
+    gate: Option<Arc<Barrier>>,
+    old_requests: usize,
 }
 
-impl State<'_> {
+impl State {
     fn reply(&mut self, target: &str, head: &str, body: &[u8]) -> (u16, String, Value) {
         let origin = &self.origin;
+        if target == "/wait-expiry" {
+            self.expired = true;
+            self.gate = None;
+            self.old_requests = 0;
+            std::fs::write(format!("{}.old-requests", self.marker), "0").unwrap();
+            return (200, String::new(), json!({}));
+        }
+        if let Some(count) = target.strip_prefix("/expire/") {
+            self.expired = true;
+            self.old_requests = 0;
+            self.gate = Some(Arc::new(Barrier::new(count.parse().unwrap())));
+            return (200, String::new(), json!({}));
+        }
         if target == "/mcp" {
             self.calls += 1;
             let request: Value = serde_json::from_slice(body).unwrap();
@@ -73,10 +143,11 @@ impl State<'_> {
             let authorized = head.lines().any(|line| {
                 line.eq_ignore_ascii_case(&format!("authorization: Bearer access-{}", self.tokens))
             });
-            let needs_auth =
-                !authorized || (matches!(self.scenario, "refresh" | "revoked") && self.calls == 3);
+            let needs_auth = (self.expired || !authorized)
+                || (matches!(self.scenario.as_str(), "refresh" | "revoked") && self.calls == 3);
             let step_up = (self.scenario == "stepup" && self.calls == 3)
                 || (self.scenario == "during-call-stepup" && self.calls == 2)
+                || (self.scenario == "rotating-stepup" && self.expired)
                 || (self.scenario == "paginated"
                     && later_page
                     && !self.scope.split_whitespace().any(|scope| scope == "write"));
@@ -95,6 +166,26 @@ impl State<'_> {
                     ),
                     json!({"error":"authorization_required"}),
                 );
+            }
+            if self.scenario.starts_with("rotating") && self.tokens >= 2 {
+                let files = std::path::Path::new(&self.marker)
+                    .parent()
+                    .unwrap()
+                    .join("credentials");
+                let persisted = std::fs::read_dir(files).unwrap().any(|entry| {
+                    let bytes = std::fs::read(entry.unwrap().path()).unwrap();
+                    serde_json::from_slice::<Value>(&bytes).is_ok_and(|saved| {
+                        saved["access_token"] == format!("access-{}", self.tokens)
+                            && saved["refresh_token"] == format!("fixture-refresh-{}", self.tokens)
+                    })
+                });
+                if !persisted {
+                    return (
+                        500,
+                        String::new(),
+                        json!({"error":"replacement_not_persisted"}),
+                    );
+                }
             }
             let result = if self.scenario == "paginated" && !later_page {
                 json!({"resultType":"complete","tools":[],"nextCursor":"next"})
@@ -151,9 +242,18 @@ impl State<'_> {
             assert!(!params.contains_key("scope"));
         }
         self.scope = params.get("scope").cloned().unwrap_or_default();
+        let denied =
+            matches!(self.scenario.as_str(), "rotating" | "rotating-denied") && self.tokens > 0;
         let query = form_urlencoded::Serializer::new(String::new())
             .extend_pairs([
-                ("code", "fixture-code"),
+                (
+                    if denied { "error" } else { "code" },
+                    if denied {
+                        "access_denied"
+                    } else {
+                        "fixture-code"
+                    },
+                ),
                 ("state", &params["state"]),
                 (
                     "iss",
@@ -187,6 +287,28 @@ impl State<'_> {
                 ext_mcp::OAUTH_CLIENT_ID
             }
         );
+        if params["grant_type"] == "refresh_token" && self.scenario.starts_with("rotating") {
+            self.refreshes += 1;
+            std::fs::write(
+                format!("{}.refreshes", self.marker),
+                self.refreshes.to_string(),
+            )
+            .unwrap();
+            if self.scenario == "rotating-transient" && self.refreshes == 1 {
+                self.gate = None;
+                return (
+                    503,
+                    String::new(),
+                    json!({"error":"temporarily_unavailable"}),
+                );
+            }
+            if self.scenario == "rotating-revoked"
+                || self.scenario == "rotating-denied"
+                || params["refresh_token"] != format!("fixture-refresh-{}", self.tokens)
+            {
+                return (400, String::new(), json!({"error":"invalid_grant"}));
+            }
+        }
         if self.scenario == "revoked" && params["grant_type"] == "refresh_token" {
             return (400, String::new(), json!({"error":"invalid_grant"}));
         }
@@ -197,16 +319,17 @@ impl State<'_> {
                     .encode(Sha256::digest(params["code_verifier"].as_bytes())),
                 self.challenge
             );
-        } else {
+        } else if !self.scenario.starts_with("rotating") {
             assert_eq!(params["refresh_token"], "fixture-refresh");
         }
         self.tokens += 1;
+        self.expired = false;
         std::fs::write(format!("{}.tokens", self.marker), self.tokens.to_string()).unwrap();
         std::fs::write(format!("{}.scope", self.marker), &self.scope).unwrap();
         (
             200,
             String::new(),
-            json!({"access_token":format!("access-{}", self.tokens),"token_type":"Bearer","refresh_token":"fixture-refresh","scope":self.scope}),
+            json!({"access_token":format!("access-{}", self.tokens),"token_type":"Bearer","refresh_token":if self.scenario.starts_with("rotating") {format!("fixture-refresh-{}", self.tokens)} else {"fixture-refresh".into()},"scope":self.scope,"expires_in":if self.scenario == "rotating-expiry" && self.tokens == 1 {1} else {3600}}),
         )
     }
 }

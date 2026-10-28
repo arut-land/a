@@ -436,10 +436,9 @@ On the M3, all 45 MCP tests passed. The engine pagination regression and the
 previously flaky no-scope authorization test each passed 20 consecutive stress
 iterations. Touched-crate check, all-target clippy with `-D warnings`, formatting,
 and the workspace Windows lint passed. The owner-approved metadata URL remains
-unchanged and still requires hosting by the owner. The engine regression adds
-two generated test-dependency edges to `Cargo.lock`; that file is outside the
-owned paths, so the companion patch is left for owner integration. CI commands
-resolve the same existing workspace packages without adding registry packages.
+unchanged and still requires hosting by the owner. The owner subsequently authorized generated lockfile ownership; commit
+`07db53a1` integrates the two existing-workspace test-dependency edges. No registry
+package was added by that patch.
 
 The post-review shipped build passed `mise run size` and its fixture scan at
 **6,873,760 bytes**, 48 bytes above the phase-1 candidate and 84,336 bytes above
@@ -455,3 +454,99 @@ This is a deterministic interpreter limitation, so no failed-job retry was made.
 The follow-up is locally verified and is not covered by the already dispatched
 SHA. Local runtime Miri invariants passed; the full local sys Miri suite stops
 earlier at the existing, out-of-scope config test's unsupported macOS `acl_init`.
+
+
+### Credential lifecycle coordination (owner-approved follow-up)
+
+`Authorizations` owns one lifecycle for each exact configured server name,
+resource URI, issuer and client ID. The daemon's existing MCP instance shares
+that value across its sessions and connections. `Mcp::with_authorizations` lets
+separately composed instances share the same value, providing the small typed
+seam for the forthcoming daemon-wide scoping work. No process-global cache or
+cross-home singleton was added.
+
+Requests receive a numbered access-token generation; refresh credentials remain
+inside the owner. Immutable access-token bytes are shared through `Arc<str>`.
+This uses Serde's existing `rc` feature, with no new package. Credential load,
+refresh, reauthorization, native persistence and publication form one owned
+transaction. Concurrent callers join its result. A late 401 from an older
+generation reuses the newer publication, including its shared failure, instead
+of redeeming the old refresh token again. A transient refresh error retains the
+last persisted refresh credential for a later operation to retry.
+
+The token endpoint's optional `expires_in` is recorded as an absolute expiration
+in the private credential record (see [RFC 6749, section 5.1](https://www.rfc-editor.org/rfc/rfc6749#section-5.1)).
+An incoming request with an expired generation joins renewal before sending the
+expired token. Missing expiry leaves rejection-driven renewal in place. There
+is no expiry timer, idle connection or maintenance task. Idle RSS and CPU were
+not remeasured for this follow-up; the earlier idle observations remain
+historical evidence, not an exact zero-byte cost claim for the new owner.
+
+The runtime owns the renewal future. Cancelling a caller drops that caller's
+wait and presentation candidacy while other callers continue awaiting the
+transaction. A reauthorization selects a live waiting caller's existing approval
+presentation. Native storage completion precedes publishing a replacement:
+storage writes are not abandoned at the network deadline, since accepted native
+jobs can outlive a dropped future. The existing configured MCP timeout bounds
+network work. No new pagination, scope, token-length or caller-count cap was added.
+
+The real-engine regressions use sixteen sessions and connections, a local HTTP
+fixture with rotating refresh tokens, and a delayed old-generation 401 after the
+replacement can already have been published. The fixture checks that both access
+and refresh replacements are on disk before accepting their first use. Separate
+cases cover one shared authorization after revocation, a shared declined result,
+expiry before HTTP, starter cancellation during refresh, transient failure and
+retry, concurrent scope step-up, and sharing between separately composed MCP
+instances. All 55 MCP tests passed in dev and release builds. All eight lifecycle
+integration cases passed 20 stress iterations each. Clippy with `-D warnings`,
+formatting, workspace Windows lint, documentation and the normal all-target tokio
+ban check passed. Both private lifecycle invariants passed Miri.
+
+The original release client reproduced sixteen refresh redemptions for one
+rotating token. An initial measurement also exposed a losing request deleting a
+replacement saved by another request. The fixture now returns a failed response
+for that persistence violation rather than panicking, allowing complete samples.
+Both compared binaries use the same final fixture. Six samples per build run in
+alternating AB/BA rounds on the shared M3, with fresh isolated homes, the shipped
+release profile, nightly-2026-10-17 and two Cargo build jobs. Before product code
+is `07db53a1` with the regression harness added; the after build includes this
+coordinator. Values below are medians [minimum–maximum].
+
+| Whole regression command | Before | After |
+| --- | ---: | ---: |
+| Refresh redemptions | 16 [16–16] | 1 [1–1] |
+| Wall time, ms | 1,038.05 [965.76–1,150.21] | 816.68 [767.67–1,150.28] |
+| User + system CPU, ms | 100 [100–110] | 90 [80–100] |
+| Native time maximum RSS, KiB | 11,664 [11,648–11,680] | 11,184 [11,120–11,296] |
+
+The before regression fails; all sixteen after requests complete. These timings
+include daemon startup, fixture delays and shutdown, and compare failed versus
+successful execution. They do not establish an equivalent-success latency or
+CPU/RSS improvement. Native `time -lp` reports command resource usage, not idle
+daemon RSS or the sum of concurrent processes' RSS. CPU values have 10 ms
+resolution. No samples were discarded from the final complete six-round replay.
+Raw samples, initial/provisional runs, source hashes and the replay script are
+retained outside the worktree beside `mcp-oauth-refresh.report.md`.
+
+Pending approval cards still belong to an engine parent call. Interrupting the
+chosen parent while its approval is pending can end that question and give every
+waiter the shared authorization-declined result. Preserving that pending card
+across its parent's interruption needs an SDK/engine authority lifetime seam
+outside these owned paths (`Cx::invoke`, `ContextOrigin`, and invocation/cancellation
+ownership). The coordinator can select another live caller before presenting,
+and refresh work survives starter cancellation; the pending-card lifetime remains
+an integration requirement for the owner/scoping lane. No SDK, engine, protocol,
+client or UI changes were made here. The owner explicitly deferred interrupted
+multipart Windows credential writes; that case remains unchanged. The approved
+client metadata URL remains the owner's unhosted placeholder.
+
+CI is deferred until independent review, as requested.
+
+The shipped coordinator build passed `mise run size` and its fixture scan at
+**6,907,008 bytes**, versus the previously measured pre-coordination OAuth build's
+**6,873,760 bytes**: **+33,248 bytes (32.47 KiB, 0.484%)**. That baseline's product
+code is unchanged through `07db53a1`; the intervening lockfile and Miri-only test
+changes do not ship. This is the complete feature delta, including expiry,
+coordination and shared access-token serialization, rather than an isolated cost
+attribution to Serde's `rc` feature. These are exact native M3 size observations;
+Linux and Windows execution of this follow-up awaits the post-review CI run.
