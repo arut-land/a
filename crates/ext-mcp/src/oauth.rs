@@ -498,10 +498,7 @@ impl Owner {
                 return Err(failure("stored credential identity mismatch"));
             }
             let credential = credential.map(Arc::new);
-            {
-                let mut state = crate::lock(&self.lifecycle);
-                state.cached = Cached::Loaded(credential.clone());
-            }
+            crate::lock(&self.lifecycle).cached = Cached::Loaded(credential.clone());
             if let Some(credential) = credential.as_ref().filter(|c| !c.access.expired()) {
                 return Ok(Arc::clone(credential));
             }

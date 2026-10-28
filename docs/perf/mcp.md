@@ -550,3 +550,45 @@ changes do not ship. This is the complete feature delta, including expiry,
 coordination and shared access-token serialization, rather than an isolated cost
 attribution to Serde's `rc` feature. These are exact native M3 size observations;
 Linux and Windows execution of this follow-up awaits the post-review CI run.
+
+
+### Scope step-up review fix
+
+A `403 insufficient_scope` leaves the previous access and refresh credential
+intact while an upgrade is presented. Successful authorization is persisted
+before replacing that grant. Declining or failing an upgrade keeps the stored
+bytes unchanged. New operations can still obtain the cached prior access token,
+while callers awaiting the failed upgrade continue to share its failure. A
+rejected `401` credential still follows the existing revocation path.
+
+The real-engine invariants
+`declining_scope_step_up_preserves_previously_granted_access` and
+`failing_scope_step_up_preserves_previously_granted_access` establish a read
+grant, reject the write upgrade, compare the stored credential bytes, perform a
+read without another card, and then refresh the original grant without another
+card. They failed on the original release client: the grant was removed and the
+read needed one extra authorization. Both pass after the fix. The private
+lifecycle invariant also checks that cached access remains available to new
+operations without hiding the failed outcome from older waiters.
+
+Six release samples per build, alternating AB/BA on the shared M3 against the same
+fixture, observed unchanged stored grants in **0/6 before versus 6/6 after**.
+The subsequent original-scope operation required **1 [1–1]** extra approval card
+before versus **0 [0–0]** after (median [minimum–maximum]). Whole regression-command
+wall times were **708.71 [703.90–1,048.30] ms** before and
+**659.12 [653.54–730.52] ms** after. These include fixture delays, startup and
+shutdown and compare failed with successful execution; they are diagnostic
+observations, not an equivalent-success latency claim. The after build also
+integrates main through `1af5daf3`; no CPU/RSS effect is attributed to this fix.
+Raw samples and source/binary hashes are retained with `mcp-oauth-stepup.report.md`.
+
+After main integration, all 58 MCP tests passed in dev and release profiles.
+Both review regressions passed 20 stress iterations each. All three lifecycle invariants passed Miri; formatting, all-target clippy with
+`-D warnings`, documentation, workspace Windows lint and the normal all-target
+tokio ban check passed. The earlier native credential-file Miri annotation is
+included in this branch and will be covered by the phase-2 CI dispatch.
+
+The pending-card parent-lifetime seam remains tracked for `mcp-elicit` /
+`mcp-instances`. The owner-approved metadata URL and interrupted multipart Windows
+credential-write decisions remain unchanged. This review fix introduces no new
+dependency, wire change or additional hardening.
