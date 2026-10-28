@@ -469,8 +469,8 @@ impl TransientBuffer {
 
     pub fn as_str(&self) -> Result<&str, std::str::Utf8Error> {
         if self.utf8 {
-            // SAFETY: typed appends and ASCII pops preserve UTF-8. Every raw
-            // mutable view, raw append, or arbitrary truncation invalidates it.
+            // SAFETY: typed appends and ASCII pops preserve UTF-8. Raw scratch,
+            // mutable views, raw appends and arbitrary truncation invalidate it.
             Ok(unsafe { std::str::from_utf8_unchecked(self.as_ref()) })
         } else {
             std::str::from_utf8(self.as_ref())
@@ -485,6 +485,8 @@ impl TransientBuffer {
             return Err(io::ErrorKind::OutOfMemory.into());
         }
         self.reserve_for(end)?;
+        // A caller can forget the guard, so invalidate before exposing scratch.
+        self.utf8 = false;
         match self.storage {
             Storage::Heap => {
                 self.compact();
@@ -572,7 +574,6 @@ pub struct ReadBuffer<'a> {
 }
 impl ReadBuffer<'_> {
     pub fn filled(mut self, len: usize) {
-        self.buffer.utf8 = false;
         self.kept += len;
     }
 }
@@ -763,6 +764,15 @@ mod tests {
         bytes.extend_from_slice(&[0xff]).unwrap();
         bytes.clear().unwrap();
         bytes.read_buffer(1).unwrap().filled(1);
+        assert!(bytes.as_str().is_err());
+    }
+
+    #[test]
+    fn forgotten_read_scratch_cannot_preserve_a_text_guarantee() {
+        let mut bytes = TransientBuffer::new(8192);
+        bytes.extend_from_slice(&[0xff]).unwrap();
+        bytes.clear().unwrap();
+        std::mem::forget(bytes.read_buffer(1).unwrap());
         assert!(bytes.as_str().is_err());
     }
 
