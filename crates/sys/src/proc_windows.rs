@@ -707,15 +707,24 @@ mod tests {
     fn termination_retains_watches_for_members_still_exiting() {
         use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
         let mut command = Command::new("cmd.exe");
-        command.args(["/D", "/C", "ping -n 60 127.0.0.1 >NUL"])
+        command
+            .args(["/D", "/C", "ping -n 60 127.0.0.1 >NUL"])
             .envs(std::env::vars_os());
-        let mut child = spawn_group(&mut command,
-            File::options().write(true).open("NUL").unwrap()).unwrap();
+        let mut child = spawn_group(
+            &mut command,
+            File::options().write(true).open("NUL").unwrap(),
+        )
+        .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let before = loop {
             let watches = child.group.exit_watches().unwrap();
-            if watches.len() >= 2 { break watches; }
-            assert!(std::time::Instant::now() < deadline, "shell never launched its child");
+            if watches.len() >= 2 {
+                break watches;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shell never launched its child"
+            );
             std::thread::yield_now();
         };
         let started = std::time::Instant::now();
@@ -723,18 +732,30 @@ mod tests {
         let terminated = started.elapsed();
         let after = child.group.exit_watches().unwrap();
         let observed = started.elapsed();
-        let pending = before.iter().filter(|process| {
-            // SAFETY: each owned process handle includes synchronization rights.
-            unsafe { WaitForSingleObject(process.as_raw_handle(), 0) } == WAIT_TIMEOUT
-        }).count();
+        let pending = before
+            .iter()
+            .filter(|process| {
+                // SAFETY: each owned process handle includes synchronization rights.
+                (unsafe { WaitForSingleObject(process.as_raw_handle(), 0) }) == WAIT_TIMEOUT
+            })
+            .count();
         let lost = after.is_empty() && pending != 0;
-        eprintln!("WIN_REAP native terminated={terminated:?} observed={observed:?} watches={} pending={pending}", after.len());
+        eprintln!(
+            "WIN_REAP native terminated={terminated:?} observed={observed:?} watches={} pending={pending}",
+            after.len()
+        );
         for process in before {
-            // SAFETY: only waits on handles retained for this test's own children.
-            assert_eq!(unsafe { WaitForSingleObject(process.as_raw_handle(), 5000) }, 0);
+            assert_eq!(
+                // SAFETY: only waits on handles retained for this test's own children.
+                unsafe { WaitForSingleObject(process.as_raw_handle(), 5000) },
+                0
+            );
         }
         child.wait().unwrap();
-        assert!(!lost, "terminated job lost every watch while {pending} members were still exiting");
+        assert!(
+            !lost,
+            "terminated job lost every watch while {pending} members were still exiting"
+        );
     }
 
     #[test]

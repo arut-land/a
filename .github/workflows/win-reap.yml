@@ -57,6 +57,9 @@ jobs:
           }
 
   native:
+    concurrency:
+      group: win-reap-native-${{ matrix.os }}
+      cancel-in-progress: true
     strategy:
       fail-fast: false
       matrix:
