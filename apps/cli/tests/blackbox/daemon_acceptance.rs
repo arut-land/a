@@ -189,9 +189,8 @@ fn an_upgrade_hands_running_work_to_the_newer_build() {
     let mut job_release = child_at_gate(&listener);
     let mut launch_release = child_at_gate(&launching);
     let job_session = env.logs().into_keys().next().unwrap();
-    wait_for_session_entry(&env, &job_session, |body| {
-        matches!(body, Body::Detached { .. })
-    });
+    let detached = |body: &Body| matches!(body, Body::Detached { .. });
+    wait_for_session_entry(&env, &job_session, deadline(), detached);
     launch_release.write_all(b"done\n").unwrap();
     let ran = launcher.collect(deadline()).unwrap();
     assert!(
@@ -208,9 +207,7 @@ fn an_upgrade_hands_running_work_to_the_newer_build() {
         .into_keys()
         .find(|id| *id != job_session)
         .unwrap();
-    wait_for_session_entry(&env, &call_session, |body| {
-        matches!(body, Body::Detached { .. })
-    });
+    wait_for_session_entry(&env, &call_session, deadline(), detached);
     let older_pid = env.pid();
     let older_build = env.home.runtime().current().unwrap();
     env.run(&["ls"]);
@@ -226,11 +223,7 @@ fn an_upgrade_hands_running_work_to_the_newer_build() {
         );
         env.run(&["ls"]);
     }
-    assert_eq!(
-        env.pid() == older_pid,
-        cfg!(unix),
-        "where the newer build serves"
-    );
+    assert_eq!(env.pid() == older_pid, cfg!(unix), "upgrade process");
     let logged =
         |session: &str, text: &str| String::from_utf8_lossy(&env.logs()[session]).contains(text);
     assert!(
@@ -243,12 +236,13 @@ fn an_upgrade_hands_running_work_to_the_newer_build() {
     );
     job_release.write_all(b"done\n").unwrap();
     call_release.write_all(b"done\n").unwrap();
-    wait_for_session_entry(&env, &job_session, |body| {
+    let ended = deadline();
+    wait_for_session_entry(&env, &job_session, ended, |body| {
         matches!(body,
             Body::Enqueue { envelope } if envelope.id().purpose == protocol::EnvelopeId::JOB
         )
     });
-    wait_for_session_entry(&env, &call_session, |body| {
+    wait_for_session_entry(&env, &call_session, ended, |body| {
         matches!(body,
             Body::Enqueue { envelope } if envelope.id().purpose == protocol::EnvelopeId::DETACHED
         )
@@ -275,9 +269,13 @@ fn an_upgrade_hands_running_work_to_the_newer_build() {
     );
 }
 
-fn wait_for_session_entry(env: &Isolated, session: &str, ready: impl Fn(&Body) -> bool) {
+fn wait_for_session_entry(
+    env: &Isolated,
+    session: &str,
+    until: Instant,
+    ready: impl Fn(&Body) -> bool,
+) {
     let mut stream = env.home.endpoint().connect().unwrap();
-    let until = deadline();
     stream
         .set_read_timeout(Some(until - Instant::now()))
         .unwrap();
