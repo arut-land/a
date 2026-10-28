@@ -90,9 +90,13 @@ def daemon(binary, output=None, trial=0, first_run=False, ready_timeout=60):
                 raise
 
 
-def idle_sample(active, idle_seconds, settle_seconds=3, retire_seconds=12):
+def idle_sample(active, idle_seconds, settle_seconds=3, retire_seconds=12, memory_probe=None):
     time.sleep(settle_seconds)
     rss = snapshot(active.pid)["rss_kib"]
+    charge = {}
+    if memory_probe is not None:
+        charge = json.loads(checked([str(memory_probe), "--memory", str(active.pid)],
+                                    env=active.env, cwd=active.home, timeout=30).stdout)
     # Blocking workers retire after ten idle seconds; CPU measures steady idle.
     time.sleep(retire_seconds)
     before = [snapshot(p, threads=True) for p in (active.pid, active.client.pid)]
@@ -100,7 +104,7 @@ def idle_sample(active, idle_seconds, settle_seconds=3, retire_seconds=12):
     time.sleep(idle_seconds)
     after = [snapshot(p, threads=True) for p in (active.pid, active.client.pid)]
     elapsed = time.monotonic() - started
-    return dict(rss=rss, seconds=elapsed, cold_reply_ms=active.cold_ms,
+    return dict(rss=rss, **charge, seconds=elapsed, cold_reply_ms=active.cold_ms,
                 first_run_ls_ms=active.first_run_ms, daemon_pid=active.pid, client_pid=active.client.pid,
                 before=before, after=after,
                 daemon_cpu_seconds=after[0]["cpu_seconds"] - before[0]["cpu_seconds"],

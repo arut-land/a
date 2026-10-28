@@ -148,7 +148,7 @@ target/debug/a web
     "node apps/web/test-browser.mjs",
     "cargo nextest run -p a --test blackbox -E 'test(/^web::/)' --no-tests=fail",
 ] }
-# Cold start, attach latency and idle daemon RSS on a release build that
+# Cold start, attach latency and idle daemon charge on a release build that
 # differs from the shipped one only by the test fixtures (built aside, in
 # target/fixtures). That `a` as shipped lacks them is read off the
 # dependency graph, not a second release build: `mise run size` scans the shipped bytes. Latency is held to its
