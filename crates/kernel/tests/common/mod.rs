@@ -792,7 +792,15 @@ pub const fn interrupt() -> Event {
 pub fn approve(call: u64, approved: bool) -> Event {
     Event::Answer {
         call: id(call),
-        value: Json::encode(&approved).unwrap(),
+        value: Json::encode(&protocol::QuestionAnswer::confirm(
+            Seq::new(call + 1).unwrap(),
+            if approved {
+                protocol::Response::accept()
+            } else {
+                protocol::Response::Decline
+            },
+        ))
+        .unwrap(),
         origin: None,
         ticket: None,
     }

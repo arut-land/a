@@ -681,6 +681,51 @@ impl Session {
         self.intend(move |client| client.offer()?.steer(text))
     }
 
+    /// Submits a reviewed draft with the exact question identity.
+    pub fn answer(
+        &self,
+        call: u64,
+        question: u64,
+        action: crate::QuestionAction,
+        values: Vec<crate::QuestionInput>,
+    ) -> Result<(), ClientError> {
+        let call = protocol::CallId::new(call).ok_or_else(|| ClientError::InvalidArgument {
+            message: "invalid call".into(),
+        })?;
+        let question =
+            protocol::Seq::new(question).ok_or_else(|| ClientError::InvalidArgument {
+                message: "invalid question".into(),
+            })?;
+        let action = match action {
+            crate::QuestionAction::Accept => "accept",
+            crate::QuestionAction::Decline => "decline",
+            crate::QuestionAction::Cancel => "cancel",
+        };
+        let draft = client::QuestionDraft {
+            values: values
+                .into_iter()
+                .filter(|v| v.included)
+                .map(|v| (v.key, v.value))
+                .collect(),
+        };
+        let mut feed = lock(&self.feed);
+        let client = &mut feed.client;
+        let (id, schema) = client
+            .view()
+            .state
+            .question(call)
+            .ok_or(Notice::NotAsking(call))?;
+        if id != question {
+            return Err(Notice::NotAsking(call).into());
+        }
+        let answer = draft
+            .answer(id, &schema, action)
+            .map_err(|message| ClientError::InvalidArgument { message })?;
+        let effects = client.offer()?.answer(call, answer)?;
+        self.driver.pump(&mut *feed, effects);
+        Ok(())
+    }
+
     /// Answers the ask for tool call `call`.
     pub fn approve(&self, call: u64, approved: bool) -> Result<(), ClientError> {
         let call = protocol::CallId::new(call).ok_or_else(|| ClientError::InvalidArgument {

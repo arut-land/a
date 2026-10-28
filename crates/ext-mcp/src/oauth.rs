@@ -1,16 +1,16 @@
 //! HTTP authorization owns secrets outside the session's durable tool graph.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::future::poll_fn;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::future::{pending, poll_fn};
+use std::pin::pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine;
-use ext::{Cx, Tool};
+use ext::Cx;
 use llm::Http;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::OAUTH_CLIENT_ID;
@@ -276,7 +276,12 @@ impl Lifecycle {
 struct Renewal {
     result: Mutex<Option<Generation>>,
     done: rt::Notify,
-    callers: Mutex<Vec<(Arc<()>, Cx)>>,
+    callers: Mutex<Vec<Caller>>,
+}
+struct Caller {
+    token: Arc<()>,
+    cx: Cx,
+    questions: Option<Arc<dyn ext::host::QuestionPort>>,
 }
 struct Participation {
     renewal: Arc<Renewal>,
@@ -288,7 +293,7 @@ impl Drop for Participation {
             let mut callers = crate::lock(&self.renewal.callers);
             callers
                 .iter()
-                .position(|(token, _)| Arc::ptr_eq(token, &self.token))
+                .position(|caller| Arc::ptr_eq(&caller.token, &self.token))
                 .map(|index| callers.swap_remove(index))
         };
         drop(removed);
@@ -298,18 +303,27 @@ impl Drop for Participation {
 impl Renewal {
     fn participate(self: &Arc<Self>, cx: &Cx) -> Participation {
         let token = Arc::new(());
-        crate::lock(&self.callers).push((Arc::clone(&token), cx.clone()));
+        crate::lock(&self.callers).push(Caller {
+            token: Arc::clone(&token),
+            cx: cx.clone(),
+            questions: cx.questions().ok(),
+        });
         Participation {
             renewal: Arc::clone(self),
             token,
         }
     }
 
-    fn presenter(&self) -> std::io::Result<Cx> {
+    fn presenter(&self) -> std::io::Result<(Cx, Arc<dyn ext::host::QuestionPort>)> {
         crate::lock(&self.callers)
             .iter()
-            .find(|(_, cx)| !cx.cancel.is_set())
-            .map(|(_, cx)| cx.clone())
+            .find(|caller| !caller.cx.cancel.is_set() && caller.questions.is_some())
+            .and_then(|caller| {
+                caller
+                    .questions
+                    .clone()
+                    .map(|port| (caller.cx.clone(), port))
+            })
             .ok_or_else(|| failure("authorization has no waiting caller"))
     }
     async fn wait(&self) -> Generation {
@@ -623,18 +637,15 @@ impl Owner {
             if request.status == http::StatusCode::UNAUTHORIZED {
                 self.save(runtime, None).await?;
             }
-            let presenter = renewal.presenter()?;
-            network(
-                runtime,
-                request.deadline,
-                authorize(
-                    &*request.client,
-                    &presenter,
-                    &self.server,
-                    &self.family.resource,
-                    &self.family.client_id,
-                    &scopes,
-                ),
+            let (presenter, questions) = renewal.presenter()?;
+            authorize(
+                &*request.client,
+                &presenter,
+                &*questions,
+                &self.server,
+                &self.family,
+                &scopes,
+                request.deadline.saturating_duration_since(Instant::now()),
             )
             .await?
         };
@@ -882,17 +893,17 @@ async fn token(
     Ok(Some(token))
 }
 
-#[derive(Default)]
-struct AuthorizationNames(AtomicUsize);
-
 async fn authorize(
     client: &dyn Http,
     cx: &Cx,
+    questions: &dyn ext::host::QuestionPort,
     server: &Server,
-    resource: &str,
-    client_id: &str,
+    family: &Family,
     scopes: &str,
+    timeout: Duration,
 ) -> std::io::Result<Tokens> {
+    let resource = family.resource.as_str();
+    let client_id = family.client_id.as_str();
     let runtime = cx
         .service::<dyn rt::Runtime>()
         .ok_or_else(|| failure("no runtime"))?;
@@ -928,23 +939,63 @@ async fn authorize(
             "?"
         }
     );
-    // HTTP requests, including later pages, share the parent call's namespace.
-    let names = cx
-        .invocation()
-        .local(0, || Arc::new(AuthorizationNames::default()));
-    let name = names.0.fetch_add(1, Ordering::Relaxed);
-    let shown = cx
-        .invoke(
-            &format!("oauth-authorize-{name}"),
-            Authorize::NAME,
-            &protocol::Json::encode(&json!({"url":url}))
-                .map_err(|_| failure("authorization presentation failed"))?,
-        )
-        .await;
-    if !matches!(shown.outcome, protocol::Outcome::Done { .. }) {
-        return Err(failure("authorization declined"));
-    }
-    let response = listener.receive().await?;
+    let question = protocol::Question {
+        source: resource.into(),
+        prompts: BTreeMap::from([(
+            "authorize".into(),
+            protocol::Prompt::Url {
+                message: "Authorize this MCP server in your browser, then continue.".into(),
+                url,
+            },
+        )]),
+    };
+    // Serve the browser before Continue, but exchange its code only after acceptance.
+    let mut callback = pin!(listener.receive());
+    let mut received = None;
+    rt::or(
+        async {
+            let shown = questions
+                .ask(question)
+                .await
+                .map_err(|_| failure("authorization presentation ended"))?;
+            if !shown.accepted() {
+                return Err(failure("authorization declined"));
+            }
+            Ok(())
+        },
+        async {
+            received = Some(callback.as_mut().await?);
+            pending().await
+        },
+    )
+    .await?;
+    let deadline = Instant::now() + timeout;
+    let response = match received {
+        Some(response) => response,
+        None => network(runtime, deadline, callback).await?,
+    };
+    let code = authorization_code(&response, &state, server)?;
+    network(
+        runtime,
+        deadline,
+        token(
+            client,
+            server,
+            resource,
+            client_id,
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", &redirect),
+                ("code_verifier", &verifier),
+            ],
+        ),
+    )
+    .await?
+    .ok_or_else(|| failure("authorization code rejected"))
+}
+
+fn authorization_code(response: &str, state: &str, server: &Server) -> std::io::Result<String> {
     let mut values = BTreeMap::new();
     for (key, value) in form_urlencoded::parse(response.as_bytes()) {
         if values
@@ -954,7 +1005,7 @@ async fn authorize(
             return Err(failure("duplicate callback parameter"));
         }
     }
-    if values.get("state") != Some(&state) {
+    if values.get("state") != Some(&state.to_owned()) {
         return Err(failure("redirect state mismatch"));
     }
     match values.get("iss") {
@@ -969,51 +1020,9 @@ async fn authorize(
     if values.contains_key("error") {
         return Err(failure("authorization server declined authorization"));
     }
-    let code = values
-        .get("code")
-        .ok_or_else(|| failure("authorization response has no code"))?;
-    token(
-        client,
-        server,
-        resource,
-        client_id,
-        &[
-            ("grant_type", "authorization_code"),
-            ("code", code),
-            ("redirect_uri", &redirect),
-            ("code_verifier", &verifier),
-        ],
-    )
-    .await?
-    .ok_or_else(|| failure("authorization code rejected"))
-}
-
-#[derive(Deserialize, ext_derive::Schema)]
-pub(crate) struct AuthorizeInput {
-    pub url: String,
-}
-
-pub(crate) struct Authorize;
-impl Tool for Authorize {
-    type In = AuthorizeInput;
-    type Out = ();
-    const NAME: &'static str = "mcp_authorize";
-    const DESCRIPTION: &'static str = "authorize an MCP server in your browser";
-    const AUDIENCE: protocol::Audience = protocol::Audience::Plugin;
-    const CONCURRENCY: ext::Concurrency = ext::Concurrency::Shared;
-    fn call(&self, _: &Self::In, _: &Cx) -> Result<(), String> {
-        Ok(())
-    }
-    fn present(input: &Self::In) -> Option<protocol::Card> {
-        Some(protocol::Card {
-            title: "Authorize MCP server".into(),
-            body: format!(
-                "Open this URL in your browser, then approve:\n{}",
-                input.url
-            ),
-            ..protocol::Card::default()
-        })
-    }
+    values
+        .remove("code")
+        .ok_or_else(|| failure("authorization response has no code"))
 }
 
 fn failure(message: &str) -> std::io::Error {

@@ -2,10 +2,11 @@
 
 use super::*;
 use crate::store::{Faulty, SyncFailure};
+use rt::Runtime;
 
 struct NoTimers(rt::Threads);
 
-impl rt::Runtime for NoTimers {
+impl Runtime for NoTimers {
     fn spawn(&self, task: rt::BoxFuture<'static, ()>) {
         self.0.spawn(task);
     }
@@ -92,7 +93,14 @@ fn turn_flushes_are_input_unsafe_work_and_final_publication() {
 }
 
 fn pipeline(registry: Registry) -> (Fixture, Arc<Faulty>, Arc<Script>) {
-    let faulty = Arc::new(Faulty::new(Arc::new(Memory::default())));
+    pipeline_on(Arc::new(Memory::default()), registry)
+}
+
+fn pipeline_on(
+    store: Arc<dyn LogStore>,
+    registry: Registry,
+) -> (Fixture, Arc<Faulty>, Arc<Script>) {
+    let faulty = Arc::new(Faulty::new(store));
     let script = Script::new(&cassette(
         "openai/streaming_grammar/tool_then_followup_text.yaml",
     ));
@@ -1344,5 +1352,540 @@ impl ext::RunningProcess for StaleProcess {
     }
     fn ended(&self) -> BoxFuture<'_, ()> {
         Box::pin(std::future::pending())
+    }
+}
+
+#[path = "../../../../kernel/tests/schedules.rs"]
+mod schedules;
+
+// Only the actor's explicit polls consume ingress. All other async jobs are
+// polled by the script; native flush syscalls still run on the real runtime.
+struct ScheduledRuntime {
+    background: rt::Threads,
+    captured: AtomicBool,
+    actor: Mutex<Option<rt::BoxFuture<'static, ()>>>,
+    tasks: Mutex<Vec<rt::BoxFuture<'static, ()>>>,
+    flushes: Mutex<Vec<oneshot::Receiver<()>>>,
+}
+
+impl Runtime for ScheduledRuntime {
+    fn spawn(&self, task: rt::BoxFuture<'static, ()>) {
+        if self.captured.swap(true, Ordering::SeqCst) {
+            lock(&self.tasks).push(task);
+        } else {
+            *lock(&self.actor) = Some(task);
+        }
+    }
+    fn spawn_blocking(
+        &self,
+        _: rt::BlockingClass,
+        _: usize,
+        work: Box<dyn FnOnce() + Send>,
+    ) -> rt::BoxFuture<'static, io::Result<()>> {
+        work();
+        Box::pin(std::future::ready(Ok(())))
+    }
+    fn spawn_flush(
+        &self,
+        work: Box<dyn FnOnce() + Send>,
+    ) -> rt::BoxFuture<'static, io::Result<()>> {
+        let (done, finished) = oneshot::channel();
+        lock(&self.flushes).push(finished);
+        self.background.spawn_flush(Box::new(move || {
+            work();
+            done.send(());
+        }))
+    }
+    fn reactor(&self) -> rt::Reactor {
+        self.background.reactor()
+    }
+    fn sleep(&self, _: Duration) -> rt::BoxFuture<'static, ()> {
+        Box::pin(std::future::pending())
+    }
+}
+
+impl ScheduledRuntime {
+    fn poll_tasks(&self) -> usize {
+        let tasks = std::mem::take(&mut *lock(&self.tasks));
+        let count = tasks.len();
+        let pending: Vec<_> = tasks
+            .into_iter()
+            .filter_map(|mut task| {
+                task.as_mut()
+                    .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+                    .is_pending()
+                    .then_some(task)
+            })
+            .collect();
+        let mut tasks = lock(&self.tasks);
+        let advanced = count - pending.len() + tasks.len();
+        tasks.extend(pending);
+        advanced
+    }
+    fn wait_flushes(&self) {
+        let flushes = std::mem::take(&mut *lock(&self.flushes));
+        for finished in flushes {
+            assert_eq!(rt::block_on(finished), Some(()));
+        }
+    }
+}
+
+struct ScheduledActor {
+    live: TestingLive,
+    actor: Option<rt::BoxFuture<'static, ()>>,
+    runtime: Arc<ScheduledRuntime>,
+}
+
+impl ScheduledActor {
+    fn new(fixture: &Fixture, runtime: Arc<ScheduledRuntime>) -> Self {
+        let live = fixture.create();
+        let actor = lock(&runtime.actor).take().unwrap();
+        let mut scheduled = Self {
+            live,
+            actor: Some(actor),
+            runtime,
+        };
+        scheduled.poll();
+        scheduled.runtime.poll_tasks();
+        scheduled.runtime.wait_flushes();
+        scheduled.runtime.poll_tasks();
+        scheduled.poll();
+        scheduled
+    }
+    fn poll(&mut self) {
+        assert!(
+            self.actor
+                .as_mut()
+                .unwrap()
+                .as_mut()
+                .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+                .is_pending()
+        );
+    }
+    fn position(&mut self) -> (u64, u64) {
+        let (done, mut position) = oneshot::channel();
+        self.live.send(Msg::Position(done));
+        loop {
+            self.poll();
+            if let Poll::Ready(Some(position)) = std::pin::Pin::new(&mut position)
+                .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+            {
+                return position;
+            }
+            // IO and cancelled jobs may suspend a burst, but no new ingress is
+            // released while draining these deterministic continuations.
+            let advanced = self.runtime.poll_tasks();
+            let flushing = !lock(&self.runtime.flushes).is_empty();
+            self.runtime.wait_flushes();
+            assert!(
+                advanced != 0 || flushing,
+                "batch ended with an unbound async continuation"
+            );
+        }
+    }
+
+    fn stop(&mut self) {
+        if let Some(actor) = self.actor.take() {
+            let tasks = std::mem::take(&mut *lock(&self.runtime.tasks));
+            for task in tasks {
+                self.runtime.background.spawn(task);
+            }
+            self.runtime.background.spawn(actor);
+            self.live.halt();
+        }
+    }
+}
+
+impl Drop for ScheduledActor {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+struct ScheduledSleep(Option<Arc<channel::Sender<StartedHarbor>>>);
+impl Tool for ScheduledSleep {
+    type In = ext_fixtures::Seconds;
+    type Out = String;
+    const NAME: &'static str = "sleep";
+    const DESCRIPTION: &'static str = "A replay-safe held call.";
+    const REPLAY: Replay = Replay::Safe;
+    const CONCURRENCY: ext::Concurrency = ext::Concurrency::Shared;
+    async fn call(&self, _: &Self::In, cx: &Cx) -> Result<String, String> {
+        let Some(starts) = &self.0 else {
+            return Ok("finished".into());
+        };
+        let (done, finished) = oneshot::channel();
+        starts.send((cx.clone(), done)).ok().unwrap();
+        Ok(finished.await.unwrap_or_default())
+    }
+}
+impl Extension for ScheduledSleep {
+    const NAME: &'static str = "scheduled-sleep";
+    const VERSION: u32 = 1;
+    fn contribute(&self, r: &mut Registrar) {
+        r.tool(Self(self.0.clone()));
+    }
+}
+
+fn native_schedule(trace: &schedules::trace::Trace) -> bool {
+    use schedules::trace::Decision;
+    let at = |decision| trace.0.iter().position(|step| *step == decision);
+    let (Some(cancel), Some(complete)) = (at(Decision::Cancel), at(Decision::Complete)) else {
+        return false;
+    };
+    let early = trace
+        .0
+        .iter()
+        .position(|s| matches!(s, Decision::Flush { epoch: 0, .. }));
+    let late = trace
+        .0
+        .iter()
+        .position(|s| matches!(s, Decision::Flush { epoch: 1, .. }));
+    trace.validate().is_ok()
+        && trace.0.starts_with(&[
+            Decision::Input,
+            Decision::Batch,
+            Decision::Progress,
+            Decision::Batch,
+        ])
+        && early
+            .zip(late)
+            .is_some_and(|(early, late)| cancel < complete && complete < early && late < early)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "one arm per ingress choice and assertions at its explicit boundary"
+)]
+fn replay_held_epochs(trace: &schedules::trace::Trace) -> schedules::trace::Checked<Vec<Entry>> {
+    use schedules::trace::{Decision, Failure, require};
+    if !native_schedule(trace) {
+        return Err(Failure::Invalid("unsupported native schedule".into()));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let faulty = Arc::new(Faulty::new(Arc::new(
+        crate::store::Jsonl::open(dir.path()).unwrap(),
+    )));
+    let (started, starts) = channel::unbounded();
+    let runtime = Arc::new(ScheduledRuntime {
+        background: rt::Threads::new(1),
+        captured: AtomicBool::new(false),
+        actor: Mutex::default(),
+        tasks: Mutex::default(),
+        flushes: Mutex::default(),
+    });
+    let fixture = Fixture::on(
+        Arc::clone(&faulty) as _,
+        ext_fixtures::ECHO,
+        Registry::default()
+            .with(&ScheduledSleep(Some(Arc::new(started))))
+            .unwrap(),
+        openai(&Script::new(&[])),
+    )
+    .configure(|shared| shared.rt = runtime.clone());
+    let mut scheduled = ScheduledActor::new(&fixture, Arc::clone(&runtime));
+    let before = scheduled.live.frames.seq();
+    let fence = scheduled.live.session.fence.load(Ordering::SeqCst);
+    let first = faulty.hold_next_flush();
+    let second = faulty.hold_next_flush();
+    let ack = enqueue(&scheduled.live, "sleep 1");
+    scheduled.poll();
+    runtime.poll_tasks();
+    first.started();
+    let (context, release) = starts
+        .try_recv()
+        .expect("input batch must start the safe tool after ordering");
+    require(
+        scheduled.live.frames.seq() == before,
+        "safe work precedes durability",
+    )?;
+    let mut release = Some(release);
+    let mut interrupted = None;
+    let mut cancelled = false;
+    let mut failed = false;
+    let mut boundaries = vec![scheduled.position()];
+    for group in trace
+        .groups()
+        .map_err(Failure::Invalid)?
+        .into_iter()
+        .skip(1)
+    {
+        for step in group {
+            match *step {
+                Decision::Progress => context.progress("ordered"),
+                Decision::Cancel => {
+                    let (reply, ack) = oneshot::channel();
+                    scheduled.live.send(Msg::Request {
+                        request: Request::Interrupt,
+                        origin: None,
+                        reply,
+                    });
+                    interrupted = Some(ack);
+                }
+                Decision::Complete => {
+                    require(
+                        context.cancel.is_set() == cancelled,
+                        "cancel delivery crossed an unbound batch",
+                    )?;
+                    release.take().unwrap().send("finished".into());
+                    runtime.poll_tasks();
+                }
+                Decision::Flush { epoch: 1, .. } => scheduled.live.send(Msg::Flushed {
+                    fence,
+                    through: boundaries[1].0,
+                    result: Ok(()),
+                }),
+                Decision::Flush { epoch: 0, result } => {
+                    failed = result == schedules::trace::Result::Failure;
+                    if failed {
+                        faulty.fail_next_sync(SyncFailure::Discard);
+                    }
+                    first.release();
+                    second.release();
+                    runtime.wait_flushes();
+                    runtime.poll_tasks();
+                }
+                _ => {
+                    return Err(Failure::Invalid(format!(
+                        "unsupported native decision: {step:?}"
+                    )));
+                }
+            }
+        }
+        // All messages in this group are queued before the only actor poll.
+        if !matches!(group[0], Decision::Flush { .. }) {
+            scheduled.live.send(Msg::Sync);
+        }
+        scheduled.poll();
+        if group.contains(&Decision::Cancel) {
+            cancelled = true;
+            require(
+                context.cancel.is_set(),
+                "interrupt must revoke the context at its boundary",
+            )?;
+        }
+        let position = scheduled.position();
+        if matches!(group[0], Decision::Flush { epoch: 1, .. }) {
+            require(
+                position.1 == before && scheduled.live.frames.seq() == before,
+                "later notification skipped an unresolved prefix",
+            )?;
+        }
+        boundaries.push(position);
+    }
+    require(
+        rt::block_on(ack).unwrap().is_err() == failed,
+        "input acknowledgment disagrees with flush result",
+    )?;
+    require(
+        rt::block_on(interrupted.unwrap()).unwrap().is_err() == failed,
+        "interrupt acknowledgment disagrees with flush result",
+    )?;
+    require(!scheduled.live.has_work(), "trace left owned work")?;
+    let log = log_of(&scheduled.live);
+    require(
+        if failed {
+            scheduled.live.frames.seq() == before
+        } else {
+            log.iter()
+                .filter(|e| matches!(e.body, Body::ToolResult { .. }))
+                .count()
+                == 1
+        },
+        "wrong settled prefix",
+    )?;
+    faulty.cut();
+    scheduled.stop();
+    require(
+        log == faulty.entries(scheduled.live.id).unwrap(),
+        "publication differs from durable prefix",
+    )?;
+    Ok(log)
+}
+
+fn expected_recovery(
+    registry: Arc<dyn Binding>,
+    prefix: &[Entry],
+    trace: &schedules::trace::Trace,
+) -> (Core, Vec<Entry>) {
+    let (mut expected, plan) = Core::resume(registry, prefix, &Load::default());
+    let mut expected_log = prefix.to_vec();
+    expected_log.extend(plan.appends.iter().cloned());
+    let mut work: VecDeque<_> = plan
+        .immediate
+        .into_iter()
+        .chain(plan.admitted.into_iter().map(|g| g.work))
+        .collect();
+    while let Some(effect) = work.pop_front() {
+        let Effect::RunTool { call, tool, .. } = effect else {
+            assert!(
+                matches!(effect, Effect::MarkBusy(_)),
+                "unbound recovery effect: {effect:?}; {trace}"
+            );
+            continue;
+        };
+        assert_eq!(tool, "sleep", "{trace}");
+        let plan = expected.step(Event::ToolDone {
+            call,
+            outcome: Outcome::Done {
+                output: Json::encode(&"finished").unwrap().into(),
+            },
+            card: None,
+            held: Vec::new(),
+        });
+        expected_log.extend(plan.appends.iter().cloned());
+        work.extend(
+            plan.immediate
+                .into_iter()
+                .chain(plan.admitted.into_iter().map(|g| g.work)),
+        );
+    }
+    assert!(
+        expected.at_rest(),
+        "expected recovery did not settle: {trace}"
+    );
+    (expected, expected_log)
+}
+
+fn assert_native_recovery(fixture: &Fixture, prefix: &[Entry], trace: &schedules::trace::Trace) {
+    let session = fixture.start(prefix);
+    let final_log = log_of(&session);
+    assert!(final_log.len() >= prefix.len(), "prefix lost: {trace}");
+    assert_eq!(
+        facts(&final_log[..prefix.len()]),
+        facts(prefix),
+        "prefix changed: {trace}"
+    );
+    let registry = fixture.0.registry.get();
+    let (expected, expected_log) =
+        expected_recovery(bind(&registry, &session.session), prefix, trace);
+    let inputs = prefix
+        .iter()
+        .filter(|e| matches!(e.body, Body::Input { .. }))
+        .count();
+    let calls: Vec<_> = final_log
+        .iter()
+        .filter_map(|e| matches!(e.body, Body::ToolCall { .. }).then_some(CallId(e.seq)))
+        .collect();
+    for entry in &final_log {
+        if let Body::ToolCall { tool, input, .. } = &entry.body {
+            assert_eq!(tool, "sleep", "wrong recovered tool: {trace}");
+            assert_eq!(
+                *input,
+                Json::encode(&json!({"seconds": 1})).unwrap(),
+                "wrong recovered input: {trace}"
+            );
+        }
+    }
+    let results: Vec<_> = final_log
+        .iter()
+        .filter_map(|e| match &e.body {
+            Body::ToolResult { call, outcome, .. } => Some((*call, outcome)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        calls.len(),
+        inputs,
+        "retained input lost its intent: {trace}"
+    );
+    assert_eq!(
+        results.len(),
+        inputs,
+        "retained input lost its result: {trace}"
+    );
+    if inputs != 0 {
+        assert_eq!(
+            results,
+            [(
+                calls[0],
+                &Outcome::Done {
+                    output: Json::encode(&"finished").unwrap().into()
+                }
+            )],
+            "wrong settled call or outcome: {trace}"
+        );
+    }
+    assert_eq!(
+        facts(&final_log),
+        facts(&expected_log),
+        "recovered facts differ from expected trace: {trace}"
+    );
+    assert_eq!(
+        serde_json::to_value(Ledger::of(&final_log)).unwrap(),
+        serde_json::to_value(expected.ledger()).unwrap(),
+        "wrong final folded state: {trace}"
+    );
+    let (resumed, plan) = Core::resume(
+        bind(&registry, &session.session),
+        &final_log,
+        &Load::default(),
+    );
+    assert!(
+        resumed.at_rest() && plan.appends.is_empty() && plan.admitted.is_empty(),
+        "settled recovery produced work: {trace}"
+    );
+    session.halt();
+}
+
+#[test]
+fn scripted_epoch_delivery_and_crash_cuts_preserve_native_admission() {
+    use schedules::trace::{Decision, Result, Trace};
+    let traces = match std::env::var("A_NATIVE_SCHEDULE_TRACE") {
+        Ok(text) => vec![text.parse::<Trace>().unwrap()],
+        Err(_) => [Result::Success, Result::Failure]
+            .into_iter()
+            .flat_map(|result| {
+                schedules::trace::held_epochs(result)
+                    .into_iter()
+                    .filter(native_schedule)
+            })
+            .collect(),
+    };
+    for trace in traces {
+        trace.validate().unwrap();
+        let selected_cut = trace.0.iter().find_map(|s| {
+            if let Decision::Crash { cut } = s {
+                Some(*cut)
+            } else {
+                None
+            }
+        });
+        let trace = Trace(
+            trace
+                .0
+                .into_iter()
+                .filter(|s| !matches!(s, Decision::Crash { .. }))
+                .collect(),
+        );
+        eprintln!(
+            "replay: A_NATIVE_SCHEDULE_TRACE='{trace}' cargo test -p engine scripted_epoch_delivery -- --nocapture"
+        );
+        let log = replay_held_epochs(&trace).unwrap_or_else(|error| {
+            let minimal = schedules::trace::shrink(trace.clone(), |candidate| {
+                native_schedule(candidate)
+                    && matches!(
+                        replay_held_epochs(candidate),
+                        Err(schedules::trace::Failure::Invariant(_))
+                    )
+            });
+            panic!("{error}; native replay: {minimal}");
+        });
+        for cut in selected_cut.map_or(0..=log.len(), |cut| cut..=cut) {
+            assert!(cut <= log.len());
+            let mut crashed = trace.clone();
+            crashed.0.push(Decision::Crash { cut });
+            eprintln!(
+                "replay: A_NATIVE_SCHEDULE_TRACE='{crashed}' cargo test -p engine scripted_epoch_delivery -- --nocapture"
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let fixture = Fixture::on(
+                Arc::new(crate::store::Jsonl::open(dir.path()).unwrap()),
+                ext_fixtures::ECHO,
+                Registry::default().with(&ScheduledSleep(None)).unwrap(),
+                openai(&Script::new(&[])),
+            );
+            assert_native_recovery(&fixture, &log[..cut], &crashed);
+        }
     }
 }

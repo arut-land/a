@@ -101,7 +101,15 @@ fn asked() -> Expected {
 fn answer(call: u64, approved: bool, ticket: u64) -> Event {
     Event::Answer {
         call: id(call),
-        value: Json::encode(&approved).unwrap(),
+        value: Json::encode(&protocol::QuestionAnswer::confirm(
+            Seq::new(call + 1).unwrap(),
+            if approved {
+                protocol::Response::accept()
+            } else {
+                protocol::Response::Decline
+            },
+        ))
+        .unwrap(),
         origin: None,
         ticket: Some(Ticket(ticket)),
     }
@@ -110,7 +118,15 @@ fn answer(call: u64, approved: bool, ticket: u64) -> Event {
 fn answered(call: u64, approved: bool) -> Body {
     Body::Answer {
         call: id(call),
-        value: Json::encode(&approved).unwrap(),
+        value: Json::encode(&protocol::QuestionAnswer::confirm(
+            Seq::new(call + 1).unwrap(),
+            if approved {
+                protocol::Response::accept()
+            } else {
+                protocol::Response::Decline
+            },
+        ))
+        .unwrap(),
         origin: None,
     }
 }
@@ -1283,10 +1299,15 @@ fn an_agents_refusal_is_logged_as_a_block() {
 }
 
 #[test]
-fn a_call_waits_on_a_dialog_and_resumes_with_its_answer() {
-    let dialog = protocol::WaitOn::Dialog {
-        ui: Json::encode(&json!({ "ask": "name?" })).unwrap(),
+fn a_question_continues_its_checkpoint_instead_of_starting_the_tool_again() {
+    let dialog = protocol::WaitOn::Question {
+        request: Box::new(protocol::QuestionWait {
+            question: protocol::Question::confirm("Continue?".into()),
+            checkpoint: Some(Json::encode("checkpoint").unwrap()),
+        }),
     };
+    let answer =
+        protocol::QuestionAnswer::confirm(Seq::new(3).unwrap(), protocol::Response::accept());
     echo().table(vec![
         (
             user("$ ask"),
@@ -1314,7 +1335,7 @@ fn a_call_waits_on_a_dialog_and_resumes_with_its_answer() {
         (
             Event::Answer {
                 call: id(2),
-                value: Json::encode("ada").unwrap(),
+                value: Json::encode(&answer).unwrap(),
                 origin: None,
                 ticket: None,
             },
@@ -1323,17 +1344,18 @@ fn a_call_waits_on_a_dialog_and_resumes_with_its_answer() {
                     4,
                     Body::Answer {
                         call: id(2),
-                        value: Json::encode("ada").unwrap(),
+                        value: Json::encode(&answer).unwrap(),
                         origin: None,
                     },
                 )],
                 vec![
                     BUSY,
-                    Work::Resume {
+                    Work::Continue {
                         call: id(2),
                         tool: "bash".into(),
                         input: Json::encode(&json!({ "command": "ask" })).unwrap(),
-                        value: Json::encode("ada").unwrap(),
+                        checkpoint: Json::encode("checkpoint").unwrap(),
+                        answer: answer.clone(),
                     },
                 ],
             ),

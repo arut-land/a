@@ -147,6 +147,10 @@ public final class SessionStore {
         run { try $0.restart() }
     }
 
+    public func answer(question: UserQuestion, action: QuestionAction, values: [QuestionInput]) async {
+        run { try $0.answer(call: question.call, question: question.id, action: action, values: values) }
+    }
+
     public func approve(call: UInt64, approved: Bool) async {
         run { try $0.approve(call: call, approved: approved) }
     }

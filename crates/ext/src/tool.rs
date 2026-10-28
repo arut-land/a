@@ -276,6 +276,14 @@ impl Cx {
         }
     }
 
+    /// Grants presentation authority while this caller is live; the owner may
+    /// retain it independently of the caller's eventual cancellation.
+    pub fn questions(&self) -> Result<Arc<dyn crate::host::QuestionPort>, String> {
+        self.host
+            .questions()
+            .ok_or_else(|| "question authority is no longer available".into())
+    }
+
     /// Names are unique within this call and reuse their durable result on replay.
     /// An exclusive callee requires an exclusive outer owner; each callee's
     /// own replay and concurrency contracts govern its admission.
@@ -604,7 +612,7 @@ impl Parsed {
         self.0.downcast_ref()
     }
 
-    fn take<T: Any>(self) -> Option<T> {
+    pub(crate) fn take<T: Any>(self) -> Option<T> {
         self.0.downcast().ok().map(|input| *input)
     }
 }
@@ -622,6 +630,7 @@ pub struct Called {
     pub card: Option<Card>,
     /// What the outcome references outside the log.
     pub held: Vec<Held>,
+    pub parked: Option<Box<crate::Parked>>,
 }
 
 impl Called {
@@ -630,6 +639,7 @@ impl Called {
             outcome: Outcome::Failed { error },
             card: None,
             held: Vec::new(),
+            parked: None,
         }
     }
 }
@@ -651,6 +661,18 @@ pub trait DynTool: Send + Sync {
     fn parse(&self, input: &Json) -> Result<Parsed, String>;
     /// Runs a call on an input [`DynTool::parse`] read.
     fn call<'a>(&'a self, input: Parsed, cx: &'a Cx) -> BoxFuture<'a, Called>;
+    /// Continues a question tool; ordinary tools cannot be continued this way.
+    fn answer<'a>(
+        &'a self,
+        _input: Parsed,
+        _state: Json,
+        _answer: protocol::QuestionAnswer,
+        _cx: &'a Cx,
+    ) -> BoxFuture<'a, Called> {
+        Box::pin(std::future::ready(Called::failed(
+            "tool has no question continuation".into(),
+        )))
+    }
     /// What the model sees of a stored output.
     fn to_model(&self, output: &Json) -> llm::Output;
     fn present(&self, input: &Parsed) -> Option<Card>;
@@ -763,6 +785,7 @@ fn called<T: Tool>(input: &T::In, output: Result<T::Out, String>) -> Called {
         Ok(json) => Called {
             card: T::present_result(input, &output),
             held: T::held(&output),
+            parked: None,
             outcome: Outcome::Done {
                 output: json.into(),
             },

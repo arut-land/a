@@ -33,6 +33,12 @@ enum TabIn {
     /// A line typed in the composer.
     Line(String, rt::oneshot::Sender<bool>),
     Cmd(Cmd),
+    Question {
+        call: protocol::CallId,
+        question: protocol::Seq,
+        action: String,
+        values: std::collections::BTreeMap<String, String>,
+    },
 }
 
 pub struct App {
@@ -65,6 +71,38 @@ impl App {
             gate,
             tabs: Arc::default(),
             streams: AtomicU64::new(0),
+        }
+    }
+
+    fn answer(&self, body: &[u8]) -> http::Response<Vec<u8>> {
+        #[derive(serde::Deserialize)]
+        struct Submitted {
+            tab: String,
+            call: u64,
+            question: u64,
+            action: String,
+            values: std::collections::BTreeMap<String, String>,
+        }
+        match serde_json::from_slice::<Submitted>(body).ok() {
+            Some(Submitted {
+                tab,
+                call,
+                question,
+                action,
+                values,
+            }) => match (protocol::CallId::new(call), protocol::Seq::new(question)) {
+                (Some(call), Some(question)) => done(self.tell(
+                    &tab,
+                    TabIn::Question {
+                        call,
+                        question,
+                        action,
+                        values,
+                    },
+                )),
+                _ => done(false),
+            },
+            _ => done(false),
         }
     }
 
@@ -155,6 +193,7 @@ impl App {
                     None => done(false),
                 }
             }
+            (&Method::POST, "/api/answer", _) => self.answer(&body),
             (&Method::POST, "/api/approve", _) => {
                 let call = param(query, "call")
                     .and_then(|c| c.parse().ok().and_then(protocol::CallId::new));
@@ -233,6 +272,9 @@ impl Live {
                     TabIn::Client(event) => event.retained_bytes(),
                     TabIn::Line(text, _) => text.len(),
                     TabIn::Cmd(_) => 4096,
+                    TabIn::Question { values, .. } => {
+                        values.iter().map(|(k, v)| k.len() + v.len()).sum()
+                    }
                 }
         });
         let tx = Arc::new(tx);
@@ -269,6 +311,12 @@ impl Live {
                     TabIn::Client(event) => (self.page.client.step(event), None),
                     TabIn::Line(text, reply) => (self.page.line(&text), Some(reply)),
                     TabIn::Cmd(cmd) => (self.page.command(cmd), None),
+                    TabIn::Question {
+                        call,
+                        question,
+                        action,
+                        values,
+                    } => (self.page.question(call, question, &action, values), None),
                 };
                 self.driver.pump(&mut self.page, effects);
                 if let Some(reply) = admission {

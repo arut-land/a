@@ -224,6 +224,11 @@ impl Recorder {
 }
 
 impl Host for Recorder {
+    fn questions(&self) -> Option<Arc<dyn crate::host::QuestionPort>> {
+        self.registry
+            .service_arc::<dyn crate::host::QuestionPort>()
+            .cloned()
+    }
     fn invoke(
         self: Arc<Self>,
         cx: Cx,

@@ -286,6 +286,18 @@ impl Client {
     /// `Err(Redraw)` asks for the next frame whole.
     fn effect(&mut self, effect: Effect) -> Result<Option<Exit>, Redraw> {
         let asked = match effect {
+            Effect::OpenUrl(url) => {
+                match sys::open_browser(&url) {
+                    Ok(mut child) => {
+                        let reaped = rt::unblock(&*self.runtime, move || child.wait());
+                        self.runtime.spawn(Box::pin(async move {
+                            let _ = reaped.await;
+                        }));
+                    }
+                    Err(error) => self.app.notice(error.to_string(), true),
+                }
+                return Ok(None);
+            }
             Effect::Cmd(cmd) => self.app.command(cmd),
             Effect::Restart => self.app.client.restart(),
             Effect::Redraw => return Err(Redraw),

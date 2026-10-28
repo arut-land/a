@@ -505,18 +505,23 @@ impl InvocationContext {
 
     /// Installs this owned context for synchronous dispatch only, never across an await.
     pub fn scope<T>(&self, run: impl FnOnce() -> T) -> T {
-        let _scope = InvocationScope(DISPATCH.replace(Some(self.clone())));
+        let _scope = InvocationScope(DISPATCH.replace(DispatchState::Active(Some(self.clone()))));
         run()
     }
 }
 
-thread_local! {
-    static DISPATCH: RefCell<Option<InvocationContext>> = const { RefCell::new(None) };
+enum DispatchState {
+    Outside,
+    Active(Option<InvocationContext>),
 }
-struct InvocationScope(Option<InvocationContext>);
+
+thread_local! {
+    static DISPATCH: RefCell<DispatchState> = const { RefCell::new(DispatchState::Outside) };
+}
+struct InvocationScope(DispatchState);
 impl Drop for InvocationScope {
     fn drop(&mut self) {
-        DISPATCH.replace(self.0.take());
+        DISPATCH.replace(std::mem::replace(&mut self.0, DispatchState::Outside));
     }
 }
 struct Dispatch {
@@ -526,8 +531,8 @@ impl Dispatch {
     fn enter() -> Self {
         Self {
             _scope: DISPATCH
-                .with_borrow(Option::is_none)
-                .then(|| InvocationScope(DISPATCH.replace(Some(InvocationContext::default())))),
+                .with_borrow(|state| matches!(state, DispatchState::Outside))
+                .then(|| InvocationScope(DISPATCH.replace(DispatchState::Active(None)))),
         }
     }
 }
@@ -535,7 +540,14 @@ impl Dispatch {
 /// State shared by synchronous handlers and their owned invocation context.
 /// `key` identifies a resource within the context. Without a context, state is fresh.
 pub fn dispatch_local<T: Any + Send + Sync>(key: usize, init: impl FnOnce() -> Arc<T>) -> Arc<T> {
-    let context = DISPATCH.with_borrow(Clone::clone);
+    let context = DISPATCH.with_borrow_mut(|state| match state {
+        DispatchState::Outside => None,
+        DispatchState::Active(context) => Some(
+            context
+                .get_or_insert_with(InvocationContext::default)
+                .clone(),
+        ),
+    });
     match context {
         Some(context) => context.local(key, init),
         None => init(),

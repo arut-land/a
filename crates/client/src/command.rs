@@ -16,6 +16,10 @@ pub enum Cmd {
         call: CallId,
         approved: bool,
     },
+    Answer {
+        call: CallId,
+        answer: protocol::QuestionAnswer,
+    },
     Interrupt,
     Detach,
     /// Sends this client's environment again.
@@ -56,6 +60,22 @@ impl Command {
 /// Every client's own slash commands. Any other slash line is input, for
 /// the daemon's commands (which it advertises, see [`help`]).
 pub const COMMANDS: &[Command] = &[
+    Command {
+        name: "answer",
+        aliases: &[],
+        args: "call json",
+        help: "submit a reviewed question answer",
+        parse: |rest| {
+            let (call, answer) = rest.split_once(' ')?;
+            Some(Cmd::Answer {
+                call: CallId::new(call.parse().ok()?)?,
+                answer: <protocol::QuestionAnswer as protocol::Decode>::from_json(
+                    answer.as_bytes(),
+                )
+                .ok()?,
+            })
+        },
+    },
     Command {
         name: "sessions",
         aliases: &[],

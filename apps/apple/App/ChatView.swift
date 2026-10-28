@@ -304,9 +304,101 @@ struct ToolView: View {
                     }
                 }
             }
+            if let question = shown.question { QuestionForm(question: question, store: store).id(question.id) }
             BodyView(body: shown.body)
         }
         .padding(10)
         .background(.quaternary.opacity(0.5), in: .rect(cornerRadius: 8))
+    }
+}
+
+
+private struct QuestionForm: View {
+    let question: UserQuestion
+    let store: SessionStore
+    @State private var values: [String: String] = [:]
+    @State private var included: Set<String> = []
+
+    private func value(_ key: String) -> Binding<String> {
+        Binding(get: { values[key] ?? "" }, set: { values[key] = $0 })
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Requested by \(question.source)").font(.headline)
+            ForEach(Array(question.prompts.enumerated()), id: \.offset) { _, prompt in
+                Text(prompt.message).textSelection(.enabled)
+                if question.prompts.count > 1 {
+                    Picker("Response for this prompt", selection: value(prompt.key)) {
+                        Text("Accept").tag("accept")
+                        Text("Decline").tag("decline")
+                        Text("Cancel").tag("cancel")
+                    }
+                }
+                if let url = prompt.url {
+                    Text(url).font(.callout.monospaced()).textSelection(.enabled)
+                    if let destination = URL(string: url) {
+                        Link("Open URL in browser", destination: destination)
+                    }
+                }
+                ForEach(prompt.fields, id: \.key) { field in
+                    VStack(alignment: .leading) {
+                        if !field.required {
+                            Toggle("Include \(field.title)", isOn: Binding(get: { included.contains(field.key) }, set: { if $0 { included.insert(field.key) } else { included.remove(field.key) } }))
+                        }
+                        Text(field.title + (field.required ? " (required)" : ""))
+                        if let description = field.description { Text(description).font(.caption) }
+                        switch field.kind {
+                        case .boolean:
+                            Picker(field.title, selection: value(field.key)) {
+                                Text("Choose…").tag("")
+                                Text("Yes").tag("true")
+                                Text("No").tag("false")
+                            }
+                        case .choice:
+                            Picker(field.title, selection: Binding<String?>(get: { values[field.key] }, set: { values[field.key] = $0 })) {
+                                Text("Choose…").tag(nil as String?)
+                                ForEach(field.options, id: \.value) { Text($0.title).tag(Optional($0.value)) }
+                            }
+                        case .multipleChoice:
+                            ForEach(field.options, id: \.value) { option in
+                                Toggle(option.title, isOn: Binding(get: {
+                                    let selected = (try? JSONDecoder().decode([String].self, from: Data((values[field.key] ?? "[]").utf8))) ?? []
+                                    return selected.contains(option.value)
+                                }, set: { checked in
+                                    var selected = (try? JSONDecoder().decode([String].self, from: Data((values[field.key] ?? "[]").utf8))) ?? []
+                                    selected.removeAll { $0 == option.value }
+                                    if checked { selected.append(option.value) }
+                                    if let data = try? JSONEncoder().encode(selected) { values[field.key] = String(decoding: data, as: UTF8.self) }
+                                }))
+                            }
+                        case .number, .text:
+                            TextField(field.title, text: value(field.key))
+                                .textFieldStyle(.roundedBorder)
+                        }
+                    }
+                }
+            }
+            HStack {
+                Button("Submit / Continue") { send(.accept) }.buttonStyle(.borderedProminent)
+                Button("Decline") { send(.decline) }
+                Button("Cancel") { send(.cancel) }
+            }
+        }
+        .onAppear {
+            for prompt in question.prompts { values[prompt.key] = "accept" }
+            for field in question.prompts.flatMap(\.fields) {
+                if let initial = field.initial { values[field.key] = initial; included.insert(field.key) }
+                if field.kind == .multipleChoice && field.initial == nil { values[field.key] = "[]" }
+                if field.required { included.insert(field.key) }
+            }
+        }
+    }
+
+    private func send(_ action: QuestionAction) {
+        let draft = question.prompts.map { QuestionInput(key: $0.key, value: values[$0.key] ?? "accept", included: true) } + question.prompts.flatMap(\.fields).map { field in
+            QuestionInput(key: field.key, value: values[field.key] ?? "", included: (field.required || included.contains(field.key)) && (field.kind != .choice || values[field.key] != nil))
+        }
+        Task { await store.answer(question: question, action: action, values: draft) }
     }
 }
