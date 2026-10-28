@@ -298,12 +298,12 @@ impl Mcp {
             .service_arc::<ext::Lifetimes>()
             .ok_or_else(|| Failure::Configuration("no scope lifetimes".into()))?;
         let registry = self.0.instances.get_or_init(|| ext::Scoped::new(lifetimes));
-        let owner = self.clone();
-        let mut startup_cx = cx.clone();
         let timeout = self.0.timeout;
-        let retired = self.0.retired.clone();
         let lease = registry
             .acquire(key, move |cancel| {
+                let owner = self.clone();
+                let mut startup_cx = cx.clone();
+                let retired = self.0.retired.clone();
                 Box::pin(async move {
                     startup_cx.cancel = cancel.clone();
                     let environment = env.0.as_ref().map_or_else(
