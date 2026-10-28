@@ -144,7 +144,10 @@ trap 'target/debug/a daemon stop >/dev/null' EXIT
 target/debug/a web
 '''
 # The black-box web UI tests (apps/cli/tests/blackbox/web.rs) on the dev build.
-"test:web" = "cargo nextest run -p a --test blackbox -E 'test(/^web::/)' --no-tests=fail"
+"test:web" = { run = [
+    "node apps/web/test-browser.mjs",
+    "cargo nextest run -p a --test blackbox -E 'test(/^web::/)' --no-tests=fail",
+] }
 # Cold start, attach latency and idle daemon RSS on a release build that
 # differs from the shipped one only by the test fixtures (built aside, in
 # target/fixtures). That `a` as shipped lacks them is read off the

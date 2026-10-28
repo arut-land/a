@@ -91,16 +91,20 @@ browser tab ──GET /s/<id>/events?tab=…──> Live: SessionClient + Page +
   runs the served page and committed Datastar in real headless Chromium,
   catches uncaught exceptions from initial attach through live echo turns,
   and preserves edits made while an admission response is pending. It is
-  ignored by default because it requires Node and an external Playwright
-  installation with Chromium installed. Set `A_WEB_PLAYWRIGHT` to that
-  installation's absolute `index.mjs` path (and `PLAYWRIGHT_BROWSERS_PATH`
-  if its browsers are stored outside the default cache), then run:
-
-  ```sh
-  mise exec -- cargo nextest run -p a --test blackbox \
-    -E 'test(=web::a_live_composer_never_throws_or_discards_a_newer_draft)' \
-    --run-ignored ignored-only --no-tests=fail
-  ```
+  part of `mise run test:web` and the full suite, without an ignore marker.
+  `test:web` requires Node and npm and prepares `playwright-core@1.64.1`
+  before running the tests. It uses installed Google Chrome on Linux and
+  macOS; without Chrome it downloads the Chromium revision pinned by that
+  driver. CI runs `test:web` before the full suite, using the runner image's
+  Chrome and Node. Direct Cargo invocations need this preparation once:
+  `node apps/web/test-browser.mjs`.
+  The driver and downloaded browser live under `CARGO_TARGET_DIR` when set,
+  otherwise the OS temporary directory, never in the source tree.
+  The driver has no npm dependencies and adds no Rust or shipped dependency;
+  it exercises the actual Datastar signal engine that expression-only tests
+  cannot cover. On the M3, the driver-only install added one package
+  (13.3 MiB; npm reported 658 ms), with no browser download when using
+  installed Chrome.
 
 ## Known costs
 

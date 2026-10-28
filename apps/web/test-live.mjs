@@ -1,8 +1,7 @@
 import assert from 'node:assert/strict';
-import { pathToFileURL } from 'node:url';
+import { launchBrowser } from './test-browser.mjs';
 
-const { chromium } = await import(pathToFileURL(process.env.A_WEB_PLAYWRIGHT));
-const browser = await chromium.launch();
+const browser = await launchBrowser();
 try {
   const page = await browser.newPage();
   const errors = [];

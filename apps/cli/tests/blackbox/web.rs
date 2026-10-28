@@ -459,7 +459,6 @@ fn a_tab_streams_replies_and_answers_asks_until_it_closes() {
 }
 
 #[test]
-#[ignore = "requires Node and A_WEB_PLAYWRIGHT pointing to Playwright's index.mjs with Chromium installed"]
 fn a_live_composer_never_throws_or_discards_a_newer_draft() {
     let env = Env::new("web-browser");
     let web = Web::start(&env);
