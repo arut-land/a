@@ -908,3 +908,18 @@ made identical. All ten final benchmark daemon stops succeeded. Candidate cleanu
 snapshots contain no remaining helper PIDs. One baseline cleanup snapshot listed
 a PID that was absent at the final audit; the original record and follow-up audit
 are retained. No MCP dependency, wire or corpus changes are introduced.
+
+### Hosted validation and process-identity test correction
+
+[CI 40732366946](https://github.com/arut-land/a/actions/runs/40732366946) passed
+Linux check, budgets, Miri, fuzz, thread and dependency jobs. Windows x64 ran
+1,991 tests: 1,990 passed, including the OAuth engine-readiness, pagination,
+rotation and other lifecycle invariants. The sole failure was a new policy test's
+use of `RecordedIdentity::alive()` on a PID: that API diagnoses process groups
+and deliberately returns false on Windows. This was a deterministic test error,
+not a flake. The corrected invariant reads the helper's native process-start
+identity before teardown and verifies that same identity is gone afterwards,
+without confusing a PID with a group or a subsequently reused PID. Production
+code and the measured release executables are unchanged. No failed-job rerun is
+used for this error; a replacement CI dispatch requires an owner exception to
+the one-dispatch instruction.

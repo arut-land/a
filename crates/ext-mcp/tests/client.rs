@@ -876,13 +876,12 @@ fn session_spawn_policy_is_applied_and_shared_launches_reject_session_hooks() {
                     .unwrap()
                     .parse()
                     .unwrap();
-                let child = sys::RecordedIdentity(pid);
-                assert!(child.alive());
-                child
+                let started = sys::process_started(pid).expect("the wrapped helper is live");
+                (pid, started)
             });
             finish(rig);
-            if let Some(child) = child {
-                assert!(!child.alive());
+            if let Some((pid, started)) = child {
+                assert_ne!(sys::process_started(pid), Some(started));
             }
         }
     }
