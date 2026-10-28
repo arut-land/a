@@ -1,0 +1,774 @@
+{
+  "metadata.json": {
+    "head": "1af5daf3818c9d0f65bda36c70f0eb25285ee743",
+    "sha256": "706efdc8c1e0a1adb0152ae29f65edc520525dbdf47b3dd3765d7980481f1419",
+    "toolchain": "rustc 1.101.0-nightly (5d8fec066 2026-10-16)\nbinary: rustc\ncommit-hash: 5d8fec0669a64607db9ccbf663e7c23125bf4748\ncommit-date: 2026-10-16\nhost: aarch64-apple-darwin\nrelease: 1.101.0-nightly\nLLVM version: 23.1.4\n",
+    "platform": "ProductName:\t\tmacOS\nProductVersion:\t\t27.0.1\nBuildVersion:\t\t26A434\n"
+  },
+  "samples.json": [
+    {
+      "trial": 0,
+      "role": "reference",
+      "binary": "/private/tmp/claude-502/-Users-rajaniraiyn-work-a/a536a1f2-a8c3-4ba1-8862-89a02f8c91c0/scratchpad/perf2/idle-budget-evidence/a-reference",
+      "at3": {
+        "rss_kib": 10624.0,
+        "cpu_seconds": 0.016077666,
+        "user_seconds": 0.005194791,
+        "kernel_seconds": 0.010882875,
+        "thread_count": 10,
+        "ctx_switches": 171,
+        "pfaults": 797,
+        "pageins": 0,
+        "footprint_kib": 3408.4453125,
+        "peak_footprint_kib": 3408.4453125
+      },
+      "code_kib": 3264.0,
+      "at15": {
+        "rss_kib": 10592.0,
+        "cpu_seconds": 0.016174041,
+        "user_seconds": 0.005220625,
+        "kernel_seconds": 0.010953416,
+        "thread_count": 7,
+        "ctx_switches": 176,
+        "pfaults": 802,
+        "pageins": 0,
+        "footprint_kib": 3376.4453125,
+        "peak_footprint_kib": 3424.4453125
+      }
+    },
+    {
+      "trial": 0,
+      "role": "current",
+      "binary": "/private/tmp/claude-502/-Users-rajaniraiyn-work-a/a536a1f2-a8c3-4ba1-8862-89a02f8c91c0/scratchpad/perf2/idle-budget-evidence/a-current",
+      "at3": {
+        "rss_kib": 10544.0,
+        "cpu_seconds": 0.010442249,
+        "user_seconds": 0.003527291,
+        "kernel_seconds": 0.006914958,
+        "thread_count": 10,
+        "ctx_switches": 185,
+        "pfaults": 788,
+        "pageins": 0,
+        "footprint_kib": 3360.515625,
+        "peak_footprint_kib": 3360.515625
+      },
+      "code_kib": 3280.0,
+      "at15": {
+        "rss_kib": 10512.0,
+        "cpu_seconds": 0.010568249,
+        "user_seconds": 0.003572083,
+        "kernel_seconds": 0.006996166,
+        "thread_count": 7,
+        "ctx_switches": 189,
+        "pfaults": 792,
+        "pageins": 0,
+        "footprint_kib": 3328.515625,
+        "peak_footprint_kib": 3360.515625
+      }
+    },
+    {
+      "trial": 1,
+      "role": "current",
+      "binary": "/private/tmp/claude-502/-Users-rajaniraiyn-work-a/a536a1f2-a8c3-4ba1-8862-89a02f8c91c0/scratchpad/perf2/idle-budget-evidence/a-current",
+      "at3": {
+        "rss_kib": 10624.0,
+        "cpu_seconds": 0.013722333,
+        "user_seconds": 0.004418458,
+        "kernel_seconds": 0.009303875,
+        "thread_count": 10,
+        "ctx_switches": 211,
+        "pfaults": 796,
+        "pageins": 0,
+        "footprint_kib": 3408.46875,
+        "peak_footprint_kib": 3408.46875
+      },
+      "code_kib": 3280.0,
+      "at15": {
+        "rss_kib": 10576.0,
+        "cpu_seconds": 0.013863206999999999,
+        "user_seconds": 0.004463291,
+        "kernel_seconds": 0.009399916,
+        "thread_count": 7,
+        "ctx_switches": 214,
+        "pfaults": 802,
+        "pageins": 0,
+        "footprint_kib": 3376.46875,
+        "peak_footprint_kib": 3440.46875
+      }
+    },
+    {
+      "trial": 1,
+      "role": "reference",
+      "binary": "/private/tmp/claude-502/-Users-rajaniraiyn-work-a/a536a1f2-a8c3-4ba1-8862-89a02f8c91c0/scratchpad/perf2/idle-budget-evidence/a-reference",
+      "at3": {
+        "rss_kib": 10624.0,
+        "cpu_seconds": 0.018075166,
+        "user_seconds": 0.005945666,
+        "kernel_seconds": 0.0121295,
+        "thread_count": 10,
+        "ctx_switches": 219,
+        "pfaults": 801,
+        "pageins": 0,
+        "footprint_kib": 3440.4921875,
+        "peak_footprint_kib": 3440.4921875
+      },
+      "code_kib": 3264.0,
+      "at15": {
+        "rss_kib": 10592.0,
+        "cpu_seconds": 0.018234832,
+        "user_seconds": 0.005995416,
+        "kernel_seconds": 0.012239416,
+        "thread_count": 7,
+        "ctx_switches": 225,
+        "pfaults": 805,
+        "pageins": 0,
+        "footprint_kib": 3408.4921875,
+        "peak_footprint_kib": 3456.4921875
+      }
+    },
+    {
+      "trial": 2,
+      "role": "reference",
+      "binary": "/private/tmp/claude-502/-Users-rajaniraiyn-work-a/a536a1f2-a8c3-4ba1-8862-89a02f8c91c0/scratchpad/perf2/idle-budget-evidence/a-reference",
+      "at3": {
+        "rss_kib": 10448.0,
+        "cpu_seconds": 0.013101333,
+        "user_seconds": 0.004496708,
+        "kernel_seconds": 0.008604625,
+        "thread_count": 10,
+        "ctx_switches": 215,
+        "pfaults": 779,
+        "pageins": 0,
+        "footprint_kib": 3264.4921875,
+        "peak_footprint_kib": 3264.4921875
+      },
+      "code_kib": 3264.0,
+      "at15": {
+        "rss_kib": 10416.0,
+        "cpu_seconds": 0.013271125,
+        "user_seconds": 0.00455525,
+        "kernel_seconds": 0.008715875,
+        "thread_count": 7,
+        "ctx_switches": 218,
+        "pfaults": 783,
+        "pageins": 0,
+        "footprint_kib": 3232.4921875,
+        "peak_footprint_kib": 3280.4921875
+      }
+    },
+    {
+      "trial": 2,
+      "role": "current",
+      "binary": "/private/tmp/claude-502/-Users-rajaniraiyn-work-a/a536a1f2-a8c3-4ba1-8862-89a02f8c91c0/scratchpad/perf2/idle-budget-evidence/a-current",
+      "at3": {
+        "rss_kib": 10544.0,
+        "cpu_seconds": 0.014836582000000001,
+        "user_seconds": 0.004744166,
+        "kernel_seconds": 0.010092416,
+        "thread_count": 10,
+        "ctx_switches": 211,
+        "pfaults": 794,
+        "pageins": 0,
+        "footprint_kib": 3344.4921875,
+        "peak_footprint_kib": 3344.4921875
+      },
+      "code_kib": 3280.0,
+      "at15": {
+        "rss_kib": 10512.0,
+        "cpu_seconds": 0.015093791,
+        "user_seconds": 0.004812333,
+        "kernel_seconds": 0.010281458,
+        "thread_count": 7,
+        "ctx_switches": 215,
+        "pfaults": 801,
+        "pageins": 0,
+        "footprint_kib": 3312.4921875,
+        "peak_footprint_kib": 3376.4921875
+      }
+    },
+    {
+      "trial": 3,
+      "role": "current",
+      "binary": "/private/tmp/claude-502/-Users-rajaniraiyn-work-a/a536a1f2-a8c3-4ba1-8862-89a02f8c91c0/scratchpad/perf2/idle-budget-evidence/a-current",
+      "at3": {
+        "rss_kib": 10512.0,
+        "cpu_seconds": 0.012191624,
+        "user_seconds": 0.004026916,
+        "kernel_seconds": 0.008164708,
+        "thread_count": 10,
+        "ctx_switches": 193,
+        "pfaults": 786,
+        "pageins": 0,
+        "footprint_kib": 3312.4921875,
+        "peak_footprint_kib": 3312.4921875
+      },
+      "code_kib": 3280.0,
+      "at15": {
+        "rss_kib": 10480.0,
+        "cpu_seconds": 0.012304958000000001,
+        "user_seconds": 0.004055083,
+        "kernel_seconds": 0.008249875,
+        "thread_count": 7,
+        "ctx_switches": 199,
+        "pfaults": 791,
+        "pageins": 0,
+        "footprint_kib": 3280.4921875,
+        "peak_footprint_kib": 3328.4921875
+      }
+    },
+    {
+      "trial": 3,
+      "role": "reference",
+      "binary": "/private/tmp/claude-502/-Users-rajaniraiyn-work-a/a536a1f2-a8c3-4ba1-8862-89a02f8c91c0/scratchpad/perf2/idle-budget-evidence/a-reference",
+      "at3": {
+        "rss_kib": 10544.0,
+        "cpu_seconds": 0.011420666,
+        "user_seconds": 0.003874833,
+        "kernel_seconds": 0.007545833,
+        "thread_count": 10,
+        "ctx_switches": 178,
+        "pfaults": 788,
+        "pageins": 0,
+        "footprint_kib": 3360.4921875,
+        "peak_footprint_kib": 3360.4921875
+      },
+      "code_kib": 3264.0,
+      "at15": {
+        "rss_kib": 10512.0,
+        "cpu_seconds": 0.011512458,
+        "user_seconds": 0.003906625,
+        "kernel_seconds": 0.007605833,
+        "thread_count": 7,
+        "ctx_switches": 181,
+        "pfaults": 792,
+        "pageins": 0,
+        "footprint_kib": 3328.4921875,
+        "peak_footprint_kib": 3376.4921875
+      }
+    },
+    {
+      "trial": 4,
+      "role": "reference",
+      "binary": "/private/tmp/claude-502/-Users-rajaniraiyn-work-a/a536a1f2-a8c3-4ba1-8862-89a02f8c91c0/scratchpad/perf2/idle-budget-evidence/a-reference",
+      "at3": {
+        "rss_kib": 10592.0,
+        "cpu_seconds": 0.013309373999999999,
+        "user_seconds": 0.004347958,
+        "kernel_seconds": 0.008961416,
+        "thread_count": 10,
+        "ctx_switches": 205,
+        "pfaults": 797,
+        "pageins": 1,
+        "footprint_kib": 3408.4921875,
+        "peak_footprint_kib": 3408.4921875
+      },
+      "code_kib": 3264.0,
+      "at15": {
+        "rss_kib": 10560.0,
+        "cpu_seconds": 0.013375916,
+        "user_seconds": 0.004371458,
+        "kernel_seconds": 0.009004458,
+        "thread_count": 7,
+        "ctx_switches": 208,
+        "pfaults": 801,
+        "pageins": 1,
+        "footprint_kib": 3376.4921875,
+        "peak_footprint_kib": 3424.4921875
+      }
+    },
+    {
+      "trial": 4,
+      "role": "current",
+      "binary": "/private/tmp/claude-502/-Users-rajaniraiyn-work-a/a536a1f2-a8c3-4ba1-8862-89a02f8c91c0/scratchpad/perf2/idle-budget-evidence/a-current",
+      "at3": {
+        "rss_kib": 10592.0,
+        "cpu_seconds": 0.017598957000000002,
+        "user_seconds": 0.006185666,
+        "kernel_seconds": 0.011413291,
+        "thread_count": 11,
+        "ctx_switches": 209,
+        "pfaults": 794,
+        "pageins": 0,
+        "footprint_kib": 3392.4921875,
+        "peak_footprint_kib": 3392.4921875
+      },
+      "code_kib": 3280.0,
+      "at15": {
+        "rss_kib": 10560.0,
+        "cpu_seconds": 0.017658583,
+        "user_seconds": 0.0062105,
+        "kernel_seconds": 0.011448083,
+        "thread_count": 7,
+        "ctx_switches": 213,
+        "pfaults": 799,
+        "pageins": 0,
+        "footprint_kib": 3360.4921875,
+        "peak_footprint_kib": 3408.4921875
+      }
+    }
+  ],
+  "exact-tests.json": [
+    {
+      "trial": 0,
+      "role": "reference",
+      "exit_code": 101,
+      "idle": "idle: daemon 10512 KiB RSS; terminal client 0ns of CPU in 3 s, 9600 KiB RSS"
+    },
+    {
+      "trial": 0,
+      "role": "current",
+      "exit_code": 101,
+      "idle": "idle: daemon 10656 KiB RSS; terminal client 0ns of CPU in 3 s, 9504 KiB RSS"
+    },
+    {
+      "trial": 1,
+      "role": "current",
+      "exit_code": 101,
+      "idle": "idle: daemon 10640 KiB RSS; terminal client 0ns of CPU in 3 s, 9552 KiB RSS"
+    },
+    {
+      "trial": 1,
+      "role": "reference",
+      "exit_code": 101,
+      "idle": "idle: daemon 10704 KiB RSS; terminal client 0ns of CPU in 3 s, 9504 KiB RSS"
+    },
+    {
+      "trial": 2,
+      "role": "reference",
+      "exit_code": 101,
+      "idle": "idle: daemon 10544 KiB RSS; terminal client 0ns of CPU in 3 s, 9488 KiB RSS"
+    },
+    {
+      "trial": 2,
+      "role": "current",
+      "exit_code": 101,
+      "idle": "idle: daemon 10672 KiB RSS; terminal client 0ns of CPU in 3 s, 9552 KiB RSS"
+    },
+    {
+      "trial": 3,
+      "role": "current",
+      "exit_code": 101,
+      "idle": "idle: daemon 10704 KiB RSS; terminal client 0ns of CPU in 3 s, 9472 KiB RSS"
+    },
+    {
+      "trial": 3,
+      "role": "reference",
+      "exit_code": 101,
+      "idle": "idle: daemon 10544 KiB RSS; terminal client 0ns of CPU in 3 s, 9536 KiB RSS"
+    },
+    {
+      "trial": 4,
+      "role": "reference",
+      "exit_code": 101,
+      "idle": "idle: daemon 10480 KiB RSS; terminal client 0ns of CPU in 3 s, 9472 KiB RSS"
+    },
+    {
+      "trial": 4,
+      "role": "current",
+      "exit_code": 101,
+      "idle": "idle: daemon 10592 KiB RSS; terminal client 0ns of CPU in 3 s, 9472 KiB RSS"
+    }
+  ],
+  "pilot/samples.json": [
+    {
+      "trial": 0,
+      "role": "current",
+      "binary": "/private/tmp/claude-502/-Users-rajaniraiyn-work-a/a536a1f2-a8c3-4ba1-8862-89a02f8c91c0/scratchpad/perf2/idle-budget-evidence/a-current",
+      "at3": {
+        "rss_kib": 10560.0,
+        "cpu_seconds": 0.014850999,
+        "user_seconds": 0.004795791,
+        "kernel_seconds": 0.010055208,
+        "thread_count": 10,
+        "ctx_switches": 224,
+        "pfaults": 796,
+        "pageins": 0,
+        "footprint_kib": 3360.4921875,
+        "peak_footprint_kib": 3360.4921875
+      },
+      "code_kib": 3280.0,
+      "at15": {
+        "rss_kib": 10528.0,
+        "cpu_seconds": 0.015071916000000001,
+        "user_seconds": 0.004861916,
+        "kernel_seconds": 0.01021,
+        "thread_count": 7,
+        "ctx_switches": 227,
+        "pfaults": 800,
+        "pageins": 0,
+        "footprint_kib": 3328.4921875,
+        "peak_footprint_kib": 3360.4921875
+      }
+    },
+    {
+      "trial": 1,
+      "role": "current",
+      "binary": "/private/tmp/claude-502/-Users-rajaniraiyn-work-a/a536a1f2-a8c3-4ba1-8862-89a02f8c91c0/scratchpad/perf2/idle-budget-evidence/a-current",
+      "at3": {
+        "rss_kib": 10560.0,
+        "cpu_seconds": 0.014620082999999999,
+        "user_seconds": 0.00460575,
+        "kernel_seconds": 0.010014333,
+        "thread_count": 11,
+        "ctx_switches": 236,
+        "pfaults": 799,
+        "pageins": 2,
+        "footprint_kib": 3360.4921875,
+        "peak_footprint_kib": 3360.4921875
+      },
+      "code_kib": 3280.0,
+      "at15": {
+        "rss_kib": 8352.0,
+        "cpu_seconds": 0.014973456999999999,
+        "user_seconds": 0.004676916,
+        "kernel_seconds": 0.010296541,
+        "thread_count": 7,
+        "ctx_switches": 240,
+        "pfaults": 835,
+        "pageins": 2,
+        "footprint_kib": 3328.4921875,
+        "peak_footprint_kib": 3376.4921875
+      }
+    },
+    {
+      "trial": 2,
+      "role": "current",
+      "binary": "/private/tmp/claude-502/-Users-rajaniraiyn-work-a/a536a1f2-a8c3-4ba1-8862-89a02f8c91c0/scratchpad/perf2/idle-budget-evidence/a-current",
+      "at3": {
+        "rss_kib": 10544.0,
+        "cpu_seconds": 0.019180582,
+        "user_seconds": 0.006535666,
+        "kernel_seconds": 0.012644916,
+        "thread_count": 10,
+        "ctx_switches": 226,
+        "pfaults": 791,
+        "pageins": 0,
+        "footprint_kib": 3328.46875,
+        "peak_footprint_kib": 3328.46875
+      },
+      "code_kib": 3280.0,
+      "at15": {
+        "rss_kib": 10512.0,
+        "cpu_seconds": 0.019351625,
+        "user_seconds": 0.00659875,
+        "kernel_seconds": 0.012752875,
+        "thread_count": 7,
+        "ctx_switches": 229,
+        "pfaults": 795,
+        "pageins": 0,
+        "footprint_kib": 3296.46875,
+        "peak_footprint_kib": 3344.46875
+      }
+    },
+    {
+      "trial": 3,
+      "role": "current",
+      "binary": "/private/tmp/claude-502/-Users-rajaniraiyn-work-a/a536a1f2-a8c3-4ba1-8862-89a02f8c91c0/scratchpad/perf2/idle-budget-evidence/a-current",
+      "at3": {
+        "rss_kib": 10592.0,
+        "cpu_seconds": 0.015497791,
+        "user_seconds": 0.005461375,
+        "kernel_seconds": 0.010036416,
+        "thread_count": 10,
+        "ctx_switches": 214,
+        "pfaults": 790,
+        "pageins": 0,
+        "footprint_kib": 3376.46875,
+        "peak_footprint_kib": 3376.46875
+      },
+      "code_kib": 3280.0,
+      "at15": {
+        "rss_kib": 10544.0,
+        "cpu_seconds": 0.015578208,
+        "user_seconds": 0.005490083,
+        "kernel_seconds": 0.010088125,
+        "thread_count": 7,
+        "ctx_switches": 217,
+        "pfaults": 794,
+        "pageins": 0,
+        "footprint_kib": 3344.46875,
+        "peak_footprint_kib": 3392.46875
+      }
+    },
+    {
+      "trial": 4,
+      "role": "current",
+      "binary": "/private/tmp/claude-502/-Users-rajaniraiyn-work-a/a536a1f2-a8c3-4ba1-8862-89a02f8c91c0/scratchpad/perf2/idle-budget-evidence/a-current",
+      "at3": {
+        "rss_kib": 10592.0,
+        "cpu_seconds": 0.019789041,
+        "user_seconds": 0.006647083,
+        "kernel_seconds": 0.013141958,
+        "thread_count": 10,
+        "ctx_switches": 213,
+        "pfaults": 788,
+        "pageins": 0,
+        "footprint_kib": 3376.46875,
+        "peak_footprint_kib": 3376.46875
+      },
+      "code_kib": 3280.0,
+      "at15": {
+        "rss_kib": 10560.0,
+        "cpu_seconds": 0.020021041,
+        "user_seconds": 0.00671475,
+        "kernel_seconds": 0.013306291,
+        "thread_count": 7,
+        "ctx_switches": 216,
+        "pfaults": 792,
+        "pageins": 0,
+        "footprint_kib": 3344.46875,
+        "peak_footprint_kib": 3392.46875
+      }
+    }
+  ],
+  "linux-attribution.json": {
+    "reference": {
+      "rss3": [
+        9448.0,
+        9616.0,
+        9452.0,
+        9452.0,
+        9736.0
+      ],
+      "rss25": [
+        9560.0,
+        9728.0,
+        9564.0,
+        9564.0,
+        9848.0
+      ],
+      "PSS": [
+        6630.0,
+        6798.0,
+        6634.0,
+        6634.0,
+        6918.0
+      ],
+      "USS": [
+        6480.0,
+        6648.0,
+        6484.0,
+        6484.0,
+        6768.0
+      ],
+      "image": [
+        5360.0,
+        5548.0,
+        5360.0,
+        5372.0,
+        5640.0
+      ],
+      "text": [
+        4652.0,
+        4780.0,
+        4652.0,
+        4652.0,
+        4908.0
+      ],
+      "heap": [
+        276.0,
+        248.0,
+        324.0,
+        324.0,
+        304.0
+      ],
+      "main_stack": [
+        60.0,
+        60.0,
+        60.0,
+        60.0,
+        60.0
+      ],
+      "anon": [
+        308.0,
+        316.0,
+        264.0,
+        252.0,
+        288.0
+      ],
+      "threads3": [
+        6,
+        6,
+        6,
+        6,
+        6
+      ],
+      "threads25": [
+        6,
+        6,
+        6,
+        6,
+        6
+      ]
+    },
+    "candidate": {
+      "rss3": [
+        9416.0,
+        9792.0,
+        9688.0,
+        9700.0,
+        9732.0
+      ],
+      "rss25": [
+        9528.0,
+        9904.0,
+        9800.0,
+        9812.0,
+        9844.0
+      ],
+      "PSS": [
+        6623.0,
+        6974.0,
+        6871.0,
+        6882.0,
+        6918.0
+      ],
+      "USS": [
+        6476.0,
+        6824.0,
+        6720.0,
+        6732.0,
+        6772.0
+      ],
+      "image": [
+        5360.0,
+        5708.0,
+        5628.0,
+        5624.0,
+        5644.0
+      ],
+      "text": [
+        4640.0,
+        4960.0,
+        4888.0,
+        4896.0,
+        4896.0
+      ],
+      "heap": [
+        276.0,
+        352.0,
+        180.0,
+        344.0,
+        300.0
+      ],
+      "main_stack": [
+        60.0,
+        60.0,
+        56.0,
+        60.0,
+        56.0
+      ],
+      "anon": [
+        304.0,
+        228.0,
+        380.0,
+        228.0,
+        288.0
+      ],
+      "threads3": [
+        6,
+        6,
+        6,
+        6,
+        6
+      ],
+      "threads25": [
+        6,
+        6,
+        6,
+        6,
+        6
+      ]
+    }
+  },
+  "macos-attribution.json": {
+    "reference": {
+      "rss3": [
+        10080.0,
+        10096.0,
+        10096.0,
+        10064.0,
+        10144.0
+      ],
+      "rss25": [
+        10048.0,
+        10064.0,
+        10064.0,
+        10032.0,
+        10112.0
+      ],
+      "footprint25": [
+        2625.0,
+        2624.9375,
+        2641.0,
+        2560.9375,
+        2657.0
+      ],
+      "image": [
+        3536.0,
+        3536.0,
+        3536.0,
+        3536.0,
+        3536.0
+      ],
+      "text": [
+        3264.0,
+        3264.0,
+        3264.0,
+        3264.0,
+        3264.0
+      ],
+      "threads25": [
+        6,
+        6,
+        6,
+        6,
+        6
+      ]
+    },
+    "candidate": {
+      "rss3": [
+        10128.0,
+        10160.0,
+        10160.0,
+        10208.0,
+        10224.0
+      ],
+      "rss25": [
+        10096.0,
+        10128.0,
+        10128.0,
+        10176.0,
+        10192.0
+      ],
+      "footprint25": [
+        2560.9375,
+        2592.9375,
+        2592.9375,
+        2609.0,
+        2641.0
+      ],
+      "image": [
+        3632.0,
+        3632.0,
+        3632.0,
+        3632.0,
+        3632.0
+      ],
+      "text": [
+        3360.0,
+        3360.0,
+        3360.0,
+        3360.0,
+        3360.0
+      ],
+      "threads25": [
+        6,
+        6,
+        6,
+        6,
+        6
+      ]
+    }
+  }
+}

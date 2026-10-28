@@ -1,9 +1,10 @@
 # Idle daemon charged memory
 
 The gate is strictly below **10 MiB (10,485,760 bytes)**. RSS remains a
-diagnostic, with no assertion. The owner changed the accounting policy after
-the round-3 investigation found that clean resident code pages could cross
-the old RSS threshold while the retained allocation set stayed flat.
+diagnostic, with no assertion. On 2026-10-28 the owner chose charged memory,
+keeping the 10 MiB limit, after the round-3 investigation found that clean
+resident code pages could cross the old RSS threshold while the retained
+allocation set stayed flat.
 
 `sys::process_memory::charged_bytes` owns native accounting and returns
 bytes or an error. Missing, inaccessible or undecodable counters never
@@ -30,6 +31,40 @@ daemon's charge after three idle seconds. The Windows adapter in
 sampler invokes the native reader through the `perf-attach --memory <pid>`
 example. Both continue reporting RSS. These are the two idle RSS assertions
 replaced by this change; historical survey RSS observations stay unchanged.
+
+## Investigation behind the accounting decision
+
+The first-phase comparison used historical survey revision `d6bb6cce` and
+candidate `1af5daf3`, with five fresh-home release pairs in alternating
+AB/BA order on each native host. It found no MiB-scale private-memory
+regression. On the M3, the historical revision already failed the exact
+RSS budget in all five samples: median 10,544 KiB [10,480–10,704], versus
+10,656 [10,592–10,704] for the candidate. Instrumented TUI footprint was
+3,408.45 [3,264.49–3,440.49] versus 3,360.52 [3,312.49–3,408.47] KiB;
+live malloc allocations rounded to 443 KiB in both. The
+[raw M3 samples, exact-test results and build identity](idle-charge-investigation.json)
+retain every observation, including the preliminary control below.
+
+The hosted endpoint comparisons attributed the observed growth to resident
+executable pages. Linux paired RSS growth was median +176 KiB [−32,+248],
+with executable text +180 [−12,+244], heap 0 [−144,+104], and no settled
+thread-count increase. Hosted macOS paired RSS grew +64 KiB [48,144] and
+executable `__TEXT` +96 [96,96], while footprint changed −32 [−64.06,+48.06].
+[Per-sample mapping attributions](idle-charge-investigation.json) accompany
+the full native artifacts in [Linux run 40692028455](https://github.com/arut-land/a/actions/runs/40692028455)
+and [macOS run 40692035085](https://github.com/arut-land/a/actions/runs/40692035085).
+These map/charge diagnostics were collected after settling, separately from
+the three-second RSS read; they are not simultaneous decompositions of it.
+This endpoint comparison did not isolate a per-merge culprit.
+
+In a preliminary unchanged-daemon control (`pilot/samples.json` in the
+[raw evidence](idle-charge-investigation.json)), RSS fell from 10,560 to
+8,352 KiB while footprint moved only from 3,360.49 to 3,328.49 KiB.
+That roughly 2 MiB RSS drop with flat footprint illustrates reclaimable
+residency, rather than an allocation fix. RSS would still be a legitimate
+contract for total residency; the owner instead selected native charged
+memory to gate process memory pressure. The numeric limit is unchanged,
+and RSS remains visible so executable residency is still observable.
 
 ## Reproduction
 
