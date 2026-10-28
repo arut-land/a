@@ -68,3 +68,27 @@ pub(crate) struct Identity {
     pub cwd: PathBuf,
     pub env: Environment,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ext::host::Registry;
+    use ext::testing::Rig;
+
+    #[test]
+    fn session_and_declaration_admissions_never_share_an_identity() {
+        let rig = Rig::new("policy-identity", Registry::default());
+        let cx = rig.cx();
+        let session = Identity {
+            policy: Policy::admit(1, Scope::Session, &cx).unwrap(),
+            server: "fixture".parse().unwrap(),
+            cwd: rig.workspace(),
+            env: Environment::default(),
+        };
+        let declaration = Identity {
+            policy: Policy::admit(1, Scope::Workspace, &cx).unwrap(),
+            ..session.clone()
+        };
+        assert!(session != declaration);
+    }
+}
