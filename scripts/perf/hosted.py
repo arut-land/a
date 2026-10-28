@@ -370,7 +370,7 @@ def sessions(source, output, variant, reference=""):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--phase", choices=["toolchain", "all", "build", "measure", "paired", "sessions", "evidence", "memory", "survey"], default="all")
+    parser.add_argument("--phase", choices=["toolchain", "all", "build", "measure", "paired", "sessions", "residency", "evidence", "memory", "survey"], default="all")
     parser.add_argument("--source", type=Path, default=ROOT)
     parser.add_argument("--output", type=Path, default=ROOT / "target/hosted-perf")
     parser.add_argument("--variant", default="{}", help='JSON: {"rustflags": [...], "config": [...]}')
@@ -408,6 +408,13 @@ def main():
         measure(output / ("a-fixtures" + SUFFIX), output / ("perf-probe" + SUFFIX),
                 output / "evidence", rounds=int(os.environ.get("PERF_EVIDENCE_ROUNDS", "3")),
                 memory_only=args.phase == "memory")
+        return
+    if args.phase == "residency":
+        if variant or args.paired_ref:
+            parser.error("residency measures unchanged-source A/A ownership waves; omit variant and paired-ref")
+        run([sys.executable, ROOT / "scripts/perf/residency.py", "--source", source,
+             "--output", output, "--target", Path(os.environ["CARGO_TARGET_DIR"]),
+             "--rounds", os.environ.get("PERF_PAIRED_ROUNDS", "5")], cwd=source)
         return
     if args.phase == "sessions":
         sessions(source, output, variant, args.paired_ref)
