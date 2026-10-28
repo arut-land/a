@@ -446,3 +446,12 @@ The post-review shipped build passed `mise run size` and its fixture scan at
 the original pre-OAuth baseline. These are exact size observations, not new idle
 measurements; the interleaved phase-1 idle observations above remain the measured
 RSS/CPU evidence.
+
+The single phase-2 CI dispatch is run `40668274523` at `e04de3af`. Its Miri job
+stopped on the credential file invariant because Miri cannot interpret native
+`open` flags (`0x800`). The test is now explicitly ignored under Miri, like the
+native credential-store invariant; ordinary native credential tests still pass.
+This is a deterministic interpreter limitation, so no failed-job retry was made.
+The follow-up is locally verified and is not covered by the already dispatched
+SHA. Local runtime Miri invariants passed; the full local sys Miri suite stops
+earlier at the existing, out-of-scope config test's unsupported macOS `acl_init`.

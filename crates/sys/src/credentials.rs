@@ -391,6 +391,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support native private-file publication")]
     fn credentials_are_resource_scoped_replaced_and_revoked_outside_logs() {
         let directory = tempfile::tempdir().unwrap();
         let store = Credentials::isolated(directory.path().join("credentials"));
