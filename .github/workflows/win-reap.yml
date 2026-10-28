@@ -4,8 +4,7 @@ on:
     branches: [win-reap]
     paths: ['.github/workflows/win-reap.yml']
 jobs:
-  reproduce:
-    if: false
+  paired:
     strategy:
       fail-fast: false
       matrix:
@@ -22,64 +21,12 @@ jobs:
           git config --global core.autocrlf false
           "CARGO_TARGET_DIR=$env:RUNNER_TEMP/win-reap-target" >> $env:GITHUB_ENV
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/win-reap-target
-          key: win-reap-${{ matrix.os }}-${{ hashFiles('Cargo.lock') }}
-      - name: Install native Rust
-        run: |
-          $channel = (Select-String -Path rust-toolchain.toml -Pattern '^channel = "(.*)"').Matches.Groups[1].Value
-          $arch = if ($env:RUNNER_ARCH -eq 'ARM64') { 'aarch64' } else { 'x86_64' }
-          $toolchain = "$channel-$arch-pc-windows-msvc"
-          "RUSTUP_TOOLCHAIN=$toolchain" >> $env:GITHUB_ENV
-          rustup toolchain install $toolchain --profile minimal --component rust-src
-      - name: Build test hosts
-        run: |
-          cargo test --release -p engine --lib --no-run --message-format=json | Tee-Object "$env:RUNNER_TEMP/build.jsonl"
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cargo test -p engine --lib --no-run --message-format=json | Tee-Object "$env:RUNNER_TEMP/dev-build.jsonl"
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-      - name: Repeat retirement
-        run: |
-          foreach ($profile in @("build", "dev-build")) {
-          $records = Get-Content "$env:RUNNER_TEMP/$profile.jsonl" | ForEach-Object { $_ | ConvertFrom-Json }
-          $exe = ($records | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'engine' -and $_.executable }).executable
-          $failures = 0
-          for ($i = 1; $i -le 1000; $i++) {
-            $timer = [Diagnostics.Stopwatch]::StartNew()
-            & $exe --exact tests::scoped_processes::last_demand_and_shutdown_reap_the_process_and_its_descendants --nocapture
-            $code = $LASTEXITCODE
-            $timer.Stop()
-            Write-Output "SAMPLE $profile $i code=$code ms=$($timer.Elapsed.TotalMilliseconds)"
-            if ($code) { $failures++ }
-          }
-          Write-Output "RESULT $profile failures=$failures"
-          }
-
-  native:
-    concurrency:
-      group: win-reap-native-${{ matrix.os }}
-      cancel-in-progress: true
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, windows-11-arm]
-    runs-on: ${{ matrix.os }}
-    env:
-      CARGO_BUILD_JOBS: 2
-      CARGO_PROFILE_DEV_CODEGEN_BACKEND: llvm
-    defaults:
-      run:
-        shell: pwsh
-    steps:
-      - run: |
-          git config --global core.autocrlf false
-          "CARGO_TARGET_DIR=$env:RUNNER_TEMP/win-reap-target" >> $env:GITHUB_ENV
-      - uses: actions/checkout@v7
-      - uses: actions/cache@v6
-        with:
-          path: ${{ runner.temp }}/win-reap-target
-          key: win-reap-native-${{ matrix.os }}-${{ hashFiles('Cargo.lock') }}
+          key: win-reap-paired-${{ matrix.os }}-${{ github.sha }}
           restore-keys: win-reap-${{ matrix.os }}-
       - name: Install native Rust
         run: |
@@ -87,17 +34,66 @@ jobs:
           $arch = if ($env:RUNNER_ARCH -eq 'ARM64') { 'aarch64' } else { 'x86_64' }
           $toolchain = "$channel-$arch-pc-windows-msvc"
           "RUSTUP_TOOLCHAIN=$toolchain" >> $env:GITHUB_ENV
-          rustup toolchain install $toolchain --profile minimal --component rust-src
-      - name: Native termination regression
+          rustup toolchain install $toolchain --profile minimal --component rust-src,clippy
+      - name: Build before and after test hosts
         run: |
-          cargo test --release -p sys --lib --no-run --message-format=json | Tee-Object "$env:RUNNER_TEMP/native.jsonl"
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          $records = Get-Content "$env:RUNNER_TEMP/native.jsonl" | ForEach-Object { $_ | ConvertFrom-Json }
-          $exe = ($records | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'sys' -and $_.executable }).executable
-          & $exe --exact proc::imp::tests::retirement_can_close_creation_without_terminating_existing_members --nocapture
-          $failures = 0
-          for ($i = 1; $i -le 100; $i++) {
-            & $exe --exact proc::imp::tests::termination_retains_watches_for_members_still_exiting --nocapture
-            if ($LASTEXITCODE) { $failures++ }
+          foreach ($file in @('proc.rs', 'proc_windows.rs')) {
+            Copy-Item "crates/sys/src/$file" "$env:RUNNER_TEMP/candidate-$file"
+            git show "e02028221a76049595e74828425d95f900433602:crates/sys/src/$file" | Set-Content "crates/sys/src/$file" -Encoding utf8NoBOM
           }
-          Write-Output "NATIVE failures=$failures"
+          foreach ($profile in @('release', 'dev')) {
+            $flags = if ($profile -eq 'release') { @('--release') } else { @() }
+            cargo test @flags -p engine --lib --no-run --message-format=json | Set-Content "$env:RUNNER_TEMP/before-$profile.jsonl"
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            $records = Get-Content "$env:RUNNER_TEMP/before-$profile.jsonl" | ForEach-Object { $_ | ConvertFrom-Json }
+            $exe = ($records | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'engine' -and $_.executable }).executable
+            Copy-Item $exe "$env:RUNNER_TEMP/before-$profile.exe"
+          }
+          foreach ($file in @('proc.rs', 'proc_windows.rs')) { Copy-Item "$env:RUNNER_TEMP/candidate-$file" "crates/sys/src/$file" }
+          cargo clippy -p sys -p engine -p ext-shell --all-targets -- -D warnings
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          foreach ($profile in @('release', 'dev')) {
+            $flags = if ($profile -eq 'release') { @('--release') } else { @() }
+            cargo test @flags -p engine -p sys --lib --no-run --message-format=json | Set-Content "$env:RUNNER_TEMP/after-$profile.jsonl"
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
+      - name: Consecutive native invariant passes
+        run: |
+          foreach ($profile in @('release', 'dev')) {
+            $records = Get-Content "$env:RUNNER_TEMP/after-$profile.jsonl" | ForEach-Object { $_ | ConvertFrom-Json }
+            $exe = ($records | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'sys' -and $_.executable }).executable
+            for ($i = 1; $i -le 100; $i++) {
+              foreach ($test in @('termination_retains_watches_for_members_still_exiting', 'retirement_keeps_every_member_beyond_a_watch_batch')) {
+                & $exe --exact "proc::imp::tests::$test" --nocapture
+                if ($LASTEXITCODE) { throw "$profile $test failed at sample $i" }
+              }
+            }
+            Write-Output "NATIVE $profile 100 consecutive passes for each invariant"
+          }
+      - name: Interleaved engine retirement samples
+        run: |
+          $afterFailures = 0
+          foreach ($profile in @('release', 'dev')) {
+            $records = Get-Content "$env:RUNNER_TEMP/after-$profile.jsonl" | ForEach-Object { $_ | ConvertFrom-Json }
+            $candidate = ($records | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'engine' -and $_.executable }).executable
+            for ($i = 1; $i -le 100; $i++) {
+              $order = if ($i % 2) { @('before', 'after') } else { @('after', 'before') }
+              foreach ($version in $order) {
+                $exe = if ($version -eq 'before') { "$env:RUNNER_TEMP/before-$profile.exe" } else { $candidate }
+                $timer = [Diagnostics.Stopwatch]::StartNew()
+                & $exe --exact tests::scoped_processes::last_demand_and_shutdown_reap_the_process_and_its_descendants --nocapture
+                $code = $LASTEXITCODE
+                $timer.Stop()
+                $record = @{ profile=$profile; version=$version; sample=$i; code=$code; ms=$timer.Elapsed.TotalMilliseconds } | ConvertTo-Json -Compress
+                Add-Content "$env:RUNNER_TEMP/win-reap-measures.jsonl" $record
+                Write-Output "MEASURE $record"
+                if ($version -eq 'after' -and $code) { $afterFailures++ }
+              }
+            }
+          }
+          if ($afterFailures) { throw "$afterFailures candidate engine failures" }
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: win-reap-${{ matrix.os }}
+          path: ${{ runner.temp }}/win-reap-measures.jsonl

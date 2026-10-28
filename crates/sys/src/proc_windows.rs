@@ -7,12 +7,14 @@ use std::process::{Command, ExitStatus};
 mod spawn;
 pub use spawn::Child;
 use std::ptr::{null, null_mut};
+use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, FILETIME};
 use windows_sys::Win32::System::JobObjects::{
-    CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
-    SetInformationJobObject, TerminateJobObject,
+    CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicProcessIdList,
+    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+    TerminateJobObject,
 };
 use windows_sys::Win32::System::Threading::{
     CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS, GetProcessTimes, OpenProcess,
@@ -27,14 +29,26 @@ use crate::windows::{Security, ok, owned};
 
 pub type ExitWatch = OwnedHandle;
 
-static TRACE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-static LEADERS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+pub(super) struct Job {
+    handle: OwnedHandle,
+    terminating: Mutex<Option<Vec<(u32, ExitWatch)>>>,
+}
 
-fn trace(message: std::fmt::Arguments<'_>) {
-    TRACE.lock().unwrap().push(format!(
-        "WIN_REAP {:?} {message}",
-        std::time::SystemTime::now()
-    ));
+impl Job {
+    pub(super) const fn new(handle: OwnedHandle) -> Self {
+        Self {
+            handle,
+            terminating: Mutex::new(None),
+        }
+    }
+
+    pub(super) fn into_handle(self) -> OwnedHandle {
+        self.handle
+    }
+
+    fn as_raw_handle(&self) -> std::os::windows::io::RawHandle {
+        self.handle.as_raw_handle()
+    }
 }
 
 pub fn passed(handle: &impl AsRawHandle) -> Passed {
@@ -252,10 +266,9 @@ fn spawn_job_role(
         environment,
     }
     .spawn()?;
-    LEADERS.lock().unwrap().push(child.id());
     let group = ProcessLease {
         id: RecordedIdentity(child.id()),
-        handle: job,
+        handle: Job::new(job),
     };
     Ok(ContainedChild {
         child,
@@ -264,7 +277,35 @@ fn spawn_job_role(
     })
 }
 
-pub(super) fn members(job: &OwnedHandle) -> io::Result<Vec<u32>> {
+pub(super) fn members(job: &Job) -> io::Result<Vec<u32>> {
+    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+    let mut terminating = job
+        .terminating
+        .lock()
+        .expect("job termination lock poisoned");
+    let Some(processes) = terminating.as_mut() else {
+        return active_members(&job.handle);
+    };
+    let mut members = Vec::with_capacity(processes.len());
+    let mut index = 0;
+    while index < processes.len() {
+        // SAFETY: retained process handles include synchronization rights.
+        match unsafe { WaitForSingleObject(processes[index].1.as_raw_handle(), 0) } {
+            WAIT_OBJECT_0 => {
+                processes.swap_remove(index);
+            }
+            WAIT_TIMEOUT => {
+                members.push(processes[index].0);
+                index += 1;
+            }
+            _ => return Err(io::Error::last_os_error()),
+        }
+    }
+    Ok(members)
+}
+
+fn active_members(job: &OwnedHandle) -> io::Result<Vec<u32>> {
     let mut count = 64;
     loop {
         // Pointer-sized storage aligns JOBOBJECT_BASIC_PROCESS_ID_LIST.
@@ -285,7 +326,6 @@ pub(super) fn members(job: &OwnedHandle) -> io::Result<Vec<u32>> {
             // SAFETY: successful query initialized both DWORDs and the listed IDs.
             let len = unsafe { *header.add(1) } as usize;
             let offset = 8 / size_of::<usize>();
-            trace(format_args!("members {:?}", &buffer[offset..offset + len]));
             return Ok(buffer[offset..offset + len]
                 .iter()
                 .filter_map(|&pid| pid.try_into().ok())
@@ -306,42 +346,55 @@ pub fn group_alive(_id: u32) -> bool {
     false
 }
 
-pub(super) fn terminate_group(job: &OwnedHandle) -> io::Result<()> {
-    trace(format_args!("terminate begin"));
+pub(super) fn terminate_group(job: &Job) -> io::Result<()> {
+    let mut terminating = job
+        .terminating
+        .lock()
+        .expect("job termination lock poisoned");
+    if terminating.is_none() {
+        // Stop new job members before the snapshot; this limit applies only to retirement.
+        // SAFETY: zero initializes a valid limits struct, including the zero process limit.
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        limits.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+        // SAFETY: the live job and complete limits buffer remain borrowed for the call.
+        ok(unsafe {
+            SetInformationJobObject(
+                job.as_raw_handle(),
+                JobObjectExtendedLimitInformation,
+                (&raw const limits).cast(),
+                u32::try_from(size_of_val(&limits)).unwrap(),
+            )
+        })?;
+        let mut processes = Vec::new();
+        for pid in active_members(&job.handle)? {
+            if let Some(process) = open_member(&job.handle, pid)? {
+                processes.push((pid, process));
+            }
+        }
+        // Termination removes PIDs from the job before their process objects signal.
+        // The lease, rather than a later job enumeration, owns the completion barrier.
+        *terminating = Some(processes);
+    }
     // SAFETY: the borrowed job remains owned throughout termination.
-    let result = ok(unsafe { TerminateJobObject(job.as_raw_handle(), 1) });
-    trace(format_args!("terminate end {result:?}"));
-    result
+    ok(unsafe { TerminateJobObject(job.as_raw_handle(), 1) })
 }
 
 pub fn process_started(pid: u32) -> Option<u64> {
-    let result = (|| {
-        // SAFETY: scalar inputs, checked owned result.
-        let process =
-            owned(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | 0x0010_0000, 0, pid) })
-                .ok()?;
-        // Retained handles keep an exited process object queryable. A signalled
-        // process is gone even while its creation time remains available.
-        // SAFETY: this owned process handle includes SYNCHRONIZE access.
-        if unsafe {
-            windows_sys::Win32::System::Threading::WaitForSingleObject(process.as_raw_handle(), 0)
-        } != windows_sys::Win32::Foundation::WAIT_TIMEOUT
-        {
-            return None;
-        }
-        created_at(&process).ok()
-    })();
-    if !LEADERS.lock().unwrap().contains(&pid) {
-        let events = std::mem::take(&mut *TRACE.lock().unwrap());
-        for event in events {
-            eprintln!("{event}");
-        }
-        eprintln!(
-            "WIN_REAP {:?} probe {pid} {result:?}",
-            std::time::SystemTime::now()
-        );
+    // SAFETY: scalar inputs, checked owned result.
+    let process =
+        owned(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | 0x0010_0000, 0, pid) })
+            .ok()?;
+    // Retained handles keep an exited process object queryable. A signalled
+    // process is gone even while its creation time remains available.
+    // SAFETY: this owned process handle includes SYNCHRONIZE access.
+    if unsafe {
+        windows_sys::Win32::System::Threading::WaitForSingleObject(process.as_raw_handle(), 0)
+    } != windows_sys::Win32::Foundation::WAIT_TIMEOUT
+    {
+        return None;
     }
-    result
+    created_at(&process).ok()
 }
 
 fn created_at(process: &OwnedHandle) -> io::Result<u64> {
@@ -367,7 +420,22 @@ pub fn exit_watch(pid: u32) -> io::Result<OwnedHandle> {
     })
 }
 
-pub fn member_watch(job: &OwnedHandle, pid: u32) -> io::Result<Option<ExitWatch>> {
+pub fn member_watch(job: &Job, pid: u32) -> io::Result<Option<ExitWatch>> {
+    let terminating = job
+        .terminating
+        .lock()
+        .expect("job termination lock poisoned");
+    if let Some(processes) = &*terminating {
+        return processes
+            .iter()
+            .find(|(id, _)| *id == pid)
+            .map(|(_, process)| process.try_clone())
+            .transpose();
+    }
+    open_member(&job.handle, pid)
+}
+
+fn open_member(job: &OwnedHandle, pid: u32) -> io::Result<Option<ExitWatch>> {
     // The query and membership check use the same retained process object.
     // SAFETY: scalar access flags and ID; the returned handle is checked and owned.
     let process = match owned(unsafe {
@@ -388,7 +456,6 @@ pub fn member_watch(job: &OwnedHandle, pid: u32) -> io::Result<Option<ExitWatch>
             &raw mut member,
         )
     })?;
-    trace(format_args!("member {pid} {member}"));
     Ok((member != 0).then_some(process))
 }
 
@@ -704,82 +771,6 @@ mod tests {
     }
 
     #[test]
-    fn retirement_can_close_creation_without_terminating_existing_members() {
-        use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
-        use windows_sys::Win32::System::JobObjects::JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
-        let mut command = Command::new("cmd.exe");
-        command
-            .args(["/D", "/C", "ping -n 60 127.0.0.1 >NUL"])
-            .envs(std::env::vars_os());
-        let output = File::options().write(true).open("NUL").unwrap();
-        let input = File::open("NUL").unwrap();
-        let mut child = spawn_group(&mut command, output.try_clone().unwrap()).unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let watches = loop {
-            let watches = child.group.exit_watches().unwrap();
-            if watches.len() >= 2 {
-                break watches;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "shell never launched its child"
-            );
-            std::thread::yield_now();
-        };
-        // SAFETY: zero is valid for all fields before the explicit flags are set.
-        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
-        limits.BasicLimitInformation.LimitFlags =
-            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
-        // SAFETY: live job and complete limits buffer remain borrowed for the call.
-        ok(unsafe {
-            SetInformationJobObject(
-                child.group.handle.as_raw_handle(),
-                JobObjectExtendedLimitInformation,
-                (&raw const limits).cast(),
-                u32::try_from(size_of_val(&limits)).unwrap(),
-            )
-        })
-        .unwrap();
-        for process in &watches {
-            assert_eq!(
-                // SAFETY: owned handles include synchronization rights.
-                unsafe { WaitForSingleObject(process.as_raw_handle(), 0) },
-                WAIT_TIMEOUT
-            );
-        }
-        let result = spawn::SpawnPlan {
-            command: &command,
-            io: [&input, &output, &output],
-            inherited: &[],
-            job: Some(&child.group.handle),
-            flags: CREATE_NO_WINDOW,
-            environment: super::super::SpawnEnvironment::Exact,
-        }
-        .spawn();
-        let refused = match result {
-            Ok(mut unexpected) => {
-                unexpected.kill().unwrap();
-                unexpected.wait().unwrap();
-                false
-            }
-            Err(error) => {
-                eprintln!("WIN_REAP sealed creation: {error}");
-                true
-            }
-        };
-        child.group.signal(Signal::Kill).unwrap();
-        for process in watches {
-            assert_eq!(
-                // SAFETY: only waits on this test's retained child handles.
-                unsafe { WaitForSingleObject(process.as_raw_handle(), 5000) },
-                0
-            );
-        }
-        child.wait().unwrap();
-        assert!(refused, "retiring job admitted another child");
-    }
-
-    #[test]
     fn termination_retains_watches_for_members_still_exiting() {
         use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
         let mut command = Command::new("cmd.exe");
@@ -803,11 +794,8 @@ mod tests {
             );
             std::thread::yield_now();
         };
-        let started = std::time::Instant::now();
         child.group.signal(Signal::Kill).unwrap();
-        let terminated = started.elapsed();
         let after = child.group.exit_watches().unwrap();
-        let observed = started.elapsed();
         let pending = before
             .iter()
             .filter(|process| {
@@ -816,10 +804,6 @@ mod tests {
             })
             .count();
         let lost = after.is_empty() && pending != 0;
-        eprintln!(
-            "WIN_REAP native terminated={terminated:?} observed={observed:?} watches={} pending={pending}",
-            after.len()
-        );
         for process in before {
             assert_eq!(
                 // SAFETY: only waits on handles retained for this test's own children.
@@ -832,6 +816,91 @@ mod tests {
             !lost,
             "terminated job lost every watch while {pending} members were still exiting"
         );
+    }
+
+    #[test]
+    #[ignore = "child process for job retirement tests"]
+    fn retirement_member() {
+        loop {
+            std::thread::park();
+        }
+    }
+
+    #[test]
+    fn retirement_keeps_every_member_beyond_a_watch_batch() {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "proc::imp::tests::retirement_member",
+                "--ignored",
+            ])
+            .envs(std::env::vars_os());
+        let input = File::open("NUL").unwrap();
+        let output = File::options().write(true).open("NUL").unwrap();
+        let mut leader = spawn_job(&command, [&input, &output, &output]).unwrap();
+        let mut children = Vec::new();
+        for _ in 0..super::super::EXIT_WATCH_BATCH {
+            children.push(
+                spawn::SpawnPlan {
+                    command: &command,
+                    io: [&input, &output, &output],
+                    inherited: &[],
+                    job: Some(&leader.group.handle.handle),
+                    flags: CREATE_NO_WINDOW,
+                    environment: super::super::SpawnEnvironment::Exact,
+                }
+                .spawn()
+                .unwrap(),
+            );
+        }
+        let watches: Vec<_> = children
+            .iter()
+            .map(|child| child.exit_watch().unwrap())
+            .collect();
+        assert!(leader.group.members().unwrap().len() > super::super::EXIT_WATCH_BATCH);
+        leader.group.signal(Signal::Kill).unwrap();
+        // Retirement permanently closes creation before its complete handle snapshot.
+        let refused = spawn::SpawnPlan {
+            command: &command,
+            io: [&input, &output, &output],
+            inherited: &[],
+            job: Some(&leader.group.handle.handle),
+            flags: CREATE_NO_WINDOW,
+            environment: super::super::SpawnEnvironment::Exact,
+        }
+        .spawn();
+        if let Ok(mut unexpected) = refused {
+            unexpected.kill().unwrap();
+            unexpected.wait().unwrap();
+            panic!("retiring job admitted another member");
+        }
+        loop {
+            let batch = leader.group.exit_watches().unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            assert!(batch.len() <= super::super::EXIT_WATCH_BATCH);
+            for process in batch {
+                assert_eq!(
+                    // SAFETY: each owned watch includes synchronization rights.
+                    unsafe { WaitForSingleObject(process.as_raw_handle(), 5000) },
+                    0
+                );
+            }
+        }
+        for process in watches {
+            assert_eq!(
+                // SAFETY: retained handles identify this test's own children.
+                unsafe { WaitForSingleObject(process.as_raw_handle(), 0) },
+                0,
+                "retirement completed before every batch member signalled"
+            );
+        }
+        leader.wait().unwrap();
+        for mut child in children {
+            child.wait().unwrap();
+        }
     }
 
     #[test]
