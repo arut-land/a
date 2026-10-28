@@ -62,9 +62,6 @@ install mbx or cache its action store: builds use native Cargo on every runner.
 Windows ARM installs native Hyperfine from the checked-in mise lockfile. Release
 and benchmark builds use LLVM; they do not need a Cranelift component.
 
-Hyperfine and mbx from the checked-in mise lockfile. Release and benchmark
-builds use LLVM; they do not need a Cranelift component.
-
 ### Native PATH verification, round 3
 
 The dedicated [Intel macOS run](https://github.com/arut-land/a/actions/runs/40507437634)
