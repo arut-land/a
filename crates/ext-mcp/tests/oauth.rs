@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -326,13 +326,18 @@ fn oauth_engine_process() {
                 .unwrap()
                 .unwrap_or(false),
         };
-        Registry::default()
+        let registry = Registry::default()
             .with(&Mcp::configure(&table)?)?
             .with(&ext_fixtures::Fixtures)?
-            .with(&browser)
+            .with(&browser)?;
+        // Extension installation follows the daemon's exclusive record claim.
+        println!("oauth-engine-ready");
+        std::io::stdout().flush().unwrap();
+        Ok(registry)
     };
+    let listener = home.bind().unwrap();
     engine::serve(
-        &home.bind().unwrap(),
+        &listener,
         &home,
         &config,
         "oauth-test",
@@ -346,6 +351,7 @@ struct Engine {
     fixture: Peer,
     daemon: Peer,
     origin: String,
+    output: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Engine {
@@ -358,18 +364,43 @@ impl Engine {
             serde_json::to_string(&root.dir.join("credentials")).unwrap(),
             scenario == "declined-stepup",
         )).unwrap();
-        let daemon = Peer(
+        let mut daemon = Peer(
             Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "oauth_engine_process", "--nocapture"])
                 .env("A_MCP_TEST_HOME", &root.dir)
+                .env("A_HOME", &root.dir)
+                .stdout(Stdio::piped())
                 .spawn()
                 .unwrap(),
         );
+        let stdout = daemon.0.stdout.take().unwrap();
+        let (ready, acknowledged) = std::sync::mpsc::sync_channel(1);
+        let output = std::thread::spawn(move || {
+            let mut output = std::io::BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                assert_ne!(
+                    output.read_line(&mut line).unwrap(),
+                    0,
+                    "engine exited before readiness"
+                );
+                if line.trim_end().ends_with("oauth-engine-ready") {
+                    break;
+                }
+                line.clear();
+            }
+            ready.send(()).unwrap();
+            std::io::copy(&mut output, &mut std::io::sink()).unwrap();
+        });
+        acknowledged
+            .recv_timeout(Duration::from_secs(10))
+            .expect("engine did not acknowledge its owned listener");
         Self {
             root,
             fixture,
             daemon,
             origin,
+            output: Some(output),
         }
     }
 
@@ -377,6 +408,7 @@ impl Engine {
         let mut client = connect(&sys::Home::from(self.root.dir.clone()));
         protocol::write_frame(&mut client, &protocol::ClientMsg::Shutdown).unwrap();
         assert!(self.daemon.0.wait().unwrap().success());
+        self.output.take().unwrap().join().unwrap();
         self.fixture.0.kill().unwrap();
         self.fixture.0.wait().unwrap();
     }
@@ -747,14 +779,7 @@ fn separately_composed_mcp_instances_share_the_same_credential_lifecycle() {
 fn connect(home: &sys::Home) -> sys::OwnedConnection {
     use protocol::{ClientMsg, DaemonMsg, read_frame, write_frame};
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut writer = loop {
-        if let Ok(connection) = home.endpoint().connect() {
-            break connection;
-        }
-        assert!(Instant::now() < deadline, "engine did not bind");
-        std::thread::sleep(Duration::from_millis(5));
-    };
+    let mut writer = home.endpoint().connect().unwrap();
     writer
         .set_read_timeout(Some(Duration::from_secs(15)))
         .unwrap();
@@ -847,4 +872,21 @@ fn private_discovery_tracks_the_actual_authorization_generation_after_refresh_an
             thread.join().unwrap();
         }
     }
+}
+
+#[test]
+fn engine_readiness_owns_the_daemon_record_before_client_discovery() {
+    let mut engine = Engine::new("paginated");
+    let home = sys::Home::from(engine.root.dir.clone());
+    let record = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(home.daemon_pid_file())
+        .expect("readiness follows record publication");
+    assert_eq!(
+        sys::fs::try_lock(&record).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    drop(record);
+    engine.stop();
 }
