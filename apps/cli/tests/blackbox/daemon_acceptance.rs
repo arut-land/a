@@ -166,6 +166,8 @@ fn two_installs_upgrade_once_and_the_older_client_never_downgrades() {
 /// reports the call's outcome and the job's end, their output whole.
 #[test]
 fn an_upgrade_hands_running_work_to_the_newer_build() {
+    let measured = Instant::now();
+    eprintln!("handover {:?}: start", measured.elapsed());
     let env = Isolated::new("handover-job");
     let config = env.home.config_file();
     let mut text = fs::read_to_string(&config).unwrap();
@@ -185,10 +187,12 @@ fn an_upgrade_hands_running_work_to_the_newer_build() {
         "{}",
         String::from_utf8_lossy(&ran.stderr)
     );
+    eprintln!("handover {:?}: job gate", measured.elapsed());
     let mut job_release = child_at_gate(&listener);
     // Its client waits for the call's outcome, through the upgrade.
     let call = format!("$ echo start; {gate}; echo end; exit 7");
     let waiting = TestProcess::spawn(&mut env.command_at(&older, &["--mode", "auto", "-p", &call]));
+    eprintln!("handover {:?}: call gate", measured.elapsed());
     let mut call_release = child_at_gate(&listener);
     let detached = Instant::now() + Duration::from_secs(30);
     while !env
@@ -202,9 +206,11 @@ fn an_upgrade_hands_running_work_to_the_newer_build() {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+    eprintln!("handover {:?}: detached", measured.elapsed());
     let older_pid = env.pid();
     let older_build = env.home.runtime().current().unwrap();
     env.run(&["ls"]);
+    eprintln!("handover {:?}: upgrade requested", measured.elapsed());
     let successor = env.home.runtime().current().unwrap();
     assert_ne!(successor, older_build);
     let upgraded = deadline();
@@ -222,6 +228,7 @@ fn an_upgrade_hands_running_work_to_the_newer_build() {
         cfg!(unix),
         "where the newer build serves"
     );
+    eprintln!("handover {:?}: successor ready", measured.elapsed());
     let logged = |text: &str| {
         env.logs()
             .values()
@@ -230,7 +237,7 @@ fn an_upgrade_hands_running_work_to_the_newer_build() {
     assert!(!logged(r#""purpose":"job""#), "the gated job ended early");
     assert!(
         !logged(r#""purpose":"detached""#),
-        "the gated call ended early"
+        "the gated call ended early: {:?}", env.logs().values().map(|log| String::from_utf8_lossy(log)).collect::<Vec<_>>()
     );
     job_release.write_all(b"done\n").unwrap();
     call_release.write_all(b"done\n").unwrap();

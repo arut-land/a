@@ -85,7 +85,7 @@ env:
 
 jobs:
   measure:
-    if: github.event_name != 'schedule' && !inputs.autostart
+    if: github.ref != 'refs/heads/win-flakes' && github.event_name != 'schedule' && !inputs.autostart
     name: perf (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
     # Churn workloads and twenty-round ablations need longer than the standard suite.
@@ -329,3 +329,57 @@ jobs:
         with:
           name: autostart-${{ matrix.runner }}
           path: autostart-result.json
+
+  flakes:
+    if: github.ref == 'refs/heads/win-flakes'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      CARGO_PROFILE_DEV_CODEGEN_BACKEND: llvm
+      NEXTEST_PROFILE: windows
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Recorded wire/provider fixtures must keep their checked-in bytes.
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+      - run: echo "MBX_CACHE_DIR=$RUNNER_TEMP/mbx" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: win-flakes
+          cache-on-failure: true
+      - name: Install native LLVM toolchain
+        shell: pwsh
+        run: |
+          $channel = (Select-String -Path rust-toolchain.toml -Pattern '^channel = "(.*)"').Matches.Groups[1].Value
+          $arch = if ($env:RUNNER_ARCH -eq 'ARM64') { 'aarch64' } else { 'x86_64' }
+          $toolchain = "$channel-$arch-pc-windows-msvc"
+          "RUSTUP_TOOLCHAIN=$toolchain" >> $env:GITHUB_ENV
+          rustup toolchain install $toolchain --profile minimal --component clippy,rust-src,rustfmt
+      - uses: jdx/mise-action@v5
+        with:
+          install_args: mr-boxington
+      - name: Install native nextest
+        shell: pwsh
+        run: |
+          $platform = if ($env:RUNNER_ARCH -eq 'ARM64') { 'windows-arm' } else { 'windows' }
+          $archive = "$env:RUNNER_TEMP/nextest.zip"
+          Invoke-WebRequest "https://get.nexte.st/0.9.148/$platform" -OutFile $archive
+          Expand-Archive $archive -DestinationPath "$env:USERPROFILE/.cargo/bin" -Force
+      - name: Select native PowerShell contract runners
+        shell: pwsh
+        run: |
+          $runners = @((Get-Command pwsh.exe).Source, "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe")
+          "A_TEST_POWERSHELL=$($runners -join ';')" >> $env:GITHUB_ENV
+      - name: Repeat native release invariants
+        run: |
+          mise exec -- cargo build --release -p a --features fixtures
+          for i in $(seq 1 60); do
+            echo "iteration $i $(date -u +%FT%TZ)"
+            mise exec -- cargo nextest run --release -p engine -p a -E 'test(an_upgrade_hands_running_work_to_the_newer_build) | test(shutdown_never_admits_a_background_side_call_waiting_for_its_flush)' --no-tests=fail --no-capture --no-fail-fast
+          done
