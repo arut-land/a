@@ -11,7 +11,16 @@ fn send(value: &Value) {
     out.flush().unwrap();
 }
 
+mod oauth_fixture;
+
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--http") {
+        oauth_fixture::serve(
+            &std::env::args().nth(2).expect("marker"),
+            &std::env::args().nth(3).expect("scenario"),
+        );
+        return;
+    }
     let marker = std::env::args().nth(1).expect("marker file");
     if marker == "--descendant" {
         let marker = std::env::args().nth(2).expect("parent marker");

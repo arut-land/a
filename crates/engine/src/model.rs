@@ -4,7 +4,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use llm::{Block, Event, Events, Http, Messages, Provider, Request};
+use llm::{Block, Event, Events, Http, Provider, Request};
 use protocol::Environment;
 
 use crate::config::Settings;
@@ -74,6 +74,7 @@ impl Models {
     }
 }
 
+#[derive(Clone)]
 pub struct Model {
     provider: Provider,
     id: llm::SmolStr,
@@ -101,23 +102,22 @@ impl Model {
     }
 
     /// A request to this model for a reply to `messages`, offering `tools`.
-    pub fn request(&self, messages: Messages, tools: llm::Tools) -> Request {
+    pub fn request(&self, messages: impl Into<llm::Conversation>, tools: llm::Tools) -> Request {
         Request {
             model: self.id.clone(),
-            messages,
+            messages: messages.into(),
             tools,
             ..Request::default()
         }
     }
 
-    /// The reply to `request`, as it streams.
-    pub fn send(&self, request: &Request) -> Events {
-        llm::stream(&*self.http, &self.provider, request)
+    pub fn prepare(&self, request: &Request) -> llm::Prepared {
+        llm::prepare_request(&self.provider, request)
     }
 
-    /// What a reply to `request` names as its producer.
-    pub fn origin(&self, request: &Request) -> llm::Origin {
-        llm::origin(&self.provider, &request.model)
+    /// Dispatches already encoded bytes, without reading canonical history.
+    pub fn send(&self, prepared: llm::Prepared) -> Events {
+        prepared.start(&*self.http)
     }
 }
 

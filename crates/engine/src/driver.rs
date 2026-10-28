@@ -895,6 +895,11 @@ impl Live {
     }
 
     pub(crate) fn stop(&self) {
+        self.session
+            .services
+            .get::<ext::SessionLifetimes>()
+            .expect("session lifetimes")
+            .close();
         self.send(Msg::Stop);
         for job in lock(&self.session.jobs).iter() {
             let _ = job.lease.signal(ext::ProcessSignal::Kill);
@@ -987,7 +992,7 @@ impl Live {
 struct Folding {
     core: Core,
     states: States,
-    snapshot: Option<Snapshot>,
+    snapshot: Option<u64>,
     has_input: bool,
     invocations: Invocations,
 }
@@ -1073,7 +1078,7 @@ impl Folding {
         }
         self.states.restore(&image.states)?;
         self.invocations = image.invocations;
-        self.snapshot = Some(snapshot.clone());
+        self.snapshot = Some(snapshot.covers);
         let core = Core::restore(Arc::clone(binding), image.ledger);
         self.core = core.with_barriers(shared.barriers);
         self.has_input = image.has_input;
@@ -1210,11 +1215,24 @@ enum Admitted {
 /// asked for this long after a write that none followed.
 const SYNC_LAG: std::time::Duration = std::time::Duration::from_millis(50);
 
+struct PreparedModel {
+    model: Model,
+    request: llm::Prepared,
+    attempt: u16,
+    // Readers borrow this generation, so extensions retaining a reader cannot pin themselves.
+    registry: Arc<Registry>,
+}
+
+enum PreparedStep {
+    Request(llm::Prepared),
+    Answered(ext::Name, ext::point::Stepped),
+}
+
 enum InFlight {
     /// A model call's request, prepared and not yet sent: the step point's
     /// decisions about it are logged in between. `Err` is why there is no
     /// model to send it to.
-    Prepared(Box<Result<(Model, llm::Request, u16), String>>),
+    Prepared(Box<Result<PreparedModel, String>>),
     Thread(Box<(ext::ModelTurn, llm::Messages, Result<Model, llm::Error>)>),
     /// A model call sent; it reports once, with [`Completion::Replied`].
     Model,
@@ -1284,7 +1302,8 @@ impl Actor {
         let frames = Arc::clone(&self.live.frames);
         let pending: Vec<Entry> = self.pending_entries().collect();
         let registry = Arc::clone(&newest);
-        let snapshot = self.journal.fold_snapshot.clone();
+        let snapshot = self.journal.fold_snapshot;
+        let session = self.live.id;
         let boundary = self.core.ledger().seq();
         let live = self.live.session.state_view();
         let prepared = rt::unblock_with(
@@ -1296,6 +1315,7 @@ impl Actor {
                 let ((), mut folding) =
                     Folding::rebuild(&binding, &registry, &shared, |restore, each| {
                         let after = snapshot
+                            .and_then(|covers| shared.store.read_snapshot(session, covers))
                             .filter(|s| restore(s.clone()))
                             .map_or(0, |s| s.covers);
                         let mut seen = after;
@@ -2434,6 +2454,12 @@ impl Actor {
     }
 
     fn retire_contexts(&mut self) {
+        self.live
+            .session
+            .services
+            .get::<ext::SessionLifetimes>()
+            .expect("session lifetimes")
+            .clear();
         self.live.session.fence.fetch_add(1, Ordering::SeqCst);
         self.live.session.cancel_all();
         // Retirement also cancels the deferred sync task; later writes need a new timer.
@@ -2742,27 +2768,58 @@ impl Actor {
     async fn prepare(&mut self, call: CallId, attempt: u16, choice: ToolChoice) {
         let (mut decisions, mut answered) = (Vec::new(), None);
         let prepared = if self.live.session.model_only() {
-            self.prepare_thread(call).await
+            self.prepare_thread(call).await.map(Some)
         } else {
             match self.live.session.model(&self.registry) {
-                Ok(model) => self.request(call, &model).await.map(|mut request| {
-                    request.tool_choice = match choice {
-                        ToolChoice::Auto => llm::ToolChoice::Auto,
-                        ToolChoice::None => llm::ToolChoice::None,
-                    };
-                    let (decided, answer) = self.bound.step(call, &mut request);
-                    decisions = decided;
-                    answered = answer.map(|(by, response)| {
-                        let (replied, message) = replied(response);
-                        self.projection.replied = message.map(|m| (call, m));
-                        (by, replied)
-                    });
-                    InFlight::Prepared(Box::new(Ok((model, request, attempt))))
-                }),
+                Ok(model) => match self.request(call, &model).await {
+                    Ok(mut request) => {
+                        request.tool_choice = match choice {
+                            ToolChoice::Auto => llm::ToolChoice::Auto,
+                            ToolChoice::None => llm::ToolChoice::None,
+                        };
+                        let bound = self.bound.clone();
+                        let preparing = model.clone();
+                        rt::try_unblock_with(
+                            &*self.live.session.shared.rt,
+                            Cpu,
+                            rt::STORAGE_BYTES,
+                            move || {
+                                let (decided, answer) = bound.step(call, &mut request);
+                                let prepared = match answer {
+                                    Some((by, response)) => PreparedStep::Answered(by, response),
+                                    None => PreparedStep::Request(preparing.prepare(&request)),
+                                };
+                                (decided, prepared)
+                            },
+                        )
+                        .await
+                        .map(|(decided, prepared)| {
+                            decisions = decided;
+                            match prepared {
+                                PreparedStep::Answered(by, response) => {
+                                    let (replied, message) = replied(response);
+                                    self.projection.replied = message.map(|m| (call, m));
+                                    answered = Some((by, replied));
+                                    None
+                                }
+                                PreparedStep::Request(request) => {
+                                    Some(InFlight::Prepared(Box::new(Ok(PreparedModel {
+                                        model,
+                                        request,
+                                        attempt,
+                                        registry: Arc::clone(&self.registry),
+                                    }))))
+                                }
+                            }
+                        })
+                        .map_err(|error| error.to_string())
+                    }
+                    Err(error) => Err(error),
+                },
                 Err(error) => Err(error),
             }
         };
-        if answered.is_none() {
+        if let Some(prepared) = prepared.transpose() {
             self.inflight.insert(
                 call,
                 prepared.unwrap_or_else(|error| InFlight::Prepared(Box::new(Err(error)))),
@@ -2796,10 +2853,15 @@ impl Actor {
             let mut execution = None;
             let (replied, message) = match prepared {
                 InFlight::Prepared(prepared) => match *prepared {
-                    Ok((model, request, attempt)) => {
+                    Ok(PreparedModel {
+                        model,
+                        request,
+                        attempt,
+                        registry,
+                    }) => {
                         let mut deltas = |text: &str| live.delta(call, attempt, text, fence);
                         let cx = live.session.cx(origin.clone(), &registry);
-                        let resolved = model.origin(&request);
+                        let resolved = request.origin();
                         let name = format!("{}:{}", resolved.provider, resolved.model);
                         let mut observed = Observation {
                             attempt,
@@ -2808,7 +2870,7 @@ impl Actor {
                         };
                         let result = contain(Box::pin(reply(
                             &model,
-                            &request,
+                            request,
                             &cancel,
                             &mut deltas,
                             &mut observed,
@@ -3062,8 +3124,9 @@ impl Live {
 impl Session {
     fn new(header: &Header, shared: &Arc<Shared>, mail: Mail, registry: &Registry) -> Arc<Self> {
         Arc::new_cyclic(|session| Self {
-            services: Arc::new(
-                SessionServices::default()
+            services: Arc::new({
+                let services = SessionServices::default()
+                    .with::<ext::SessionLifetimes>(Arc::new(ext::SessionLifetimes::default()))
                     .with::<dyn ext::Layers>(Arc::new(SessionLayers(session.clone())))
                     .with::<dyn rt::Runtime>(Arc::clone(&shared.rt))
                     .with::<rt::watch::Hub>(Arc::clone(&shared.hub))
@@ -3072,8 +3135,16 @@ impl Session {
                         shared.http_clients.get_or_init(|| {
                             Arc::new(transport::Clients::new(Arc::clone(&shared.rt)))
                         }),
-                    )),
-            ),
+                    ));
+                match shared
+                    .daemon
+                    .upgrade()
+                    .and_then(|daemon| daemon.queried.get_arc::<ext::Lifetimes>().cloned())
+                {
+                    Some(lifetimes) => services.with::<ext::Lifetimes>(lifetimes),
+                    None => services,
+                }
+            }),
             spawn: Mutex::default(),
             fence: AtomicU64::new(0),
             id: header.id,
@@ -3179,12 +3250,13 @@ struct Observation {
 
 async fn reply(
     model: &Model,
-    request: &llm::Request,
+    request: llm::Prepared,
     cancel: &Cancel,
     deltas: &mut (dyn FnMut(&str) + Send),
     observed: &mut Observation,
 ) -> (Replied, Option<llm::Assistant>) {
     // Sent once polled, as an interrupt meanwhile finds it.
+    let origin = request.origin().clone();
     let mut events = None;
     let reading = async {
         let _ = services::attempt_clock();
@@ -3209,7 +3281,7 @@ async fn reply(
     };
     let reply = read.and_then(|()| {
         let events = events.ok_or_else(llm::Error::incomplete)?;
-        events.finish(Some(model.origin(request)))
+        events.finish(Some(origin))
     });
     match reply {
         Ok(reply) => replied(Ok(reply)),

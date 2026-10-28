@@ -268,7 +268,7 @@ fn request(
     model: &str,
     key: ProtocolKey,
     variant: usize,
-    messages: impl Into<llm::Messages>,
+    messages: impl Into<llm::Conversation>,
 ) -> Request {
     let mut request = Request {
         model: model.into(),
@@ -397,20 +397,50 @@ fn every_body_is_the_one_pinned() {
         };
         let mut hash = Fnv(0xcbf2_9ce4_8422_2325);
         let mut grown = llm::Messages::new();
+        let mut tail = llm::Messages::new();
+        let mut resident = llm::Resident::default();
+        let canonical = std::sync::Arc::new(case.messages.clone());
+        let retained = |resident: &llm::Resident, tail: &llm::Messages, at: usize| {
+            let canonical = std::sync::Arc::clone(&canonical);
+            let conversation =
+                llm::Conversation::retained(resident.clone(), tail.clone(), move || {
+                    Ok(canonical[..=at].to_vec().into())
+                });
+            sent(
+                &case.provider,
+                &request(case.model, key, case.variant, conversation),
+            )
+        };
         for (at, message) in case.messages.iter().enumerate() {
             match message {
                 Message::Tool(tool) if tool.results.len() > 1 => {
                     let first = tool.results[..1].to_vec();
+                    tail.push(Message::Tool(ToolMessage {
+                        results: first.clone(),
+                    }));
                     grown.push(Message::Tool(ToolMessage { results: first }));
-                    send(grown.clone());
+                    assert_eq!(retained(&resident, &tail, at), send(grown.clone()));
+                    if let Some(Message::Tool(last)) = tail.last_mut() {
+                        last.results.extend_from_slice(&tool.results[1..]);
+                    }
                     if let Some(Message::Tool(last)) = grown.last_mut() {
                         last.results.extend_from_slice(&tool.results[1..]);
                     }
                 }
-                message => grown.push(message.clone()),
+                message => {
+                    grown.push(message.clone());
+                    tail.push(message.clone());
+                }
             }
             let whole = send(case.messages[..=at].to_vec().into());
             let body = send(grown.clone());
+            assert_eq!(
+                retained(&resident, &tail, at),
+                whole,
+                "{} retained at {at}",
+                case.label
+            );
+            resident.retain(&mut tail);
             assert!(
                 body == whole,
                 "{} at {at}:\n grown: {}\n whole: {}",

@@ -380,6 +380,7 @@ impl Daemon {
 
     /// `handed` is what the previous build handed over: the sessions it
     /// names load at once, too, to take their groups up.
+    #[allow(clippy::too_many_lines)]
     fn load_on(
         home: &Home,
         config: &Config,
@@ -419,6 +420,10 @@ impl Daemon {
             http: http_clients.client(transport::RedirectPolicy::Follow),
         };
         let registry = ext::host::Current::new(config.registry().map_err(io::Error::other)?);
+        let lifetimes = Arc::new(ext::Lifetimes::new({
+            let rt = Arc::clone(&rt);
+            Arc::new(move |task| rt.spawn(task))
+        }));
         let daemon = Arc::new_cyclic(|daemon| Self {
             shared: Arc::new(Shared {
                 http_clients: std::sync::OnceLock::from(http_clients),
@@ -445,6 +450,7 @@ impl Daemon {
             stopping: Mutex::new(None),
             queried: Arc::new(
                 ext::host::SessionServices::default()
+                    .with::<ext::Lifetimes>(lifetimes)
                     .with::<dyn rt::Runtime>(runtime.clone())
                     .with::<rt::watch::Hub>(hub),
             ),
@@ -1012,6 +1018,9 @@ impl Daemon {
 
     async fn shutdown_until(&self, mut grace: rt::BoxFuture<'_, ()>) {
         *lock(&self.admission) = false;
+        if let Some(lifetimes) = self.queried.get::<ext::Lifetimes>() {
+            lifetimes.close();
+        }
         loop {
             let ending: Vec<Flag> = self
                 .slots()
@@ -1022,6 +1031,23 @@ impl Daemon {
                 })
                 .collect();
             if ending.is_empty() {
+                let ended = rt::or(
+                    async {
+                        if let Some(lifetimes) = self.queried.get::<ext::Lifetimes>() {
+                            lifetimes.ended().await;
+                        }
+                        true
+                    },
+                    async {
+                        grace.as_mut().await;
+                        false
+                    },
+                )
+                .await;
+                if !ended {
+                    fact(Fact::ShutdownExpired { sessions: 0 });
+                    return;
+                }
                 let shared = Arc::clone(&self.shared);
                 rt::unblock(&*Arc::clone(&shared.rt), move || {
                     if let Err(e) = shared.catalog.clean() {

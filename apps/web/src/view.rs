@@ -84,7 +84,7 @@ pub fn chat_page(session: SessionId, tab: &str) -> String {
     let title = format!("a · {}", session.short());
     html(maud! {
         Document title=(&title) {
-            header style=(style::BAR) data-signals={ "{tab: '" (tab) "', draft: '', admitted: null}" } {
+            header style=(style::BAR) data-signals={ "{tab: '" (tab) "', draft: '', admitted: false}" } {
                 a style=(style::BRAND) href="/" { "← a" }
                 span style=(style::MONO) { (format_args!("{}", session.short())) }
                 TitleSpan title=(None);
@@ -97,7 +97,7 @@ pub fn chat_page(session: SessionId, tab: &str) -> String {
             }
             div style=(style::COMPOSER_BAR) {
                 form style=(style::COMPOSER)
-                    data-effect="if ($admitted !== null) { if ($draft === $admitted) $draft = ''; $admitted = null; }"
+                    data-effect="if ($admitted !== false) { if ($draft === $admitted) $draft = ''; $admitted = false; }"
                     data-on:submit="$draft.trim() && @post('/api/send')" {
                     input style=(style::INPUT) name="text" placeholder="Message" autocomplete="off"
                         autofocus data-bind:draft;

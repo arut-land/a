@@ -512,6 +512,7 @@ struct Probe {
     /// The entries loads read, and the snapshots kept, by what they cover.
     read: Arc<AtomicUsize>,
     snapshots: Arc<Mutex<Vec<u64>>>,
+    snapshot_reads: Arc<Mutex<Vec<u64>>>,
     observe_write: Arc<Mutex<Option<Box<WriteObserver>>>>,
 }
 
@@ -565,6 +566,11 @@ impl Log for Probed {
 }
 
 impl LogStore for Probe {
+    fn read_snapshot(&self, id: SessionId, covers: u64) -> Option<Snapshot> {
+        lock(&self.snapshot_reads).push(covers);
+        self.store.read_snapshot(id, covers)
+    }
+
     fn prefix(&self, id: SessionId, seq: u64) -> io::Result<Vec<Entry>> {
         self.store.prefix(id, seq)
     }
@@ -2485,6 +2491,178 @@ fn a_session_loads_from_its_snapshot_and_reads_only_the_suffix() {
             (log.len() as u64 + 2, &echo("again")),
         ]
     );
+}
+
+#[test]
+#[ignore = "a measurement"]
+fn bench_reconstructing_a_warm_session_from_its_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(crate::store::Jsonl::open(dir.path()).unwrap());
+    let fixture = Fixture::on(
+        store,
+        ext_fixtures::ECHO,
+        echoing(&Policy::default()),
+        openai(&Script::new(&[])),
+    );
+    let session = fixture.create();
+    session.submit(&"x".repeat(5 << 20)).unwrap();
+    settle(&session);
+    session.barrier();
+    session.submit("after").unwrap();
+    settle(&session);
+    let states = lock(&session.session.state_view()).image().unwrap();
+    for _ in 0..9 {
+        let registry = echoing(&Policy::default());
+        let start = Instant::now();
+        fixture.0.registry.replace(registry);
+        session.send(Msg::Step(Event::Note {
+            call: id(999),
+            note: Note::Progress("ignored".into()),
+        }));
+        session.barrier();
+        println!("reconstruction_us={}", start.elapsed().as_micros());
+        assert_eq!(lock(&session.session.state_view()).image().unwrap(), states);
+    }
+    session.halt();
+}
+
+#[test]
+fn generation_reconstruction_reads_its_stored_checkpoint_only_on_demand() {
+    let probe = Probe::default();
+    let fixture = Fixture::on(
+        Arc::new(probe.clone()),
+        ext_fixtures::ECHO,
+        echoing(&Policy::default()),
+        openai(&Script::new(&[])),
+    );
+    let header = Fixture::header();
+    let session = Live::start(&header, &fixture.0, Open::Create, Owner::None).unwrap();
+    session
+        .submit(&"x".repeat(usize::try_from(SNAPSHOT_EVERY).unwrap()))
+        .unwrap();
+    settle(&session);
+    session.barrier();
+    let covers = *lock(&probe.snapshots).last().unwrap();
+    session.submit("after").unwrap();
+    settle(&session);
+    let states = lock(&session.session.state_view()).image().unwrap();
+    assert!(lock(&probe.snapshot_reads).is_empty());
+
+    fixture.0.registry.replace(echoing(&Policy::default()));
+    session.send(Msg::Step(Event::Note {
+        call: id(999),
+        note: Note::Progress("ignored".into()),
+    }));
+    session.barrier();
+    assert_eq!(*lock(&probe.snapshot_reads), [covers]);
+    assert_eq!(lock(&session.session.state_view()).image().unwrap(), states);
+    session.halt();
+
+    let session = Live::start(&header, &fixture.0, Open::Load, Owner::None).unwrap();
+    settle(&session);
+    fixture.0.registry.replace(echoing(&Policy::default()));
+    session.send(Msg::Step(Event::Note {
+        call: id(999),
+        note: Note::Progress("ignored".into()),
+    }));
+    session.barrier();
+    assert_eq!(*lock(&probe.snapshot_reads), [covers, covers]);
+    assert_eq!(lock(&session.session.state_view()).image().unwrap(), states);
+    session.halt();
+}
+
+#[test]
+fn stored_checkpoint_identity_survives_a_cut_before_the_next_append() {
+    let dir = tempfile::tempdir().unwrap();
+    for backing in [
+        Arc::new(crate::store::Jsonl::open(dir.path()).unwrap()) as Arc<dyn LogStore>,
+        Arc::new(Memory::default()),
+    ] {
+        let store = crate::store::Faulty::new(Arc::clone(&backing));
+        let header = Fixture::header();
+        let other = Fixture::header();
+        let mut loaded = store.create(&header).unwrap();
+        loaded.append(echo("before")).unwrap();
+        let snapshot = Snapshot {
+            covers: 1,
+            image: Json::encode(&"checkpoint").unwrap(),
+        };
+        loaded.writer.snapshot(&snapshot).unwrap();
+        assert_eq!(store.read_snapshot(header.id, 1), Some(snapshot.clone()));
+        assert_eq!(store.read_snapshot(other.id, 1), None);
+        loaded
+            .writer
+            .append(
+                &mut [entry(2, echo("lost"))],
+                crate::store::AppendMode::Write,
+            )
+            .unwrap();
+        store.cut();
+        drop(loaded);
+
+        let mut offered = None;
+        let mut suffix = Vec::new();
+        let mut loaded = backing
+            .load(
+                header.id,
+                &mut |snapshot| {
+                    offered = Some(snapshot);
+                    true
+                },
+                &mut |entry| suffix.push(entry),
+            )
+            .unwrap();
+        assert_eq!(offered, Some(snapshot.clone()));
+        assert_eq!(suffix, []);
+        assert_eq!(loaded.seq, 1);
+        assert_eq!(store.read_snapshot(header.id, 1), Some(snapshot));
+        loaded.append(echo("after")).unwrap();
+        let newer = Snapshot {
+            covers: 2,
+            image: Json::encode(&"new checkpoint").unwrap(),
+        };
+        loaded.writer.snapshot(&newer).unwrap();
+        assert_eq!(backing.read_snapshot(header.id, 1), None);
+        assert_eq!(backing.read_snapshot(header.id, 2), Some(newer));
+    }
+}
+
+#[test]
+fn a_missing_stored_checkpoint_reconstructs_the_generation_from_the_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(crate::store::Jsonl::open(dir.path()).unwrap());
+    let fixture = Fixture::on(
+        store,
+        ext_fixtures::ECHO,
+        echoing(&Policy::default()),
+        openai(&Script::new(&[])),
+    );
+    let session = fixture.create();
+    session
+        .submit(&"x".repeat(usize::try_from(SNAPSHOT_EVERY).unwrap()))
+        .unwrap();
+    settle(&session);
+    session.barrier();
+    session.submit("after").unwrap();
+    settle(&session);
+    let before = session.session.state_view();
+    let states = lock(&before).image().unwrap();
+    std::fs::remove_file(
+        dir.path()
+            .join(session.id.to_string())
+            .join("derived/log.snap"),
+    )
+    .unwrap();
+    fixture.0.registry.replace(echoing(&Policy::default()));
+    session.send(Msg::Step(Event::Note {
+        call: id(999),
+        note: Note::Progress("ignored".into()),
+    }));
+    session.barrier();
+    let after = session.session.state_view();
+    assert!(!Arc::ptr_eq(&before, &after), "the generation was adopted");
+    assert_eq!(lock(&after).image().unwrap(), states);
+    session.halt();
 }
 
 /// #57: the entries of one step are committed together: one write and

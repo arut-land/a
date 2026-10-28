@@ -77,7 +77,11 @@ fn run(messages: Vec<Message>) -> Vec<Message> {
         provider: &provider,
         model: "m",
     };
-    prepare(&request, &target).messages.to_vec()
+    prepare(&request, &target)
+        .messages
+        .canonical()
+        .unwrap()
+        .to_vec()
 }
 
 #[test]
@@ -238,12 +242,12 @@ fn legal_and_normalised_call_ids_remain_distinct_and_results_follow_them() {
             model: "m",
         };
         let out = prepare(&request, &target);
-        let Message::Assistant(assistant) = &out.messages[0] else {
+        let Message::Assistant(assistant) = &out.messages.canonical().unwrap()[0] else {
             panic!()
         };
         let calls: Vec<_> = assistant.tool_calls().map(|c| c.id.clone()).collect();
         assert_ne!(calls[0], calls[1]);
-        let Message::Tool(tool) = &out.messages[1] else {
+        let Message::Tool(tool) = &out.messages.canonical().unwrap()[1] else {
             panic!()
         };
         assert_eq!(
@@ -290,7 +294,7 @@ fn separate_turns_keep_distinct_ids_and_all_results_even_with_native_calls() {
                 },
             );
             let mut ids = Vec::new();
-            for pair in out.messages.as_chunks::<2>().0 {
+            for pair in out.messages.canonical().unwrap().as_chunks::<2>().0 {
                 let Message::Assistant(assistant) = &pair[0] else {
                     panic!()
                 };

@@ -10,11 +10,11 @@ mod tests;
 
 use std::collections::{BTreeMap, HashSet};
 
-use super::editor::{Edit, Editor};
+use super::editor::{Edit, Editor, HistoryEntry};
 use super::keys::{Input, Key, Mouse};
 use super::render::{Canvas, Viewport};
 use super::text::{Action, Color, Line, Style};
-use super::view::{Live, MUTED};
+use super::view::{CardCursor, Cursor, MUTED};
 use client::{Cmd, Env, Link, Renderer, SessionClient, Show};
 use protocol::view::{Change, Item, SessionView, Update, Usage, mismatch_line};
 use protocol::{HostPath, SessionSummary, Target};
@@ -57,8 +57,12 @@ struct Summary {
 struct Rows {
     width: usize,
     lines: Vec<Line>,
-    /// A reply streaming in: how far its text was wrapped.
-    live: Option<Live>,
+    /// Layout indexes borrow their source from the session view.
+    cursor: Option<Cursor>,
+    card: Option<CardCursor>,
+    start: usize,
+    total: usize,
+    streaming: bool,
 }
 
 // Screen toggles and the frame owed, each read where it is set.
@@ -79,6 +83,7 @@ pub struct App {
     width: usize,
     body: u16,
     editor: Editor,
+    input_session: Option<protocol::SessionId>,
     /// The slash menu's selected command.
     menu_at: Option<usize>,
     /// The approval list's highlight: Yes until moved to No.
@@ -179,6 +184,7 @@ impl App {
             width: 0,
             body: 0,
             editor: Editor::default(),
+            input_session: None,
             menu_at: Some(0),
             deny: false,
             overlay: None,
@@ -229,6 +235,12 @@ impl App {
     /// Has the session client carry out `cmd`; returns what the driver is
     /// to do.
     pub fn command(&mut self, cmd: Cmd) -> Vec<client::Effect> {
+        if let Cmd::Open(target) = &cmd
+            && !matches!(target, Target::Id(id) if Some(*id) == self.input_session)
+        {
+            self.editor.clear();
+            self.input_session = None;
+        }
         if let Cmd::Approve { .. } = cmd {
             self.deny = false;
         }
@@ -285,6 +297,10 @@ impl App {
                     self.overlay = None;
                 }
                 if reset {
+                    if self.input_session.is_some() && self.input_session != self.view().session {
+                        self.editor.clear();
+                    }
+                    self.input_session = self.view().session;
                     self.cache.clear();
                     self.collapsed.clear();
                     self.anchor = None;
@@ -295,10 +311,7 @@ impl App {
                     self.flash = None;
                 }
             }
-            Change::Added { index, item } => {
-                if let Item::User { text, .. } = &item {
-                    self.editor.remember(text);
-                }
+            Change::Added { index, .. } => {
                 self.cache.remove(&index);
             }
             Change::Updated { index, .. } => {
@@ -445,14 +458,14 @@ impl App {
                         if args {
                             self.editor.insert(" ");
                         } else if key == Key::Enter
-                            && let Edit::Submit(input) = self.editor.key(Key::Enter)
+                            && let Edit::Submit(input) = self.edit(Key::Enter)
                         {
                             return self.submit(input);
                         }
                     }
                     key => {
                         self.menu_at = Some(0);
-                        if let Edit::Submit(input) = self.editor.key(key) {
+                        if let Edit::Submit(input) = self.edit(key) {
                             return self.submit(input);
                         }
                     }
@@ -460,6 +473,46 @@ impl App {
             }
         }
         None
+    }
+
+    fn edit(&mut self, key: Key) -> Edit {
+        let view = self.client.view();
+        self.editor.key_with_history(key, || {
+            let mut previous = None;
+            view.items
+                .iter()
+                .filter_map(|item| {
+                    if self.input_session != view.session {
+                        return None;
+                    }
+                    match item {
+                        Item::User { text, .. } => Some(HistoryEntry::Text(text.trim())),
+                        Item::Tool {
+                            tool,
+                            input,
+                            by: protocol::Audience::User,
+                            ..
+                        } => Some(HistoryEntry::Command { tool, input }),
+                        _ => None,
+                    }
+                })
+                .filter(move |entry| {
+                    let HistoryEntry::Text(text) = entry else {
+                        previous = None;
+                        return true;
+                    };
+                    let distinct = previous != Some(*text);
+                    previous = Some(*text);
+                    distinct && !text.is_empty()
+                })
+                .chain(
+                    view.state
+                        .queued()
+                        .filter(|q| self.input_session == view.session && q.source.visible())
+                        .map(|q| HistoryEntry::Text(&q.text)),
+                )
+                .chain(self.client.pending_inputs().map(HistoryEntry::Segments))
+        })
     }
 
     fn overlay_key(&mut self, key: Key) -> Option<Effect> {
@@ -726,7 +779,11 @@ mod display_tests {
                     Rows {
                         width: 80,
                         lines: Vec::new(),
-                        live: None,
+                        cursor: None,
+                        card: None,
+                        start: 0,
+                        total: 0,
+                        streaming: false,
                     },
                 )
             })

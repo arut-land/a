@@ -16,6 +16,7 @@ mod awake;
 pub mod config;
 pub mod console;
 pub mod crash;
+pub mod credentials;
 mod desktop;
 #[cfg(windows)]
 mod directory_watch;

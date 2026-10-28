@@ -330,7 +330,12 @@ pub(crate) fn prepare(request: &crate::spec::Request, target: &Target<'_>) -> cr
 
     let (mut pass, mut sent) = (Prepare::default(), Sent(Vec::new()));
     let mut out = Settled::default();
-    for message in request.messages.iter() {
+    for message in request
+        .messages
+        .canonical()
+        .expect("test canonical input")
+        .iter()
+    {
         let _ = pass.push(target, message, &mut sent, &mut out);
     }
     let _ = pass.finish(&mut sent, &mut out);

@@ -63,6 +63,15 @@ browser tab ──GET /s/<id>/events?tab=…──> Live: SessionClient + Page +
   the source (`assets/datastar-1.0.4.js.zz`, 13 KB of 34), embedded and
   served compressed under a versioned path so browsers keep it. A unit test
   inflates it and holds it to the `.js` byte for byte.
+- **Composer admission**: `admitted` is `false` until the server accepts a
+  draft, then holds that draft until the effect consumes it. The effect
+  clears the composer only if it still contains the accepted text, and
+  resets `admitted` to `false`. Datastar [removes signals assigned
+  `null`](https://data-star.dev/reference/attributes#data-signals); reading
+  a missing signal creates an empty string. Using `null` here caused the
+  effect to repeatedly read and remove its own dependency, overflowing the
+  browser stack even in an empty chat. Keeping the signal present removes
+  that loop without changing Datastar or transcript patches.
 
 ## Running and testing
 
@@ -78,6 +87,24 @@ browser tab ──GET /s/<id>/events?tab=…──> Live: SessionClient + Page +
 - Unit tests: the gate (`a_host_is_ours_on_our_port_only`, the cookie and
   handoff rules), the page's patches for an attach, a delta and an update,
   the event framing, the embedded script.
+- Browser regression: `a_live_composer_never_throws_or_discards_a_newer_draft`
+  runs the served page and committed Datastar in real headless Chromium,
+  catches uncaught exceptions from initial attach through live echo turns,
+  and preserves edits made while an admission response is pending. It is
+  part of `mise run test:web` and the full suite, without an ignore marker.
+  `test:web` requires Node and npm and prepares `playwright-core@1.64.1`
+  before running the tests. It uses installed Google Chrome on Linux and
+  macOS; without Chrome it downloads the Chromium revision pinned by that
+  driver. CI runs `test:web` before the full suite, using the runner image's
+  Chrome and Node. Direct Cargo invocations need this preparation once:
+  `node apps/web/test-browser.mjs`.
+  The driver and downloaded browser live under `CARGO_TARGET_DIR` when set,
+  otherwise the OS temporary directory, never in the source tree.
+  The driver has no npm dependencies and adds no Rust or shipped dependency;
+  it exercises the actual Datastar signal engine that expression-only tests
+  cannot cover. On the M3, the driver-only install added one package
+  (13.3 MiB; npm reported 658 ms), with no browser download when using
+  installed Chrome.
 
 ## Known costs
 

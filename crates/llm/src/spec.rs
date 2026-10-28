@@ -73,7 +73,7 @@ pub struct Request {
     pub model: SmolStr,
     /// The conversation. Leading system messages are the system prompt;
     /// later ones are instructions given mid-conversation.
-    pub messages: Messages,
+    pub messages: crate::Conversation,
     #[serde(default, skip_serializing_if = "Tools::is_empty")]
     pub tools: Tools,
     #[serde(default, skip_serializing_if = "ToolChoice::is_auto")]

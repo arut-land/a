@@ -20,6 +20,7 @@ use protocol::{
 /// Provider replies remain intact; live updates and recovery share projection rules.
 pub struct Transcript {
     messages: Messages,
+    resident: llm::Resident,
     model_only: bool,
     /// Where the next context message goes: after the system prompt and
     /// the context before it.
@@ -374,6 +375,7 @@ impl Transcript {
         Self {
             context: messages.len(),
             messages,
+            resident: llm::Resident::default(),
             model_only: false,
             calls: HashMap::new(),
             answered: Vec::new(),
@@ -391,7 +393,11 @@ impl Transcript {
 
     /// Folds entry `e`. `fresh` is the message of the reply this daemon
     /// just had, which `e` stores: taken as it is rather than read again.
-    pub fn apply(&mut self, e: &Entry, fresh: Option<Assistant>) {
+    pub fn apply(&mut self, e: &Entry, fresh: Option<Assistant>) -> bool {
+        self.retain();
+        if !self.accepts(e) {
+            return false;
+        }
         self.through = e.seq.get();
         if let Body::Spawned { intent } = &e.body {
             if let Ok(image) = protocol::publication::SpawnImage::from_json(intent) {
@@ -413,6 +419,7 @@ impl Transcript {
         } else if let Some(value) = context_fact(&e.body) {
             self.apply_input(e.seq, value, fresh);
         }
+        true
     }
 
     fn inherit(&mut self, messages: &Messages, seq: Seq) {
@@ -687,9 +694,29 @@ impl Transcript {
         Arc::ptr_eq(&self.registry, registry)
     }
 
-    /// The conversation before entry `before`, if it is all of it.
-    pub fn before(&self, before: u64) -> Option<&Messages> {
-        (self.last < before).then_some(&self.messages)
+    pub(super) fn retain(&mut self) {
+        self.resident.retain(&mut self.messages);
+    }
+
+    pub(super) fn accepts(&self, entry: &Entry) -> bool {
+        if !self.resident.has_prefix() {
+            return true;
+        }
+        match entry.body {
+            Body::Context { .. } | Body::Spawned { .. } | Body::Edit { .. } => false,
+            Body::ToolResult { .. } | Body::Take { into: Some(_), .. } => !self.messages.is_empty(),
+            _ => true,
+        }
+    }
+
+    pub(super) fn request_before(
+        &self,
+        before: u64,
+        restore: impl Fn() -> Result<Messages, llm::Error> + Send + Sync + 'static,
+    ) -> Option<llm::Conversation> {
+        (self.last < before).then(|| {
+            llm::Conversation::retained(self.resident.clone(), self.messages.clone(), restore)
+        })
     }
 
     /// Pending exchanges cannot be replayed by a context-only child.
@@ -1172,5 +1199,79 @@ mod tests {
         assert_eq!(plain, llm::Output::Json(Json::encode("ok").unwrap()));
         let shown = output(Registry::default().with(&Shown).unwrap());
         assert_eq!(shown, llm::Output::Text(format!("t said {plain:?}")));
+    }
+
+    #[test]
+    fn an_encoded_tool_tail_is_reconstructed_before_a_late_join() {
+        let registry = Arc::new(Registry::default());
+        let mut entries = vec![
+            entry(
+                1,
+                Body::ToolCall {
+                    invoke: None,
+                    tool: "t".into(),
+                    input: Json::null(),
+                    id: Some("c1".into()),
+                    card: None,
+                    by: protocol::Audience::Model,
+                },
+            ),
+            entry(
+                2,
+                Body::ToolResult {
+                    call: CallId::new(1).unwrap(),
+                    outcome: Outcome::Done {
+                        output: Json::encode("ok").unwrap().into(),
+                    },
+                    card: None,
+                    held: Vec::new(),
+                },
+            ),
+            entry(3, input("later", Mode::Queue, false)),
+        ];
+        let mut transcript = Transcript::of(&entries, Arc::clone(&registry), "");
+        let saved = entries.clone();
+        let source_registry = Arc::clone(&registry);
+        let request = llm::Request {
+            model: "m".into(),
+            messages: transcript
+                .request_before(4, move || {
+                    Ok(Transcript::of(&saved, Arc::clone(&source_registry), "").into_messages())
+                })
+                .unwrap(),
+            ..llm::Request::default()
+        };
+        let provider = llm::Provider::new(
+            "openai",
+            "http://127.0.0.1:1",
+            llm::Auth::None,
+            llm::protocols::chat::Chat::new(llm::protocols::chat::HOSTS[0].1),
+        );
+        let prepared = llm::prepare_request(&provider, &request);
+        drop(request);
+        transcript.retain();
+        assert!(transcript.messages.is_empty());
+        let joined = entry(
+            4,
+            Body::Take {
+                input: Seq::new(3).unwrap(),
+                into: Some(CallId::new(1).unwrap()),
+            },
+        );
+        assert!(!transcript.apply(&joined, None));
+        entries.push(joined);
+        let replayed = Transcript::of(&entries, registry, "").into_messages();
+        let Some(Message::Tool(tool)) = replayed.last() else {
+            panic!("joined tool result")
+        };
+        let llm::Output::Content(parts) = &tool.results[0].output else {
+            panic!("joined content")
+        };
+        assert!(
+            parts
+                .iter()
+                .any(|part| matches!(part, llm::UserPart::Text(text) if text.text == "later"))
+        );
+        std::hint::black_box(prepared.origin());
     }
 }

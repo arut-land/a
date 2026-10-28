@@ -39,6 +39,11 @@ pub trait Record: Send + Sync {
 
 /// Launch and live ownership are one operation; numeric ids are recovery facts.
 pub trait Processes: Send + Sync {
+    /// A launch port that retains only runtime facilities. Shared callers supply
+    /// declaration-owned cwd/env and an already admitted scope-owned spawn policy;
+    /// this port never runs the first caller's session hooks.
+    fn launcher(&self, cx: &Cx) -> Result<Arc<dyn ProcessLauncher>, SpawnError>;
+
     fn spawn<'a>(
         &'a self,
         cx: &'a Cx,
@@ -56,6 +61,28 @@ pub trait Processes: Send + Sync {
         Box::pin(std::future::ready(Err(
             std::io::ErrorKind::Unsupported.into()
         )))
+    }
+}
+
+/// Session-free launch authority, supplied by the native process provider.
+/// The owner's cancellation is independent of any individual request.
+pub trait ProcessLauncher: Send + Sync {
+    fn spawn(
+        &self,
+        cancel: crate::Cancel,
+        launch: LaunchSpec,
+    ) -> BoxFuture<'static, Result<OwnedProcess, SpawnError>>;
+}
+
+impl crate::ScopedResource for OwnedProcess {
+    fn ended(&self) -> BoxFuture<'_, ()> {
+        self.process.ended()
+    }
+    fn close(&self) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            let _ = self.signal(ProcessSignal::Kill);
+            self.process.ended().await;
+        })
     }
 }
 

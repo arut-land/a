@@ -18,20 +18,20 @@ _.file = { path = ".env.local", redact = true }
 shell = "bash -o errexit -o pipefail -c"
 
 [tools]
-mr-boxington = "1.24.1"
-"cargo:cargo-nextest" = "0.9"
-"cargo:cargo-deny" = "0.20"
-"cargo:cargo-machete" = "0.9.2"
+mr-boxington = { version = "latest", workflow = "release.yml@refs/heads/main" }
+"cargo:cargo-nextest" = "latest"
+"cargo:cargo-deny" = "latest"
+"cargo:cargo-machete" = "latest"
 # Coverage-guided runs of the bolero targets (`mise run fuzz`).
-"cargo:cargo-bolero" = "0.13.5"
-mold = { version = "3.0.0", os = ["linux"] }
-hyperfine = "2.0.0"
-"cargo:cargo-bloat" = "0.12.1"
-"cargo:cargo-llvm-lines" = "0.4.48"
-# The macOS app (apps/apple): the BoltFFI CLI at exactly the version of the
-# crates/ffi dependency, and XcodeGen for its project.
+"cargo:cargo-bolero" = "latest"
+mold = { version = "latest", os = ["linux"] }
+hyperfine = "latest"
+"cargo:cargo-bloat" = "latest"
+"cargo:cargo-llvm-lines" = "latest"
+# The macOS app (apps/apple): the BoltFFI CLI pinned to exactly the version of
+# the crates/ffi dependency, and XcodeGen for its project.
 "github:boltffi/boltffi" = { version = "0.31.1", os = ["macos"] }
-"aqua:yonaskolb/XcodeGen" = { version = "2.46.0", os = ["macos"] }
+"aqua:yonaskolb/XcodeGen" = { version = "latest", os = ["macos"] }
 
 [wrappers.cargo]
 command = "mbx"
@@ -144,7 +144,10 @@ trap 'target/debug/a daemon stop >/dev/null' EXIT
 target/debug/a web
 '''
 # The black-box web UI tests (apps/cli/tests/blackbox/web.rs) on the dev build.
-"test:web" = "cargo nextest run -p a --test blackbox -E 'test(/^web::/)' --no-tests=fail"
+"test:web" = { run = [
+    "node apps/web/test-browser.mjs",
+    "cargo nextest run -p a --test blackbox -E 'test(/^web::/)' --no-tests=fail",
+] }
 # Cold start, attach latency and idle daemon RSS on a release build that
 # differs from the shipped one only by the test fixtures (built aside, in
 # target/fixtures). That `a` as shipped lacks them is read off the

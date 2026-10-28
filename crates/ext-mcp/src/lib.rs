@@ -1,11 +1,17 @@
 //! Lazy MCP tools, over stdio or the model HTTP transport. Discovery is a
 //! logged tool result, never an eager part of assembling a session.
 
+/// Default public native-client identity; hosting is managed by the owner.
+pub const OAUTH_CLIENT_ID: &str = "https://arut.land/.well-known/oauth-client/a.json";
+
 mod discovery;
 mod headers;
 mod incoming;
 mod name;
+mod oauth;
 pub use name::{ServerName, ToolName};
+pub use oauth::Authorizations;
+mod redirect;
 mod rpc;
 mod stdio;
 
@@ -44,6 +50,8 @@ struct Inner {
     servers: Vec<Server>,
     timeout: Duration,
     clients: Mutex<HashMap<(SessionId, ServerName), stdio::Client>>,
+    registrations: BTreeMap<ServerName, oauth::Registration>,
+    auth: Authorizations,
 }
 
 struct RemoteTool {
@@ -57,6 +65,15 @@ fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl Mcp {
     pub fn new(servers: Vec<Server>, timeout: Duration) -> Result<Self, Refused> {
+        Self::with_authorizations(servers, timeout, Authorizations::default())
+    }
+
+    /// Composes MCP instances that share one daemon's credential lifecycles.
+    pub fn with_authorizations(
+        servers: Vec<Server>,
+        timeout: Duration,
+        authorizations: Authorizations,
+    ) -> Result<Self, Refused> {
         if servers.len() > 64 {
             return Err(Refused("ext.mcp: at most 64 servers".into()));
         }
@@ -90,6 +107,8 @@ impl Mcp {
             servers,
             timeout,
             clients: Mutex::default(),
+            registrations: BTreeMap::new(),
+            auth: authorizations,
         })))
     }
 
@@ -156,7 +175,22 @@ impl Mcp {
                     }
                     result
                 }
-                Transport::Http(url) => rpc::http(url, method, params, headers, cx).await,
+                Transport::Http(url) => {
+                    rpc::http_authorized(
+                        url,
+                        method,
+                        params,
+                        headers,
+                        oauth::Connection {
+                            server: server.name.clone(),
+                            registration: self.0.registrations.get(&server.name).cloned(),
+                            authorizations: self.0.auth.clone(),
+                            timeout: self.0.timeout,
+                        },
+                        cx,
+                    )
+                    .await
+                }
             }
         };
         rt::or(work, async {
@@ -240,6 +274,7 @@ impl Mcp {
 impl Configured for Mcp {
     fn configure(table: &impl Table) -> Result<Self, Refused> {
         let mut servers = Vec::new();
+        let mut registrations = BTreeMap::new();
         for name in table.list("servers")?.unwrap_or_default() {
             let name: ServerName = name.parse().map_err(Refused)?;
             let argv = table.list(&name)?;
@@ -254,6 +289,22 @@ impl Configured for Mcp {
                     )));
                 }
             };
+            match (
+                table.text(&format!("{name}_client_id"))?,
+                table.text(&format!("{name}_issuer"))?,
+            ) {
+                (None, None) => {}
+                (Some(id), Some(issuer)) if matches!(transport, Transport::Http(_)) => {
+                    let registration =
+                        oauth::Registration::new(id, issuer).map_err(|e| Refused(e.to_string()))?;
+                    registrations.insert(name.clone(), registration);
+                }
+                _ => {
+                    return Err(Refused(format!(
+                        "ext.mcp.{name}: client_id and issuer require an HTTP server and must be supplied together"
+                    )));
+                }
+            }
             let mut env = BTreeMap::new();
             for entry in table.list(&format!("{name}_env"))?.unwrap_or_default() {
                 let (key, value) = entry
@@ -272,10 +323,14 @@ impl Configured for Mcp {
                 env,
             });
         }
-        Self::new(
+        let mut mcp = Self::new(
             servers,
             Duration::from_secs(table.whole("timeout_secs")?.unwrap_or(120)),
-        )
+        )?;
+        Arc::get_mut(&mut mcp.0)
+            .expect("new MCP instance")
+            .registrations = registrations;
+        Ok(mcp)
     }
 }
 
@@ -302,7 +357,18 @@ impl Extension for Mcp {
         r.text(Text::generation("mcp-index", 30, index))
             .tool(List(self.clone()))
             .tool(Schema(self.clone()))
-            .tool(Call(self.clone()));
+            .tool(Call(self.clone()))
+            .tool(oauth::Authorize)
+            .on::<ext::point::Permission>(|_, call| {
+                if call.tool == <oauth::Authorize as Tool>::NAME {
+                    protocol::Permission::Ask(protocol::ApprovalReason::OperatorRule {
+                        tool: call.tool.into(),
+                        input: None,
+                    })
+                } else {
+                    protocol::Permission::Allow
+                }
+            });
     }
 }
 
@@ -506,6 +572,15 @@ mod publication_tests {
     use ext::testing::Rig;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    struct IsolatedCredentials(sys::credentials::Credentials);
+    impl Extension for IsolatedCredentials {
+        const NAME: &'static str = "isolated-credentials";
+        const VERSION: u32 = 1;
+        fn contribute(&self, r: &mut Registrar) {
+            r.provide(Arc::new(self.0.clone()));
+        }
+    }
+
     #[derive(Clone, Default)]
     struct Schemas(Arc<AtomicUsize>);
 
@@ -545,7 +620,7 @@ mod publication_tests {
     }
 
     #[test]
-    fn http_only_mcp_needs_no_process_provider() {
+    fn public_http_needs_neither_a_process_provider_nor_credential_access() {
         let mcp = Mcp::new(
             vec![Server {
                 name: ServerName::try_from("http-only".to_owned()).unwrap(),
@@ -556,7 +631,13 @@ mod publication_tests {
             Duration::from_secs(5),
         )
         .unwrap();
+        let home = Rig::new("mcp-home", Registry::default());
+        std::fs::write(home.dir.join("credentials"), b"not a credential directory").unwrap();
         let registry = Registry::default()
+            .with(&IsolatedCredentials(
+                sys::credentials::Credentials::isolated(home.dir.join("credentials")),
+            ))
+            .unwrap()
             .with(&Schemas::default())
             .unwrap()
             .with(&mcp)
@@ -575,9 +656,16 @@ mod publication_tests {
 
     #[test]
     fn publication_keys_do_not_repeat_the_published_content() {
+        let home = Rig::new("mcp-home", Registry::default());
         let rig = Rig::new(
             "remote-schema-identity",
-            Registry::default().with(&Schemas::default()).unwrap(),
+            Registry::default()
+                .with(&IsolatedCredentials(
+                    sys::credentials::Credentials::isolated(home.dir.join("credentials")),
+                ))
+                .unwrap()
+                .with(&Schemas::default())
+                .unwrap(),
         );
         let schema = Schema(
             Mcp::new(
