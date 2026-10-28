@@ -55,6 +55,10 @@ jobs:
       # The no-polling acceptance test traces the client's syscalls.
       - if: runner.os == 'Linux'
         run: sudo apt-get install -y --no-install-recommends clang pkg-config libssl-dev strace
+      # Use the image's Chrome and Node; install only the pinned browser driver.
+      # This also prepares the browser for the un-ignored test in the full suite.
+      - name: Web browser regression
+        run: mise run test:web
       # fmt, clippy -D warnings, then every test: unit, llm parity, and the
       # black-box M1 acceptance tests in apps/cli/tests/blackbox. The
       # release budgets run in their own jobs. Live-model tests stay
