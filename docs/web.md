@@ -63,6 +63,15 @@ browser tab ──GET /s/<id>/events?tab=…──> Live: SessionClient + Page +
   the source (`assets/datastar-1.0.4.js.zz`, 13 KB of 34), embedded and
   served compressed under a versioned path so browsers keep it. A unit test
   inflates it and holds it to the `.js` byte for byte.
+- **Composer admission**: `admitted` is `false` until the server accepts a
+  draft, then holds that draft until the effect consumes it. The effect
+  clears the composer only if it still contains the accepted text, and
+  resets `admitted` to `false`. Datastar [removes signals assigned
+  `null`](https://data-star.dev/reference/attributes#data-signals); reading
+  a missing signal creates an empty string. Using `null` here caused the
+  effect to repeatedly read and remove its own dependency, overflowing the
+  browser stack even in an empty chat. Keeping the signal present removes
+  that loop without changing Datastar or transcript patches.
 
 ## Running and testing
 
@@ -78,6 +87,20 @@ browser tab ──GET /s/<id>/events?tab=…──> Live: SessionClient + Page +
 - Unit tests: the gate (`a_host_is_ours_on_our_port_only`, the cookie and
   handoff rules), the page's patches for an attach, a delta and an update,
   the event framing, the embedded script.
+- Browser regression: `a_live_composer_never_throws_or_discards_a_newer_draft`
+  runs the served page and committed Datastar in real headless Chromium,
+  catches uncaught exceptions from initial attach through live echo turns,
+  and preserves edits made while an admission response is pending. It is
+  ignored by default because it requires Node and an external Playwright
+  installation with Chromium installed. Set `A_WEB_PLAYWRIGHT` to that
+  installation's absolute `index.mjs` path (and `PLAYWRIGHT_BROWSERS_PATH`
+  if its browsers are stored outside the default cache), then run:
+
+  ```sh
+  mise exec -- cargo nextest run -p a --test blackbox \
+    -E 'test(=web::a_live_composer_never_throws_or_discards_a_newer_draft)' \
+    --run-ignored ignored-only --no-tests=fail
+  ```
 
 ## Known costs
 

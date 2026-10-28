@@ -8,16 +8,16 @@ const expression = source.match(/data-effect="([^"]+)"/)[1];
 const apply = new Function('$draft', '$admitted', `${expression}; return { draft: $draft, admitted: $admitted };`);
 
 test('admission clears only the submitted draft', () => {
-  assert.deepEqual(apply('submitted', 'submitted'), { draft: '', admitted: null });
+  assert.deepEqual(apply('submitted', 'submitted'), { draft: '', admitted: false });
   assert.deepEqual(apply('edited while pending', 'submitted'), {
-    draft: 'edited while pending', admitted: null,
+    draft: 'edited while pending', admitted: false,
   });
 });
 
 test('rejection and consumed acknowledgements preserve subsequent drafts', () => {
-  assert.deepEqual(apply('submitted', null), { draft: 'submitted', admitted: null });
+  assert.deepEqual(apply('submitted', false), { draft: 'submitted', admitted: false });
   const acknowledged = apply('new text', 'submitted');
   assert.deepEqual(apply('submitted', acknowledged.admitted), {
-    draft: 'submitted', admitted: null,
+    draft: 'submitted', admitted: false,
   });
 });
