@@ -119,7 +119,7 @@ async fn within<T>(reactor: &Reactor, limit: Duration, work: impl Future<Output 
 /// A connection's incoming frames, taken as they arrive.
 struct Frames {
     io: Arc<Async<Stream>>,
-    buf: Vec<u8>,
+    buf: protocol::FrameReader,
     bytes: usize,
     batch: usize,
 }
@@ -128,7 +128,7 @@ impl Frames {
     fn new(io: Arc<Async<Stream>>) -> Self {
         Self {
             io,
-            buf: Vec::new(),
+            buf: protocol::FrameReader::new(),
             bytes: 0,
             batch: 0,
         }
@@ -141,22 +141,17 @@ impl Frames {
                 self.batch = 0;
                 rt::yield_now().await;
             }
-            if let Some((len, body)) = protocol::frame_in(&self.buf)? {
+            if let Some((len, msg)) = self.buf.decode()? {
                 self.batch += len.max(WRITE_BATCH / 64);
-                let msg = T::from_json(body.json()?)?;
                 self.bytes = len;
-                self.buf.drain(..len);
                 return Ok(Some(msg));
             }
             let n = self
                 .io
                 .read_with(|mut s| {
-                    // Scratch lives only while polling: an idle connection
-                    // retains received bytes, not a full read buffer. A direct
-                    // Vec read would retain the entire scratch allocation.
-                    let mut read = [0; 16 << 10];
-                    let n = s.read(&mut read)?;
-                    self.buf.extend_from_slice(&read[..n]);
+                    let mut read = self.buf.read_buffer(WRITE_BATCH)?;
+                    let n = s.read(read.as_mut())?;
+                    read.filled(n);
                     Ok(n)
                 })
                 .await?;
@@ -169,10 +164,9 @@ impl Frames {
     }
 
     /// Reads what the client sends and drops it, until it hangs up.
-    async fn drain(mut self) {
+    async fn drain(self) {
         let mut scratch = vec![0; 16 << 10];
         while let Ok(1..) = self.io.read_with(|mut s| s.read(&mut scratch)).await {}
-        self.buf.clear();
     }
 }
 
@@ -855,13 +849,13 @@ mod tests {
             Some(ClientMsg::Detach)
         ));
         assert!(
-            frames.buf.capacity() < 16 << 10,
+            frames.buf.capacity() <= WRITE_BATCH,
             "read scratch was retained"
         );
         let writer = std::thread::spawn(move || {
             ClientMsg::Hello {
                 proto: PROTO,
-                build: "x".repeat(64 << 10),
+                build: "x".repeat(5 << 20),
                 caps: Caps::NONE,
                 client: None,
                 machine: None,
@@ -872,13 +866,20 @@ mod tests {
         });
         assert!(matches!(
             rt::block_on(frames.next::<ClientMsg>()).unwrap(),
-            Some(ClientMsg::Hello { build, .. }) if build.len() == 64 << 10
+            Some(ClientMsg::Hello { build, .. }) if build.len() == 5 << 20
         ));
         let peer = writer.join().unwrap();
+        assert!(frames.buf.is_empty(), "completed frame retained input");
+        assert!(
+            frames.buf.capacity() <= WRITE_BATCH,
+            "completed frame retained heap storage"
+        );
         frames.batch = 0;
+        let mut ready = Vec::new();
         for _ in 0..65 {
-            ClientMsg::Detach.write_frame(&mut frames.buf).unwrap();
+            ClientMsg::Detach.write_frame(&mut ready).unwrap();
         }
+        frames.buf.extend_from_slice(&ready).unwrap();
         for _ in 0..64 {
             assert!(matches!(
                 rt::block_on(frames.next::<ClientMsg>()).unwrap(),

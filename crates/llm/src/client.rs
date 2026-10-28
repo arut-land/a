@@ -193,7 +193,7 @@ enum State {
 /// A successful reply's body, being decoded.
 struct Reader {
     body: Body,
-    sse: SseFramer,
+    sse: Box<SseFramer>,
     decoder: Box<dyn Decoder>,
     queue: VecDeque<Event>,
     /// What the last chunk decoded to, on its way to `queue`.
@@ -278,7 +278,7 @@ impl Reader {
     fn new(body: Body, decoder: Box<dyn Decoder>) -> Self {
         Self {
             body,
-            sse: SseFramer::with_limits(DecodeLimits::default()),
+            sse: Box::new(SseFramer::with_limits(DecodeLimits::default())),
             decoder,
             queue: VecDeque::new(),
             decoded: Vec::new(),

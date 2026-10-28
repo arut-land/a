@@ -8,7 +8,7 @@ publish.workspace = true
 # Watches machines.toml and the ssh configuration for the host list.
 rt = { workspace = true, features = ["watch"] }
 ext-logging.workspace = true
-protocol.workspace = true
+protocol = { workspace = true, features = ["native-buffer"] }
 sys.workspace = true
 serde_json.workspace = true
 # The remote verifies uploads with POSIX `cksum`, the one digest every host has.

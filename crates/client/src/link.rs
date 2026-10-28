@@ -86,7 +86,7 @@ pub struct Opened {
     pub machine: Option<MachineId>,
     /// What the link read past its own preamble: the start of the daemon's
     /// answer.
-    pub buffered: Vec<u8>,
+    pub buffered: protocol::FrameReader,
     /// The far host's environment, as its bridge captured it; `None` for
     /// this machine's daemon.
     pub remote: Option<Environment>,
@@ -97,6 +97,23 @@ pub struct Opened {
 /// The bytes between a client and its daemon, as a link carries them.
 pub trait Stream: Send + Sync {
     fn read<'a>(&'a self, bytes: &'a mut [u8]) -> BoxFuture<'a, io::Result<usize>>;
+    /// Fills the next frame, preserving partial bytes across cancellation.
+    fn read_frame<'a>(
+        &'a self,
+        buffered: &'a mut protocol::FrameReader,
+    ) -> BoxFuture<'a, io::Result<bool>> {
+        Box::pin(async move {
+            while buffered.needs_more()? {
+                let mut read = buffered.read_buffer(64 << 10)?;
+                let n = self.read(read.as_mut()).await?;
+                read.filled(n);
+                if n == 0 {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })
+    }
     /// Writes all of `bytes`, and waits for the write to complete.
     fn write_all<'a>(&'a self, bytes: &'a [u8]) -> BoxFuture<'a, io::Result<()>>;
 }
@@ -131,6 +148,23 @@ where
         Box::pin(self.read.read_with(|mut io| io.read(bytes)))
     }
 
+    fn read_frame<'a>(
+        &'a self,
+        buffered: &'a mut protocol::FrameReader,
+    ) -> BoxFuture<'a, io::Result<bool>> {
+        Box::pin(self.read.read_with(move |mut io| {
+            while buffered.needs_more()? {
+                let mut read = buffered.read_buffer(64 << 10)?;
+                let n = io.read(read.as_mut())?;
+                read.filled(n);
+                if n == 0 {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }))
+    }
+
     fn write_all<'a>(&'a self, bytes: &'a [u8]) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(self.write.write_all(bytes))
     }
@@ -144,24 +178,30 @@ impl dyn Stream + '_ {
     }
 
     /// The next frame, from what is `buffered` and then the stream.
-    pub(crate) async fn recv<T: Decode>(&self, buffered: &mut Vec<u8>) -> io::Result<Option<T>> {
+    pub(crate) async fn recv<T: Decode>(
+        &self,
+        buffered: &mut protocol::FrameReader,
+    ) -> io::Result<Option<T>> {
         loop {
-            if let Some((len, body)) = protocol::frame_in(buffered)? {
-                let msg = T::from_json(body.json()?)?;
-                buffered.drain(..len);
+            if let Some((_, msg)) = buffered.decode()? {
                 return Ok(Some(msg));
             }
-            if !self.fill(buffered).await? {
+            if !self.read_frame(buffered).await? {
                 return Ok(None);
             }
         }
     }
 
     /// The next line, for a link's preamble; `None` at the end of the stream.
-    pub(crate) async fn line(&self, buffered: &mut Vec<u8>) -> io::Result<Option<Vec<u8>>> {
+    pub(crate) async fn line(
+        &self,
+        buffered: &mut protocol::FrameReader,
+    ) -> io::Result<Option<Vec<u8>>> {
         loop {
             if let Some(end) = buffered.iter().position(|&byte| byte == b'\n') {
-                return Ok(Some(buffered.drain(..=end).collect()));
+                let line = buffered[..=end].to_vec();
+                buffered.consume(end + 1)?;
+                return Ok(Some(line));
             }
             if buffered.len() > 64 << 10 {
                 return Err(io::Error::other("oversized preamble line"));
@@ -173,7 +213,7 @@ impl dyn Stream + '_ {
     }
 
     /// Waits for a draining daemon to close the connection as it exits.
-    pub(crate) async fn drained(&self, buffered: &mut Vec<u8>) -> Result<(), Error> {
+    pub(crate) async fn drained(&self, buffered: &mut protocol::FrameReader) -> Result<(), Error> {
         loop {
             match self.recv::<DaemonMsg>(buffered).await {
                 Ok(Some(_)) => {}
@@ -186,12 +226,11 @@ impl dyn Stream + '_ {
     }
 
     /// Reads more into `buffered`; `false` at the end of the stream.
-    pub(crate) async fn fill(&self, buffered: &mut Vec<u8>) -> io::Result<bool> {
-        let kept = buffered.len();
-        buffered.resize(kept + 8192, 0);
-        let read = self.read(&mut buffered[kept..]).await;
-        buffered.truncate(kept + *read.as_ref().unwrap_or(&0));
-        Ok(read? > 0)
+    pub(crate) async fn fill(&self, buffered: &mut protocol::FrameReader) -> io::Result<bool> {
+        let mut read = buffered.read_buffer(8192)?;
+        let n = self.read(read.as_mut()).await?;
+        read.filled(n);
+        Ok(n > 0)
     }
 }
 
@@ -293,7 +332,7 @@ pub(crate) fn socket(rt: &Rt, stream: sys::OwnedConnection) -> io::Result<Opened
             (),
         )),
         machine: None,
-        buffered: Vec::new(),
+        buffered: protocol::FrameReader::new(),
         remote: None,
         within: crate::HELLO_TIMEOUT,
     })
@@ -402,7 +441,7 @@ pub(crate) async fn connect<F: Future<Output = ()> + Send>(
 /// back, then reads the answer.
 pub(crate) async fn hello(
     stream: &dyn Stream,
-    buffered: &mut Vec<u8>,
+    buffered: &mut protocol::FrameReader,
     build: &str,
     client: Option<ClientId>,
     machine: Option<MachineId>,
@@ -478,3 +517,105 @@ pub(crate) async fn hello(
 
 /// The shared runtime behind the blocking SDK entry points.
 pub(crate) static BLOCKING: LazyLock<Rt> = LazyLock::new(|| Arc::new(rt::Threads::new(1)));
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partial_frames_keep_their_bytes_and_completed_frames_release_storage() {
+        let root = tempfile::tempdir().unwrap();
+        let home = Home::from(root.path().to_path_buf());
+        std::fs::create_dir_all(home.run_dir()).unwrap();
+        let owner = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(home.daemon_pid_file())
+            .unwrap();
+        sys::fs::lock(&owner).unwrap();
+        write!(&owner, "{}", sys::crash::Record::current("test")).unwrap();
+        let listener = home.bind().unwrap();
+        let peer = home.endpoint().connect().unwrap();
+        let runtime: Rt = Arc::new(rt::Threads::new(1));
+        let opened = socket(&runtime, listener.accept().unwrap()).unwrap();
+        let mut wire = Vec::new();
+        ClientMsg::Hello {
+            proto: PROTO,
+            build: "x".repeat(5 << 20),
+            caps: Caps::NONE,
+            client: None,
+            machine: None,
+        }
+        .write_frame(&mut wire)
+        .unwrap();
+        // A link may already have received the start of a frame with its preamble.
+        let mut buffered = protocol::FrameReader::new();
+        buffered.extend_from_slice(&wire[..4096]).unwrap();
+        let writer = std::thread::spawn(move || {
+            Write::write_all(&mut &peer, &wire[4096..]).unwrap();
+            peer
+        });
+        assert!(matches!(
+            rt::block_on(opened.stream.recv::<ClientMsg>(&mut buffered)).unwrap(),
+            Some(ClientMsg::Hello { build, .. }) if build.len() == 5 << 20
+        ));
+        assert!(buffered.is_empty(), "completed frame retained input");
+        assert!(
+            buffered.capacity() < 5 << 19,
+            "completed frame retained heap storage"
+        );
+        let peer = writer.join().unwrap();
+        drop(peer);
+        drop(opened);
+        drop(listener);
+        home.endpoint().remove();
+    }
+
+    #[test]
+    fn cancelling_a_fill_preserves_the_prefix_and_can_resume() {
+        use std::future::{Future, poll_fn};
+        use std::pin::pin;
+        use std::task::Poll;
+
+        let root = tempfile::tempdir().unwrap();
+        let home = Home::from(root.path().to_path_buf());
+        std::fs::create_dir_all(home.run_dir()).unwrap();
+        let owner = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(home.daemon_pid_file())
+            .unwrap();
+        sys::fs::lock(&owner).unwrap();
+        write!(&owner, "{}", sys::crash::Record::current("test")).unwrap();
+        let listener = home.bind().unwrap();
+        let peer = home.endpoint().connect().unwrap();
+        let runtime: Rt = Arc::new(rt::Threads::new(1));
+        let opened = socket(&runtime, listener.accept().unwrap()).unwrap();
+        let mut wire = Vec::new();
+        ClientMsg::Detach.write_frame(&mut wire).unwrap();
+        let mut buffered = protocol::FrameReader::new();
+        Write::write_all(&mut &peer, &wire[..3]).unwrap();
+        assert!(rt::block_on(opened.stream.fill(&mut buffered)).unwrap());
+        assert_eq!(buffered.as_ref(), &wire[..3]);
+        {
+            let mut read = pin!(opened.stream.fill(&mut buffered));
+            rt::block_on(poll_fn(|cx| {
+                assert!(read.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            }));
+        }
+        assert_eq!(buffered.as_ref(), &wire[..3]);
+        Write::write_all(&mut &peer, &wire[3..]).unwrap();
+        assert!(rt::block_on(opened.stream.fill(&mut buffered)).unwrap());
+        assert!(matches!(
+            buffered.decode().unwrap(),
+            Some((_, ClientMsg::Detach))
+        ));
+        drop(peer);
+        drop(opened);
+        drop(listener);
+        home.endpoint().remove();
+    }
+}

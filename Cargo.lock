@@ -1631,6 +1631,7 @@ dependencies = [
  "serde_json",
  "serde_yaml_ng",
  "smol_str",
+ "sys",
  "transport",
 ]
 
@@ -2035,6 +2036,7 @@ dependencies = [
  "json",
  "serde",
  "serde_json",
+ "sys",
  "uuid",
 ]
 

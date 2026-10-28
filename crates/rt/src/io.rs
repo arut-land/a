@@ -220,7 +220,13 @@ impl<T: Source> Async<T> {
     /// Runs `op` until it does not would-block, waiting for the descriptor
     /// to turn readable in between.
     pub async fn read_with<R>(&self, op: impl FnMut(&T) -> io::Result<R>) -> io::Result<R> {
-        self.retry(false, op).await
+        match &self.0 {
+            Inner::AsyncIo(io) => io.read_with(op).await,
+            #[cfg(windows)]
+            Inner::Completion { .. } | Inner::Signal(_) => self.retry(false, op).await,
+            #[cfg(test)]
+            Inner::FakeCompletion { .. } => self.retry(false, op).await,
+        }
     }
 
     /// Returns accepted bytes without a cancellation point after submission.
@@ -470,5 +476,37 @@ mod acknowledgement_tests {
             b"frame",
             "retrying a cancelled flush must not submit the frame again"
         );
+    }
+}
+
+#[cfg(test)]
+mod read_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::pin::pin;
+    use std::task::{Context, Waker};
+
+    #[test]
+    fn a_repolled_read_retries_without_requiring_a_new_readiness_tick() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let input = Async::socket(&Reactor::AsyncIo, listener.accept().unwrap().0).unwrap();
+        let attempts = Cell::new(0);
+        let mut received = [0; 5];
+        {
+            let mut read = pin!(input.read_with(|mut input| {
+                attempts.set(attempts.get() + 1);
+                input.read(&mut received)
+            }));
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(read.as_mut().poll(&mut cx).is_pending());
+            assert!(read.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(attempts.get(), 2);
+            peer.write_all(b"ready").unwrap();
+            assert_eq!(crate::block_on(read).unwrap(), 5);
+        }
+        assert_eq!(&received, b"ready");
     }
 }

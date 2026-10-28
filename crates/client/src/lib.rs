@@ -169,7 +169,7 @@ impl From<Error> for io::Error {
 /// [`Driver`] reads and writes one at once.
 pub struct Connection {
     stream: Box<dyn link::Stream>,
-    buffered: Vec<u8>,
+    buffered: protocol::FrameReader,
     /// The far host's environment, as its bridge captured it; `None` for
     /// this machine's daemon.
     pub remote: Option<Environment>,
@@ -269,7 +269,7 @@ impl Connection {
 /// The first message `pick` accepts; the rest are skipped.
 async fn until<T>(
     stream: &dyn link::Stream,
-    buffered: &mut Vec<u8>,
+    buffered: &mut protocol::FrameReader,
     pick: &mut impl FnMut(DaemonMsg) -> Option<T>,
 ) -> io::Result<T> {
     while let Some(msg) = stream.recv(buffered).await? {
