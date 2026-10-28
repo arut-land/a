@@ -370,8 +370,9 @@ class RealDaemon(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
             # Shorten this lifecycle check; resource measurements use the production windows.
-            def observe(active, seconds):
-                return lifecycle.idle_sample(active, .1, settle_seconds=0, retire_seconds=0)
+            def observe(active, seconds, **kwargs):
+                kwargs.setdefault("memory_probe", os.environ["PERF_TEST_PROBE"])
+                return lifecycle.idle_sample(active, .1, settle_seconds=0, retire_seconds=0, **kwargs)
             with mock.patch.object(local, "idle_sample", side_effect=observe):
                 raw = local.sample(binary, .1, output)
             self.assertEqual(raw["daemon_cpu_seconds"], raw["after"][0]["cpu_seconds"] - raw["before"][0]["cpu_seconds"])
@@ -380,6 +381,7 @@ class RealDaemon(unittest.TestCase):
             hosted_raw = json.loads((output / "idle-0.json").read_text())
             self.assertEqual(raw.keys(), hosted_raw.keys())
             self.assertEqual(metrics["idle_rss_kib"]["samples"], [hosted_raw["rss"]])
+            self.assertEqual(metrics["idle_charged_kib"]["samples"], [hosted_raw["charged_bytes"] / 1024])
             self.assertEqual(metrics["idle_daemon_cpu_ms"]["samples"], [hosted_raw["daemon_cpu_seconds"] * 1000])
             self.assertEqual(len(json.loads((output / "attach-0.json").read_text())), 500)
             self.assertEqual(metrics["cold_reply_ms"]["samples"], [hosted_raw["cold_reply_ms"]])

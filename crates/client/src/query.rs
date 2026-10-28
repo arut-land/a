@@ -27,7 +27,7 @@ pub enum Answer {
 /// it, and every [`Canceller`] of it, hangs up, which cancels the query.
 pub struct Answers {
     stream: Arc<dyn Stream>,
-    buffered: Vec<u8>,
+    buffered: protocol::FrameReader,
     done: bool,
 }
 

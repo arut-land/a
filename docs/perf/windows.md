@@ -1,5 +1,8 @@
 # Windows daemon platform
 
+The current idle gate uses [native charged memory](idle-charge.md), with
+Windows private commit validated on native x64 and ARM64 runners.
+
 ## Transport and completion
 
 The transport uses byte-mode local named pipes selected by the locked daemon

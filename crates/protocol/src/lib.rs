@@ -154,6 +154,7 @@ mod address;
 pub mod blob;
 #[macro_use]
 mod decode;
+mod framing;
 pub mod ledger;
 mod peer;
 pub mod publication;
@@ -161,6 +162,7 @@ pub mod view;
 
 pub use address::{Address, HostPath};
 pub use blob::{BlobId, BlobOrigin, BlobRef, Held, Payload};
+pub use framing::FrameReader;
 pub use json::Json;
 pub use peer::{MachineId, Role};
 

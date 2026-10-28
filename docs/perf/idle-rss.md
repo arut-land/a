@@ -1,8 +1,14 @@
-# Idle daemon RSS (2026-10-21)
+# Idle daemon memory
 
-The idle budget is **strictly below 10,240 KiB**, measured with `ps -o rss=`
-after the terminal has shown `● live` and both processes have been idle for
-three seconds. The budget was not changed.
+The idle budget is **strictly below 10 MiB of charged memory** after the
+terminal has shown `● live` and both processes have been idle for three
+seconds. macOS uses physical footprint, Linux PSS, and Windows private
+commit. RSS is printed as a diagnostic and is not asserted. The numeric
+limit is unchanged; the accounting policy changed by owner decision.
+See [native accounting and validation](idle-charge.md).
+
+The investigation below records the former RSS contract on 2026-10-21.
+Its historical measurements have not been rewritten.
 
 ## History
 

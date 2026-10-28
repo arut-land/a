@@ -131,7 +131,7 @@ def memory_build(source, output, variant, memory_only=True):
 
 def budgets(output, binary=None, probe=None, samples=5):
     binary = str(binary or output / ("a-fixtures" + SUFFIX))
-    cold, first_run, rss, cpu, client_cpu, attach_p50, attach_p99 = [], [], [], [], [], [], []
+    cold, first_run, rss, charged, cpu, client_cpu, attach_p50, attach_p99 = [], [], [], [], [], [], [], []
     for trial in range(samples):
         with daemon(binary, output, trial, first_run=True) as active:
             home, env, pid = active.home, active.env, active.pid
@@ -139,10 +139,11 @@ def budgets(output, binary=None, probe=None, samples=5):
             def cli(*args):
                 return checked([binary, *args], output, f"{trial}-prep", env=env, cwd=home, timeout=60)
 
-            observation = idle_sample(active, 10)
+            observation = idle_sample(active, 10, memory_probe=probe or output / ("perf-attach" + SUFFIX))
             first_run.append(observation["first_run_ls_ms"])
             cold.append(observation["cold_reply_ms"])
             rss.append(observation["rss"])
+            charged.append(observation["charged_bytes"] / 1024)
             cpu.append(observation["daemon_cpu_seconds"] * 1000)
             client_cpu.append(observation["client_cpu_seconds"] * 1000)
             (output / f"idle-{trial}.json").write_text(json.dumps(observation, indent=2))
@@ -161,7 +162,8 @@ def budgets(output, binary=None, probe=None, samples=5):
             (output / f"attach-{trial}.json").write_text(json.dumps(samples))
     metrics = {name: distribution(values) for name, values in [
         ("cold_reply_ms", cold), ("first_run_ls_ms", first_run), ("attach_p50_ms", attach_p50), ("attach_p99_ms", attach_p99),
-        ("idle_rss_kib", rss), ("idle_daemon_cpu_ms", cpu), ("idle_line_client_cpu_ms", client_cpu)]}
+        ("idle_rss_kib", rss), ("idle_charged_kib", charged),
+        ("idle_daemon_cpu_ms", cpu), ("idle_line_client_cpu_ms", client_cpu)]}
     metrics["idle_daemon_cpu_ms"]["windows"] = cpu
     metrics["idle_line_client_cpu_ms"]["windows"] = client_cpu
     return metrics

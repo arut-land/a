@@ -237,3 +237,4 @@ main 10688 KiB, fixed branch 10656 KiB). These local failures are retained,
 not hidden by a new threshold or allocator policy. Hosted macOS budgets
 remain a required check for this change. Raw samples, full-suite outputs,
 and native memory maps are under `/private/tmp/index-idle`.
+These historical RSS failures predate the [charged-memory gate](idle-charge.md).

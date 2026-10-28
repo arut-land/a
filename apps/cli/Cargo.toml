@@ -78,7 +78,7 @@ fixtures = ["ext-fixtures/on"]
 # TLS uses the host's crypto library and trust store on every platform.
 [dependencies.llm]
 workspace = true
-features = ["tls-native"]
+features = ["tls-native", "native-buffer"]
 
 [dev-dependencies]
 ext = { workspace = true, features = ["testing"] }

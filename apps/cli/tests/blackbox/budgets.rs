@@ -139,7 +139,7 @@ fn the_terminal_client_paints_its_first_frame_within_16ms() {
     );
 }
 
-/// Idle, the daemon holds under 10 MiB and its terminal client runs no
+/// Idle, the daemon's charged memory stays under 10 MiB and its terminal client runs no
 /// code: both measured over the one quiet window.
 #[test]
 #[ignore = "mise run budgets"]
@@ -153,13 +153,18 @@ fn an_idle_daemon_and_terminal_client_cost_nothing() {
     std::thread::sleep(Duration::from_secs(3));
     let used = cpu_time(client).saturating_sub(before);
     let (daemon_rss, client_rss) = (rss_kib(daemon), rss_kib(client));
+    let charged = sys::process_memory::charged_bytes(daemon).unwrap();
     eprintln!(
-        "idle: daemon {daemon_rss} KiB RSS; terminal client {used:?} of CPU in 3 s, \
-         {client_rss} KiB RSS"
+        "idle: daemon {} KiB {} ({daemon_rss} KiB RSS); terminal client {used:?} of CPU in 3 s, \
+         {client_rss} KiB RSS",
+        charged / 1024,
+        sys::process_memory::METRIC,
     );
     assert!(
-        daemon_rss < 10 * 1024,
-        "daemon {daemon_rss} KiB over 10 MiB"
+        charged < 10 * 1024 * 1024,
+        "daemon {} bytes {} over 10 MiB",
+        charged,
+        sys::process_memory::METRIC,
     );
     assert!(
         used <= Duration::from_millis(10),

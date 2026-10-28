@@ -49,7 +49,8 @@ bench retains its result. The transcript contains 64 real echo turns.
 | Existence queries, two publication attempts | 4 | 2 |
 
 Idle CPU resolution is 10 ms. Daemon RSS ranges overlap, at least 1,056 KiB
-below the 10,240 KiB RSS cap. Shipped size is reported above. Standalone probe
+below the then-current 10,240 KiB RSS cap. The current gate uses
+[charged memory](idle-charge.md). Shipped size is reported above. Standalone probe
 loads/consumers are in raw records. Allocation counts remain unchanged.
 
 Main → final in every cell:
