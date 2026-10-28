@@ -58,7 +58,7 @@ pub struct ProcessLease {
     #[cfg(unix)]
     child: Child,
     #[cfg(windows)]
-    handle: std::os::windows::io::OwnedHandle,
+    handle: imp::Job,
 }
 
 impl ProcessLease {
@@ -76,7 +76,10 @@ impl ProcessLease {
         id: RecordedIdentity,
         handle: std::os::windows::io::OwnedHandle,
     ) -> Self {
-        Self { id, handle }
+        Self {
+            id,
+            handle: imp::Job::new(handle),
+        }
     }
 
     /// The job, no longer stopped as the lease drops: for the next build.
@@ -85,7 +88,7 @@ impl ProcessLease {
         let lease = std::mem::ManuallyDrop::new(self);
         // SAFETY: the lease is never dropped, so the handle read out of it
         // has this one owner.
-        unsafe { std::ptr::read(&raw const lease.handle) }
+        unsafe { std::ptr::read(&raw const lease.handle) }.into_handle()
     }
 
     pub const fn id(&self) -> RecordedIdentity {
