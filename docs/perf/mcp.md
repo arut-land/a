@@ -592,3 +592,143 @@ The pending-card parent-lifetime seam remains tracked for `mcp-elicit` /
 `mcp-instances`. The owner-approved metadata URL and interrupted multipart Windows
 credential-write decisions remain unchanged. This review fix introduces no new
 dependency, wire change or additional hardening.
+
+
+## Scoped MCP instances and discovery reuse (round 3)
+
+The daemon now uses one SDK `Scoped` registry across its participating sessions,
+with exact private declaration/argv/cwd/environment identities. Session is the
+default, including when experimental sharing is enabled. Workspace/user stdio
+scopes require explicit `experimental_stdio_sharing = true`; HTTP rejects scope
+settings and retains the existing pool. Shared launch inputs belong to the trusted
+declaration, not the first caller. Unused declarations start no actor or process.
+
+A process owns one frame writer/reader and a request map with globally unique IDs.
+Admission waits for retained-data credit instead of rejecting demand. Cancellation
+releases caller authority immediately. Shared exchanges send MCP cancellation and
+retain only charged ingress/drain state to their original deadline; an undrained
+exchange retires the instance. Session cancellation kills the tree. The SDK owns
+single-flight startup, session demand, retirement and native shutdown cleanup.
+No unsafe call is replayed after a crash or transport retirement.
+
+Discovery retains one immutable validated full list while its server TTL remains
+fresh. A cold eligible fetch is single-flight; known immediately stale lists stay
+independent. Every page contributes its earliest expiry, visibility and actual
+authorizing generation. The OAuth owner exposes an opaque owner/recipient/generation
+identity without exposing token bytes, checks expiry before cache lookup, and tags
+the response after challenge/retry. Changing authorization generation between pages
+prevents aggregate caching. Notification invalidation and publication share one
+lock. No tool/MRTR result is cached, and no refresh polling or subscription stream
+was introduced.
+
+### Native release comparison
+
+Apple M3, 16 GiB, macOS 27.0.1 arm64, nightly-2026-10-17, ordinary installed std.
+Baseline: `63ac410ac780fa13cb627ee4a902a788952253b4`. Candidate runtime source:
+`985c83b06e090c0abf13e87b933e2f2abfdccf73`. Both are repository release-profile fixture builds, built with
+`CARGO_BUILD_JOBS=2` through `mise exec --` and an external target directory.
+The same preserved baseline MCP child binary (489,424 bytes, SHA-256
+`79e50e2f37bd989e34af7f2778d0e53b210fc7116726326365b2c8dd5d74aced`) is
+used on both sides, so new test-fixture behavior cannot change child memory.
+
+The original finding was reproduced before implementation. This comparison uses
+five alternating AB/BA rounds per flag state on the shared host. Each observation
+starts a fresh isolated A_HOME, attaches 1, then 32, then 128 retained sessions in
+one workspace, and runs first list, warm list, schema and call for each newly
+added session. It preserves the survey's 12-second settling and 3-second idle
+windows. No providers are configured or contacted. Each daemon stops through its
+own A_HOME, and every cleanup record confirms no remaining fixture PID.
+
+Values are median [min–max] across five observations. First-list latency is the
+per-observation median for the newly added sessions (1/31/96), including durable
+tool dispatch, spawn/probe where necessary, list and client rendering. It does
+not isolate pipe setup or handshake latency. The 358.989 ms cold observation is
+retained. Native footprint is the OS per-process charge; summed child footprint
+and RSS do not measure unique physical machine RAM. Parent values also include
+retained sessions and tool results.
+
+| Stdio scope / flag | Sessions | Children before → after | Child footprint MiB, before → after | Parent footprint MiB, before → after |
+| --- | ---: | ---: | --- | --- |
+| session / off | 1 | 1 → 1 | 1.750 [1.750–1.766] → 1.766 [1.735–1.766] | 3.657 [3.563–3.672] → 3.563 [3.532–3.641] |
+| session / off | 32 | 32 → 32 | 56.248 [56.139–56.467] → 56.170 [56.045–56.561] | 6.141 [6.079–6.219] → 6.579 [6.469–6.625] |
+| session / off | 128 | 128 → 128 | 225.743 [224.149–226.134] → 225.274 [224.181–226.196] | 13.625 [13.547–13.672] → 14.985 [14.922–15.063] |
+| workspace / on | 1 | 1 → 1 | 1.766 [1.750–1.782] → 1.750 [1.750–1.750] | 3.641 [3.547–3.688] → 3.657 [3.547–3.766] |
+| workspace / on | 32 | 32 → 1 | 56.264 [56.123–56.389] → 1.813 [1.797–1.844] | 6.141 [6.079–6.235] → 5.704 [5.625–5.844] |
+| workspace / on | 128 | 128 → 1 | 224.915 [224.337–226.102] → 1.813 [1.797–1.860] | 13.594 [13.422–13.672] → 11.563 [11.469–11.641] |
+
+| Stdio scope / flag | Sessions | First list ms, before → after | Warm list ms, before → after |
+| --- | ---: | --- | --- |
+| session / off | 1 | 13.037 [12.589–358.989] → 11.630 [11.547–21.197] | 7.596 [5.730–9.134] → 6.728 [6.662–14.232] |
+| session / off | 32 | 11.989 [11.905–17.930] → 11.028 [10.033–20.746] | 6.048 [5.996–8.771] → 6.943 [5.934–7.908] |
+| session / off | 128 | 12.993 [9.994–26.469] → 12.965 [10.032–16.786] | 6.992 [5.966–10.550] → 6.019 [5.103–7.950] |
+| workspace / on | 1 | 12.502 [11.343–27.320] → 11.638 [11.496–38.652] | 6.781 [5.429–7.624] → 6.776 [6.702–11.082] |
+| workspace / on | 32 | 12.144 [10.057–12.923] → 6.067 [5.135–7.997] | 6.948 [6.018–7.869] → 5.988 [5.930–7.930] |
+| workspace / on | 128 | 13.280 [10.968–17.022] → 6.114 [6.002–7.655] | 6.031 [5.958–8.205] → 6.018 [5.904–6.992] |
+
+At 128 sessions, default-scope parent footprint rises by about 1.36 MiB; parent
+RSS rises from 21.359 [20.188–21.391] to 22.812 [22.766–22.891] MiB. This is an
+observed cost of the new ownership/routing state, not a default-scope memory win.
+The opt-in workload removes 127 fixture processes. Its summed child footprint
+falls from 224.915 [224.337–226.102] to 1.813 [1.797–1.860] MiB. The first-ever
+shared cold list is still 11.638 [11.497–38.652] ms: sharing removes repeated
+startup, not the cost of the first process. User scope across workspaces is
+validated functionally; no separate user-scope performance distribution is claimed.
+
+For the 96 newly added sessions at 128, native daemon CPU per first-list operation
+is 2.997 [2.453–4.435] ms before and 1.415 [0.735–1.718] ms after with sharing;
+default scope is 3.078 [2.126–5.960] and 2.945 [2.214–4.711] ms. These are batch
+CPU deltas divided by operation count, including the surrounding daemon work.
+All sixty three-second settled daemon CPU windows show zero counter increments.
+This is no observed idle CPU at OS resolution, not a proof of zero wakeups or a
+promise about arbitrary servers. Latency remains observational on this shared M3.
+
+### HTTP request counts
+
+Five further alternating AB/BA rounds use a recording loopback peer, fresh homes,
+and sixteen cold calls followed by sixteen warm calls. Positive TTL is
+`ttlMs=300000, cacheScope=private`, with anonymous authorization and dummy fixture
+arguments; no authenticated performance gain is claimed. Counts are identical
+in all five samples (therefore their min/max equal the listed value).
+
+| TTL | Version | POSTs / 16 cold calls | POSTs / 16 warm calls | First call ms | Warm calls p50 ms |
+| --- | --- | ---: | ---: | --- | --- |
+| missing | before | 32 | 32 | 6.948 [4.543–7.904] | 6.974 [5.996–7.008] |
+| missing | after | 32 | 32 | 6.915 [6.809–7.932] | 5.998 [5.578–6.982] |
+| positive private | before | 32 | 32 | 6.931 [6.157–7.903] | 6.957 [6.011–6.993] |
+| positive private | after | 17 | 16 | 6.879 [6.681–7.896] | 6.004 [5.961–6.038] |
+
+Positive-TTL cold calls drop from 32 to 17 POSTs (one list plus sixteen calls);
+warm calls drop from 32 to 16. No-TTL calls remain at two POSTs per call. Request
+count establishes the removed list fetch/decode; these small loopback wall times
+do not establish a universal latency improvement.
+
+Fixture-enabled a grows from 7,387,728 to 7,454,176 bytes (+64.891 KiB). This is
+probe size, not shipped fixture-free size. Linux/Windows native runtime/performance
+and macOS Intel measurements are unmeasured in phase 1; the full Windows cross-target
+workspace clippy check passed. No dependency, daemon wire, log format or corpus changed.
+
+### Validation and retained evidence
+
+The selected native suite passes 101 tests, including all MCP/OAuth tests and CLI
+unit/MCP daemon tests; the twelve daemon tests also pass against the release
+candidate. Invariants cover 128 concurrent sessions sharing one process/probe,
+reordered responses and exact progress ownership, exact environment identity,
+session isolation of stateful server globals, workspace/user boundaries, stable
+shared launch inputs, cancellation/drain deadlines, one session hibernating while
+a peer remains attached, last-release/shutdown descendant cleanup and no effect
+replay. Positive/zero/missing/expired TTL, mixed page deadlines, list invalidation,
+noncacheable input-required results and private-generation changes after refresh,
+expiry and paginated step-up use real children and loopback peers. The existing
+rotating-token lifecycle tests remain intact. The new scope invariant fails
+against the preserved baseline executable and passes on the candidate.
+
+Touched-crate checks, fmt, all-target/all-feature clippy with `-D warnings`, the
+Windows workspace lint, rustdoc and the normal-dependency no-Tokio scan passed.
+The scan wrote its output outside the worktree. Hosted CI awaits independent
+review; phase 1 does not dispatch it.
+
+Raw data and binaries' hashes are retained outside the repository under the task
+scratchpad's `r3/mcp-instances/`: `release-samples.jsonl`, `release-summary.json`,
+`http-release.jsonl`, `http-release-summary.json`, `candidate-source.json`, host
+metadata, cleanup records and the `release-measure.py`, `http-release.py` and
+`release-summary.py` runners. Builds use `perf2/tgt-mcp-instances`.
