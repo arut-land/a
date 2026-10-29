@@ -152,8 +152,10 @@ impl Sources {
 
     /// Resolves routes concurrently on the supplied runtime's Storage pool.
     pub async fn resolve_async(&self, rt: &Rt) -> io::Result<Vec<Known>> {
+        eprintln!("flake resolve start {:?}", std::time::Instant::now());
         let sources = self.clone();
         let machines = rt::unblock(&**rt, move || sources.machines()).await?;
+        eprintln!("flake machines loaded {} {:?}", machines.len(), std::time::Instant::now());
         let resolving: Vec<_> = machines
             .iter()
             .map(|machine| {
@@ -172,6 +174,7 @@ impl Sources {
                 known.push(Known { machine, route });
             }
         }
+        eprintln!("flake resolve complete {:?}", std::time::Instant::now());
         Ok(known)
     }
 
@@ -221,12 +224,14 @@ impl Sources {
         if let Some(SshConfig::File(file)) = &self.ssh {
             ssh.arg("-F").arg(file);
         }
+        eprintln!("flake ssh start {host:?} {:?}", std::time::Instant::now());
         let output = ssh
             .arg(host)
             .stdin(Stdio::null())
             .stderr(Stdio::null())
             .output()
             .ok()?;
+        eprintln!("flake ssh complete {host:?} {:?}", std::time::Instant::now());
         output.status.success().then_some(())?;
         let text = String::from_utf8_lossy(&output.stdout);
         let value = |key: &str| {
@@ -271,12 +276,14 @@ struct Watched {
 impl Watched {
     fn changed(self: &Arc<Self>) {
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        eprintln!("flake changed {generation} {:?}", std::time::Instant::now());
         let watched = Arc::downgrade(self);
         self.rt.spawn(Box::pin(async move {
             let Some(shared) = watched.upgrade() else {
                 return;
             };
             let found = shared.sources.resolve_async(&shared.rt).await;
+            eprintln!("flake delivery {generation} current {} {:?}", shared.generation.load(Ordering::Acquire), std::time::Instant::now());
             if shared.generation.load(Ordering::Acquire) == generation {
                 (shared.sink)(found);
             }
