@@ -9,7 +9,7 @@ execution authority remains private to each session. The initial graph implement
 
 The owner subsequently approved proposals #1 and #2 together. The current
 revision adds forkable prepared encoded prefixes, bounded graph cursors across
-inherited scopes and incremental admission lookup. Its repeated matrix and separate native attribution are complete; the total CPU gate remains unmet because of a measured descriptor-dependent launch cost. The sections
+inherited scopes and incremental admission lookup. Its latest operation-scoped handle follow-up removes idle descriptor retention and the measured launch slope; the total CPU gate remains unmet. The final section records the remaining daemon-wide work and tradeoffs. The sections
 below preserve the earlier measurements and their unmet gates as historical
 evidence. Client history paging remains stage B; catalog interning was not
 approved.
@@ -306,3 +306,67 @@ The process control localizes a substantial part of the remaining depth cost to 
 **Owner-pending file allocation:** crates/engine/src/store/jsonl.rs and its real store invariant/restart tests in crates/engine/src/store/tests.rs. The proposed follow-up is operation-scoped log/index file ownership: idle history keeps offsets and source identity, active I/O owns handles, and pending durability epochs retain exactly the handles needed until flush completion. This removes descriptor pressure without limiting sessions, history, tools or recall; it avoids modifying the excluded sys process backend. Preserve append ordering, torn-tail repair, read-only state, delayed cache flushes, concurrent readers, restart and file/source identity. Likelihood/cost: the failure is deterministic in this matrix; directly measured launch growth is about 40 ms/root turn at this scale. Implementation and portable lifetime verification are estimated at 1–2 days, followed by the repeated acceptance matrix. That expected gain is not a measured fix, and further residual attribution may still be needed. No such storage change or speculative hardening was added under the current file allocation.
 
 Raw evidence: context-socket-summary.json, context-process-summary.json, spawn-native-summary.json and their per-case native counters/archives. process-attribution-provenance.json records diagnostic source/binary hashes. The full final-build provenance is context-final-provenance.json.
+
+
+## Operation-scoped durable handles follow-up
+
+The owner approved store/jsonl.rs, store/tests.rs and a sys FileIdentity accessor for
+the measured descriptor/launch cost. Idle history now retains offsets and source
+identity; reads/appends own handles only for I/O, and pending durability epochs own the
+exact file needed until flush completion. Reopened sources are checked against handle
+identity. Sidecars reopen for incremental delta writes. Existing ordering, torn-tail
+repair, read-only state, concurrent reads, delayed flushes, restart and source identity
+are preserved. No dependency, wire/log change or session/history/tool limit.
+
+All 21 new primary cases pass: three interleaved A/B samples at 1/4/8 roots ×32 plus
+three complete 64-turn cases, with real TUI/FFI/web streaming and warm/cold hashes.
+Before 3b34dc92, after product code 56bc30bf, common main 3a32fe61, same release
+profile/workload as above. A later test-only change uses the production sealed header.
+Runtime environments exclude inherited providers/proxies and use loopback/dummy
+credentials. Values below are median [min–max], n=3; CPU ms/root turn, slopes OLS rounds
+9–32.
+
+| Roots | Arm | Last4 total CPU | User slope | Kernel slope | Total slope |
+| --- | --- | --- | --- | --- | --- |
+| 1 | before | 71.48 [71.22–71.50] | 0.092 [0.082–0.185] | 0.199 [0.167–0.270] | 0.291 [0.249–0.456] |
+| 1 | after | 73.34 [73.01–73.43] | 0.064 [0.044–0.066] | 0.091 [0.041–0.122] | 0.155 [0.107–0.166] |
+| 4 | before | 99.41 [98.68–104.64] | 0.231 [0.192–0.322] | 0.842 [0.788–0.907] | 1.073 [0.980–1.229] |
+| 4 | after | 86.50 [85.83–86.88] | 0.262 [0.204–0.299] | 0.213 [0.168–0.225] | 0.488 [0.372–0.512] |
+| 8 | before | 133.80 [131.74–137.83] | 0.412 [0.404–0.465] | 1.624 [1.590–1.804] | 2.037 [1.994–2.269] |
+| 8 | after | 93.98 [93.75–94.63] | 0.418 [0.346–0.421] | 0.220 [0.202–0.258] | 0.638 [0.548–0.679] |
+
+
+The daemon descriptor invariant reproduces three baseline failures (4/32/128 idle
+sessions: 48/104/296 FDs) and three fixed passes (40/40/40 FDs; no log/index handles).
+In the deep eight-root matrix, round 32 FDs fall 4178 → 50 in every run; detached 15s
+4298 → 42. All 64-turn cases preserve 65 root turns/520 tools including live clients and
+cold recovery. Fixed 64-turn last4 CPU 81.53 [81.49–81.67], user slope 0.078
+[0.048–0.078], kernel slope 0.135 [0.112–0.142].
+
+Twelve separate interleaved plain/profile controls quantify TCP and actual posix_spawn
+CPU. At eight roots, launch first4/last4 is now 0.673 [0.668–0.690]/0.717
+[0.715–0.738]ms, versus the earlier 3.350/43.852 ms descriptor-heavy result. TCP slope
+0.126 [0.121–0.127]ms/depth leaves a measured 0.433 [0.366–0.666] non-send/non-spawn
+residual. Three native stack captures with a matching dSYM identify
+Owner::hibernate/next_hibernation/loaded and Live::idle_for scans over daemon-wide
+collections (14.87–16.71% of sampled userspace leaf weight; not a CPU-time partition).
+These are a remaining hot path, not an exclusive explanation of every residual cycle.
+**Total CPU acceptance remains unmet; #1+#2 are not ready to merge.** Further
+supervisor/index/deadline work needs crates/engine/src/lib.rs ownership and a
+counterfactual measurement. No such change was made here.
+
+Live heap remains essentially unchanged (eight-root 898.744 → 898.850 MiB); identities
+replace handles without dropping history. Four-root footprint rises 608.80
+[606.72–612.11] → 644.00 [643.74–646.81]MiB, mostly vmmap Malloc Large(empty) dirty
+regions 129.0 [125.1–130.5] → 162.8 [162.2–163.4]MiB. Eight-root footprint is 1133.67 →
+1130.78 MiB. The one-root late CPU cost 71.48 → 73.34 ms from per-operation
+reopen/identity checks is reported. No allocator policy or feature cap was added.
+
+622 engine/sys tests pass (16 skipped), plus 64 final store tests; fmt, check,
+all-target/all-feature `clippy -D warnings`, Windows cross-lint and release pass. The
+unchanged edit rollback test hit a temporary-directory AlreadyExists once; isolation and
+the full rerun pass. The detached cancellation regression passes. No CI is dispatched.
+Full tables, all spreads/consumer counters, source attribution, owner-pending items and
+cleanup record are in context-graph.handles.report.md under the evidence root above.
+handles-final-provenance.json and handles-attribution-provenance.json pin
+sources/binaries; prior evidence and the public sys::spawn_group probe remain unchanged.
