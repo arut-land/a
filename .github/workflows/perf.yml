@@ -5,7 +5,7 @@ on:
       mode:
         type: choice
         default: paired
-        options: [paired, debug-host]
+        options: [paired, debug-host, full-host]
 permissions:
   contents: read
 env:
@@ -13,7 +13,7 @@ env:
   MISE_AUTO_INSTALL: false
 jobs:
   probe:
-    if: inputs.mode != 'debug-host'
+    if: inputs.mode == 'paired'
     strategy:
       fail-fast: false
       matrix:
@@ -170,7 +170,7 @@ jobs:
             ${{ runner.temp }}/host-list.log
 
   debug-host:
-    if: inputs.mode == 'debug-host'
+    if: inputs.mode != 'paired'
     runs-on: windows-latest
     env:
       CARGO_PROFILE_DEV_CODEGEN_BACKEND: llvm
@@ -217,11 +217,13 @@ jobs:
         run: |
           $runners = @((Get-Command pwsh.exe).Source, "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe")
           "A_TEST_POWERSHELL=$($runners -join ';')" >> $env:GITHUB_ENV
-      - name: Build the native CI host-list workload
+      - if: inputs.mode == 'debug-host'
+        name: Build the native CI host-list workload
         run: |
           mise exec -- cargo nextest list -p client --test machines --list-type binaries-only --message-format json > "$RUNNER_TEMP/client.json"
           mise exec -- cargo metadata --format-version 1 --no-deps > "$RUNNER_TEMP/metadata.json"
-      - name: Host-list repetitions with concurrent real SSH resolution
+      - if: inputs.mode == 'debug-host'
+        name: Host-list repetitions with concurrent real SSH resolution
         run: |
           set -o pipefail
           mise exec -- cargo nextest run --cargo-metadata "$RUNNER_TEMP/metadata.json" --binaries-metadata "$RUNNER_TEMP/client.json" -E 'test(ssh_resolves_each_host)' --stress-duration 5m --no-fail-fast --status-level pass > "$RUNNER_TEMP/ssh-load.log" 2>&1 &
@@ -233,6 +235,25 @@ jobs:
               print(datetime.datetime.now(datetime.timezone.utc).isoformat(), line, end="")
           ' | tee "$RUNNER_TEMP/debug-host.log"
           wait "$load_pid"
+      - if: inputs.mode == 'full-host'
+        name: Build the native CI suite
+        run: |
+          mise exec -- cargo build -p a
+          mise exec -- cargo nextest list --workspace --features a/lua --list-type binaries-only --message-format json > "$RUNNER_TEMP/full.json"
+          mise exec -- cargo metadata --format-version 1 --no-deps > "$RUNNER_TEMP/metadata.json"
+      - if: inputs.mode == 'full-host'
+        name: Host-list repetitions alongside the native suite
+        run: |
+          set -o pipefail
+          mise exec -- cargo nextest run --cargo-metadata "$RUNNER_TEMP/metadata.json" --binaries-metadata "$RUNNER_TEMP/full.json" -E '!test(the_host_list_follows_its_files)' --no-fail-fast --status-level pass > "$RUNNER_TEMP/full-suite.log" 2>&1 &
+          suite_pid=$!
+          trap 'wait "$suite_pid" || true' EXIT
+          mise exec -- cargo nextest run --cargo-metadata "$RUNNER_TEMP/metadata.json" --binaries-metadata "$RUNNER_TEMP/full.json" -E 'test(the_host_list_follows_its_files)' --stress-count 2000 --no-fail-fast --status-level pass --success-output immediate 2>&1 | python3 -u -c '
+          import sys, datetime
+          for line in sys.stdin:
+              print(datetime.datetime.now(datetime.timezone.utc).isoformat(), line, end="")
+          ' | tee "$RUNNER_TEMP/debug-host.log"
+          wait "$suite_pid"
       - uses: actions/upload-artifact@v5
         if: always()
         with:
@@ -240,3 +261,4 @@ jobs:
           path: |
             ${{ runner.temp }}/debug-host.log
             ${{ runner.temp }}/ssh-load.log
+            ${{ runner.temp }}/full-suite.log
