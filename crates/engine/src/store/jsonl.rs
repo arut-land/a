@@ -931,8 +931,14 @@ mod tests {
     fn idle_history_retains_no_handles_after_durability_completes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("log.jsonl");
-        let (file, publication) = sys::fs::open_log(&path, Some(b"header\n")).unwrap();
-        let index = Arc::new(Index::new(&file, path, 7).unwrap());
+        let header = header_line(&Header {
+            id: SessionId::new(),
+            workspace: dir.path().to_owned(),
+            parent: None,
+        })
+        .unwrap();
+        let (file, publication) = sys::fs::open_log(&path, Some(&header)).unwrap();
+        let index = Arc::new(Index::new(&file, path, header.len() as u64).unwrap());
         drop(file);
         let mut log = JsonlLog {
             index: Arc::clone(&index),
@@ -954,7 +960,7 @@ mod tests {
         }
         assert!(lease.upgrade().is_none());
         assert!(log.enroll().is_none());
-        assert_eq!(index.end(), 7);
+        assert_eq!(index.end(), header.len() as u64);
         log.sync().unwrap();
         if let Some(request) = log.enroll() {
             request.leader.unwrap().run();
