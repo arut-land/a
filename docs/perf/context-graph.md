@@ -9,7 +9,7 @@ execution authority remains private to each session. The initial graph implement
 
 The owner subsequently approved proposals #1 and #2 together. The current
 revision adds forkable prepared encoded prefixes, bounded graph cursors across
-inherited scopes and incremental admission lookup. Its operation-scoped handle follow-up removes idle descriptor retention and the measured launch slope. The latest indexed-supervisor follow-up removes all-session pulse scans and reduces wide user CPU; total CPU acceptance remains unmet. The final section records the remaining measured work and tradeoffs. The sections
+inherited scopes and incremental admission lookup. Its operation-scoped handle follow-up removes idle descriptor retention and the measured launch slope. The latest indexed-supervisor follow-up removes all-session pulse scans and reduces wide user CPU. The owner accepts the CPU gate as met: owner-log scans, descriptor-dependent launch cost and supervisor scans are removed; remaining growth is full-context fork_task transmission plus noise. Independent review approved merging. The final section records the measurements, historical verdict and owner decision. The sections
 below preserve the earlier measurements and their unmet gates as historical
 evidence. Client history paging remains stage B; catalog interning was not
 approved.
@@ -98,7 +98,7 @@ Windows retirement). Post-integration fmt, check, all 484 tests, clippy, Windows
 build passed again. A separate integrated 64-turn smoke completed its extra live
 turn and cold reattach with matching hashes (65 turns, 520 tools). These tables
 are not a new repeated measurement of that integrated tree.
-The unmet CPU gate is explicit, and CI awaits independent review.
+**Historical verdict, superseded by the owner decision below:** The unmet CPU gate is explicit, and CI awaits independent review.
 
 Raw provenance, sources, repeated native counters, allocation stacks, renderer
 hashes and compressed stopped-home archives are retained outside the worktree:
@@ -154,7 +154,7 @@ construction and before rendering clients attach.
 | 8 | after | 83.67 [80.65–84.75] | 187.48 [182.88–242.89] | 3.87 [3.82–6.50] | 1730.15 [1729.05–1737.26] | 1884.59 [1871.70–1887.30] | 1834.00 [1830.64–1841.19] |
 
 Late CPU is substantially lower, but every after-arm slope remains positive.
-The required flat end-to-end CPU gate is **unmet**; no owner waiver was received.
+**Historical verdict, superseded by the owner decision below:** The required flat end-to-end CPU gate is **unmet**; no owner waiver was received.
 Full-context fork request traffic remains 0.323 MiB/turn in the first four turns
 and 5.128 MiB/turn in the last four, in both arms (sum of fork-role request
 bytes per root turn). The bounded cursor does not cap those requests. A separate
@@ -219,7 +219,7 @@ Only context-final-* cases enter these tables; one interrupted case was restarte
 fresh, and all completed cases were preserved. Full consumer, lifecycle and
 latency tables are in the phase report beside the raw evidence.
 
-**CPU acceptance is not met.** The raw CPU slopes below are positive, especially at wide concurrency. Required outgoing bodies are preserved and grow with full history. Independent native controls below show that send work alone does not explain the residual. Provider receive wall time is never subtracted from daemon CPU. This branch is not ready to merge; further store-file ownership is requested in the phase report.
+**Historical verdict, superseded by the owner decision below:** **CPU acceptance is not met.** The raw CPU slopes below are positive, especially at wide concurrency. Required outgoing bodies are preserved and grow with full history. Independent native controls below show that send work alone does not explain the residual. Provider receive wall time is never subtracted from daemon CPU. This branch is not ready to merge; further store-file ownership is requested in the phase report.
 
 All figures are median [minimum–maximum], n=3; CPU is ms per root turn, memory MiB. Slopes are OLS over rounds 9–32 (64-run slopes9–64). No provider body receive wall time is subtracted from CPU.
 
@@ -301,7 +301,7 @@ An isolated release probe uses the real public sys::spawn_group implementation, 
 
 The process control localizes a substantial part of the remaining depth cost to launch work under descriptor pressure. The isolated probe reproduces that dependency without context encoding or a model. It does not establish that the entire residual has a single cause. Source inspection identifies Index.file and Ends.idx in crates/engine/src/store/jsonl.rs as the retained per-session file owners.
 
-**Acceptance gate: not met.** Functional 64-turn completion and all required preservation checks pass, and shared prefix ownership removes repeated inherited compilation. However, total CPU still grows beyond measured transmission. No owner waiver is assumed, and this branch is not ready to merge.
+**Historical verdict, superseded by the owner decision below:** **Acceptance gate: not met.** Functional 64-turn completion and all required preservation checks pass, and shared prefix ownership removes repeated inherited compilation. However, total CPU still grows beyond measured transmission. No owner waiver is assumed, and this branch is not ready to merge.
 
 **Owner-pending file allocation:** crates/engine/src/store/jsonl.rs and its real store invariant/restart tests in crates/engine/src/store/tests.rs. The proposed follow-up is operation-scoped log/index file ownership: idle history keeps offsets and source identity, active I/O owns handles, and pending durability epochs retain exactly the handles needed until flush completion. This removes descriptor pressure without limiting sessions, history, tools or recall; it avoids modifying the excluded sys process backend. Preserve append ordering, torn-tail repair, read-only state, delayed cache flushes, concurrent readers, restart and file/source identity. Likelihood/cost: the failure is deterministic in this matrix; directly measured launch growth is about 40 ms/root turn at this scale. Implementation and portable lifetime verification are estimated at 1–2 days, followed by the repeated acceptance matrix. That expected gain is not a measured fix, and further residual attribution may still be needed. No such storage change or speculative hardening was added under the current file allocation.
 
@@ -351,7 +351,7 @@ residual. Three native stack captures with a matching dSYM identify
 Owner::hibernate/next_hibernation/loaded and Live::idle_for scans over daemon-wide
 collections (14.87–16.71% of sampled userspace leaf weight; not a CPU-time partition).
 These are a remaining hot path, not an exclusive explanation of every residual cycle.
-**Total CPU acceptance remains unmet; #1+#2 are not ready to merge.** Further
+**Historical verdict, superseded by the owner decision below:** **Total CPU acceptance remains unmet; #1+#2 are not ready to merge.** Further
 supervisor/index/deadline work needs crates/engine/src/lib.rs ownership and a
 counterfactual measurement. No such change was made here.
 
@@ -445,7 +445,7 @@ stacks identify incremental child-ownership range reads, current context-node
 writes, request transport and checkpoints. The child-ownership cursor already
 advances; these stacks do not show a settled-prefix reread. Kernel/wait leaves
 include file operations/durability and socket sends but are dominated by waits.
-**Total CPU acceptance remains unmet; this branch is not ready to merge.** Further
+**Historical verdict, superseded by the owner decision below:** **Total CPU acceptance remains unmet; this branch is not ready to merge.** Further
 narrow native CPU/syscall attribution is owner-pending before another product change
 (estimated 0.5–1 day plus any newly approved matrix). No residual was relabelled as
 necessary transmission without evidence.
@@ -468,4 +468,14 @@ The edit-test TempDir flake remains with its owner. Full phase report:
 `context-graph.supervisor.report.md` in the existing context-graph evidence root;
 `super-final-provenance.json` and `supervisor-attribution-provenance.json` pin code,
 binaries, scripts, raw tables and diagnostic symbols. Earlier reports and the
-native spawn probe remain intact. Phase 1 stops for independent re-review.
+native spawn probe remain intact. Phase 1 stopped for independent re-review.
+
+### Owner acceptance after independent review
+
+The owner accepts the CPU gate as met. Owner-log scans, descriptor-dependent
+launch cost and supervisor scans have been removed; the owner attributes the
+remaining growth to full-context fork_task transmission plus noise. Independent
+review approved merging, subject to this documentation correction. This decision
+supersedes the earlier unmet-gate and not-ready-to-merge verdicts above. Every
+measurement, spread and attribution limitation is retained unchanged. Phase 2
+proceeds with main integration and Linux/Windows CI.
