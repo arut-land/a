@@ -71,6 +71,27 @@ enum Waiting {
     Own(String),
 }
 
+/// Cursor boundaries and projection interpret admitted model inputs identically.
+pub(super) enum ModelInput<'a> {
+    Direct(&'a str),
+    Inbox(&'a str),
+}
+
+impl ModelInput<'_> {
+    pub(super) fn turn(self) -> Option<ext::ModelTurn> {
+        match self {
+            Self::Direct(text) => ext::ModelTurn::from_intent(text).ok().map(|(turn, _)| turn),
+            Self::Inbox(text) => {
+                let json = serde_json::from_str::<protocol::Json>(text).ok()?;
+                let input = protocol::publication::ThreadInput::from_json(&json).ok()?;
+                ext::ModelTurn::from_intent(input.turn.raw())
+                    .ok()
+                    .map(|(turn, _)| turn)
+            }
+        }
+    }
+}
+
 /// `segments` as the model reads them: typed text as it is, and what the
 /// user pasted or attached tagged as such; a steer, given to a turn already
 /// running, says who gave it.
@@ -580,21 +601,11 @@ impl Transcript {
                     let (text, turn) = match waiting {
                         Waiting::Input(segments, _) => {
                             let text = segments.text();
-                            let turn = ext::ModelTurn::from_intent(&text)
-                                .ok()
-                                .map(|(turn, _)| turn);
+                            let turn = ModelInput::Direct(&text).turn();
                             (text, turn)
                         }
                         Waiting::Inbox(_, text) => {
-                            let turn = serde_json::from_str::<protocol::Json>(&text)
-                                .ok()
-                                .and_then(|json| {
-                                    protocol::publication::ThreadInput::from_json(&json).ok()
-                                })
-                                .and_then(|input| {
-                                    ext::ModelTurn::from_intent(input.turn.raw()).ok()
-                                })
-                                .map(|(turn, _)| turn);
+                            let turn = ModelInput::Inbox(&text).turn();
                             (text, turn)
                         }
                         Waiting::Own(text) => (text, None),

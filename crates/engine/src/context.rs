@@ -5,7 +5,7 @@ use std::io::{self, Write};
 
 use ext::blob::{BlobStore, Places};
 use protocol::publication::{
-    ContextImage, ContextInput, ContextLayer, ContextNode, ContextValue, SpawnImage,
+    ContextImage, ContextInput, ContextLayer, ContextNode, ContextValue, RunnerKind, SpawnImage,
 };
 use protocol::{BlobOrigin, BlobRef, Body, Entry};
 
@@ -121,7 +121,7 @@ impl Presentation {
             &ContextNode {
                 previous: None,
                 presentation: None,
-                runner: protocol::publication::RunnerKind::Agent,
+                runner: RunnerKind::Agent,
                 inputs: vec![ContextInput(
                     protocol::Seq::new(1).unwrap(),
                     ContextValue::Presentation(metadata),
@@ -215,15 +215,18 @@ pub(crate) fn expand_bounded(
     places: &Places,
     exchanges: u16,
 ) -> io::Result<Vec<ContextLayer>> {
-    expand_with(image, places, Some(exchanges))
+    if exchanges == 0 {
+        return Ok(Vec::new());
+    }
+    expand_with(image, places, Some(usize::from(exchanges) + 1))
 }
 
 fn expand_with(
     image: &ContextImage,
     places: &Places,
-    exchanges: Option<u16>,
+    window: Option<usize>,
 ) -> io::Result<Vec<ContextLayer>> {
-    if exchanges == Some(0) {
+    if window == Some(0) {
         return Ok(Vec::new());
     }
     let mut nodes = Vec::new();
@@ -233,8 +236,8 @@ fn expand_with(
         let mut node = read(&blob, places)?;
         next = node.previous.take();
         nodes.push(node);
-        if let Some(exchanges) = exchanges
-            && let Some(seq) = suffix_start(&nodes, exchanges)
+        if let Some(window) = window
+            && let Some(seq) = suffix_start(&nodes, window, image.runner)
         {
             start = Some(seq);
             break;
@@ -247,6 +250,7 @@ fn expand_with(
             .flat_map(|node| node.edits.iter().cloned())
             .collect(),
     );
+    let local_users = window.map_or_default(|_| user_boundaries(&nodes, &edits, image.runner));
     let completed: HashSet<_> = nodes
         .iter()
         .flat_map(|node| &node.inputs)
@@ -272,7 +276,15 @@ fn expand_with(
                 };
                 ContextValue::User(text.clone())
             } else if let ContextValue::Inherited(at) = value {
-                let mut inherited = expand_with(&node.inherited[at], places, exchanges)?;
+                // The leading exchange belongs to the whole cursor, not to
+                // every inherited scope it crosses.
+                let remaining = window.map(|window| {
+                    window.saturating_sub(local_users.iter().filter(|user| **user > seq).count())
+                });
+                let mut inherited = expand_with(&node.inherited[at], places, remaining)?;
+                if inherited.is_empty() {
+                    continue;
+                }
                 let offset = image.len();
                 for ContextLayer(_, inputs) in &mut inherited {
                     for ContextInput(_, value) in inputs {
@@ -307,9 +319,9 @@ fn expand_with(
     Ok(image)
 }
 
-/// Keep an extra complete local exchange so selection never starts within a tool group.
+/// Keep one extra exchange so selection never starts within a tool group.
 /// An older call/queue dependency forces the reader to continue into the preceding segment.
-fn suffix_start(nodes: &[ContextNode], exchanges: u16) -> Option<protocol::Seq> {
+fn suffix_start(nodes: &[ContextNode], window: usize, runner: RunnerKind) -> Option<protocol::Seq> {
     let edits = crate::transcript::Edits::new(
         nodes
             .iter()
@@ -317,35 +329,12 @@ fn suffix_start(nodes: &[ContextNode], exchanges: u16) -> Option<protocol::Seq> 
             .flat_map(|node| node.edits.iter().cloned())
             .collect(),
     );
-    let taken: HashSet<_> = nodes
-        .iter()
-        .flat_map(|node| &node.inputs)
-        .filter_map(|ContextInput(seq, value)| {
-            if edits.at(*seq).is_none()
-                && let ContextValue::Taken(input) = value
-            {
-                Some(*input)
-            } else {
-                None
-            }
-        })
-        .collect();
-    let boundaries: Vec<_> = nodes
-        .iter()
-        .rev()
-        .flat_map(|node| &node.inputs)
-        .filter_map(|ContextInput(seq, value)| match edits.at(*seq) {
-            Some((from, Some(_))) if from == seq.get() => Some(*seq),
-            None if matches!(value, ContextValue::User(_))
-                || matches!(value, ContextValue::Queued(..) | ContextValue::Inbox(..) if taken.contains(seq)) =>
-            {
-                Some(*seq)
-            }
-            Some(_) | None => None,
-        })
-        .collect();
-    let start = *boundaries.get(boundaries.len().checked_sub(usize::from(exchanges) + 1)?)?;
-    let requested = boundaries[boundaries.len() - usize::from(exchanges)];
+    let boundaries = user_boundaries(nodes, &edits, runner);
+    let start = *boundaries.get(boundaries.len().checked_sub(window)?)?;
+    if window == 1 {
+        return Some(start);
+    }
+    let requested = boundaries[boundaries.len() - (window - 1)];
     for ContextInput(seq, value) in nodes.iter().flat_map(|node| &node.inputs) {
         // The extra leading exchange protects tool-group boundaries; its own
         // dependencies cannot extend the requested suffix indefinitely.
@@ -364,6 +353,60 @@ fn suffix_start(nodes: &[ContextNode], exchanges: u16) -> Option<protocol::Seq> 
         }
     }
     Some(start)
+}
+
+fn user_boundaries(
+    nodes: &[ContextNode],
+    edits: &crate::transcript::Edits,
+    runner: RunnerKind,
+) -> Vec<protocol::Seq> {
+    let taken: HashSet<_> = nodes
+        .iter()
+        .flat_map(|node| &node.inputs)
+        .filter_map(|ContextInput(seq, value)| {
+            if edits.at(*seq).is_none()
+                && let ContextValue::Taken(input) = value
+            {
+                Some(*input)
+            } else {
+                None
+            }
+        })
+        .collect();
+    nodes
+        .iter()
+        .rev()
+        .flat_map(|node| &node.inputs)
+        .filter_map(|ContextInput(seq, value)| {
+            match edits.at(*seq) {
+                Some((from, Some(_))) if from == seq.get() => return Some(*seq),
+                Some(_) => return None,
+                None => {}
+            }
+            let turn = match value {
+                ContextValue::User(_) => return Some(*seq),
+                ContextValue::Queued(segments, _) if taken.contains(seq) => {
+                    if runner == RunnerKind::Agent {
+                        return Some(*seq);
+                    }
+                    crate::transcript::ModelInput::Direct(&segments.text()).turn()
+                }
+                ContextValue::Inbox(_, text) if taken.contains(seq) => {
+                    if runner == RunnerKind::Agent {
+                        return Some(*seq);
+                    }
+                    crate::transcript::ModelInput::Inbox(text).turn()
+                }
+                _ => return None,
+            };
+            turn.is_none_or(|turn| {
+                turn.messages
+                    .iter()
+                    .any(|message| matches!(message, llm::Message::User(_)))
+            })
+            .then_some(*seq)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -608,6 +651,142 @@ mod tests {
                 expand(&branch, places).is_err(),
                 "the full projection still needs the removed ancestor"
             );
+        });
+    }
+
+    #[test]
+    fn a_global_window_keeps_system_only_inherited_inputs() {
+        TEST_STORE.with(|(_, store, places)| {
+            let owner = SessionId::new();
+            let mut entries = vec![entry(
+                1,
+                Body::Spawned {
+                    intent: SpawnImage {
+                        runner: RunnerKind::ModelOnly,
+                        authority: Json::null(),
+                        image: ContextImage::default(),
+                    }
+                    .to_json()
+                    .unwrap(),
+                },
+            )];
+            for seq in [2, 4, 6] {
+                let mut turn = ext::Conversation::turn::<ext_title::Title>("system", "")
+                    .request(CallId::new(seq).unwrap());
+                turn.messages =
+                    llm::Messages::from_iter([llm::Message::system(format!("system {seq}"))]);
+                let input = protocol::publication::ThreadInput {
+                    turn: turn.intent(None).unwrap(),
+                    context: ContextImage::default(),
+                }
+                .to_json()
+                .unwrap();
+                entries.extend([
+                    entry(
+                        seq,
+                        Body::Enqueue {
+                            envelope: protocol::Envelope::new(
+                                protocol::EnvelopeId {
+                                    sender: owner,
+                                    call: CallId::new(seq).unwrap(),
+                                    purpose: "system".into(),
+                                },
+                                owner,
+                                protocol::Carried::Message(input.raw().into()),
+                                Vec::new(),
+                            )
+                            .unwrap(),
+                        },
+                    ),
+                    entry(
+                        seq + 1,
+                        Body::Take {
+                            input: protocol::Seq::new(seq).unwrap(),
+                            into: None,
+                        },
+                    ),
+                ]);
+            }
+            let parent = append(ContextImage::default(), entries, &**store).unwrap();
+            let child = append(
+                ContextImage::default(),
+                [spawn(1, parent), user(2, "first"), user(3, "second")],
+                &**store,
+            )
+            .unwrap();
+            let registry = Arc::new(ext::host::Registry::default());
+            let policy = llm::ContextPolicy {
+                exchanges: 2,
+                bytes: 100_000,
+            };
+            let current = llm::Messages::from_iter([llm::Message::user("mandatory")]);
+            let full =
+                crate::transcript::Transcript::cut(&child, registry.clone(), "", places, None)
+                    .unwrap()
+                    .into_messages();
+            let bounded = crate::transcript::Transcript::cut(
+                &child,
+                registry,
+                "",
+                places,
+                Some(policy.exchanges),
+            )
+            .unwrap()
+            .into_messages();
+            assert_eq!(
+                policy.assemble(&[], &bounded, &current).unwrap(),
+                policy.assemble(&[], &full, &current).unwrap()
+            );
+        });
+    }
+
+    #[test]
+    fn a_bounded_side_never_walks_past_its_inherited_exchange_budget() {
+        TEST_STORE.with(|(_, store, places)| {
+            let mut cut = append(ContextImage::default(), [user(1, "old root")], &**store).unwrap();
+            let mut unrequested = None;
+            for depth in 0..24 {
+                cut = append(
+                    ContextImage::default(),
+                    [
+                        spawn(1, cut),
+                        user(2, &format!("fork {depth}")),
+                        entry(
+                            3,
+                            Body::Assistant {
+                                text: format!("answer {depth}"),
+                            },
+                        ),
+                    ],
+                    &**store,
+                )
+                .unwrap();
+                if depth == 12 {
+                    unrequested = cut.root.clone();
+                }
+            }
+            let registry = Arc::new(ext::host::Registry::default());
+            let policy = llm::ContextPolicy {
+                exchanges: 2,
+                bytes: 100_000,
+            };
+            let current = llm::Messages::from_iter([llm::Message::user("mandatory")]);
+            let full = crate::transcript::Transcript::cut(&cut, registry.clone(), "", places, None)
+                .unwrap()
+                .into_messages();
+            let expected = policy.assemble(&[], &full, &current).unwrap();
+            std::fs::remove_file(store.materialize(&unrequested.unwrap().id).unwrap()).unwrap();
+            let recent = crate::transcript::Transcript::cut(
+                &cut,
+                registry,
+                "",
+                places,
+                Some(policy.exchanges),
+            )
+            .unwrap()
+            .into_messages();
+            assert_eq!(policy.assemble(&[], &recent, &current).unwrap(), expected);
+            assert!(expand(&cut, places).is_err());
         });
     }
 
