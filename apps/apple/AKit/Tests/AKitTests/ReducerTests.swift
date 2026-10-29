@@ -216,6 +216,7 @@ func expectInStep(_ store: SessionStore, _ reducer: Reducer, _ name: String) {
     let item = reducer.snapshot().items[0]
     let store = SessionStore(source: Reducer())
     let batch = ChangeBatch(
+        history: nil,
         revision: 1, retainedBytes: 0, seq: 99,
         changes: [
             .added(index: 0, item: item),
@@ -245,9 +246,11 @@ func expectInStep(_ store: SessionStore, _ reducer: Reducer, _ name: String) {
         let store = SessionStore(source: Reducer())
         let turn = store.turn
         store.apply(ChangeBatch(
+        history: nil,
             revision: 1, retainedBytes: 0, seq: 1, changes: [.added(index: 0, item: item)],
             turn: turn, streaming: nil, title: "original"))
         store.apply(ChangeBatch(
+        history: nil,
             revision: 2, retainedBytes: 0, seq: 99, changes: [.error(message: "discarded")] + changes,
             turn: reducer.turn(), streaming: StreamId(call: 123, attempt: 0), title: "discarded"))
         #expect(store.items == [item])
@@ -257,6 +260,7 @@ func expectInStep(_ store: SessionStore, _ reducer: Reducer, _ name: String) {
         #expect(store.sessionId == nil && store.workspace.isEmpty && store.problem == nil)
 
         store.apply(ChangeBatch(
+        history: nil,
             revision: 2, retainedBytes: 0, seq: 2,
             changes: [.added(index: 1, item: next), .updated(index: 1, item: next)],
             turn: turn, streaming: nil, title: "retry"))

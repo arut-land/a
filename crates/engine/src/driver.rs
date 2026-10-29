@@ -22,7 +22,7 @@ use std::task::Poll;
 use std::time::Instant;
 
 use crate::catalog::Record;
-use crate::store::{Encoded, Header, Loaded, Parent, Snapshot, Writer};
+use crate::store::{Header, Loaded, Parent, Snapshot, Writer};
 use ext::host::{Binding, Bound, Host, Parts, Registry, SessionServices};
 use ext::point::View;
 use ext::{BoxFuture, Called, Cancel, Cx, Flag, States};
@@ -31,6 +31,7 @@ use kernel::{
     Work as Effect,
 };
 use protocol::ledger::Ledger;
+#[cfg(test)]
 use protocol::view::SessionView;
 use protocol::{
     Activity, Author, Body, CallId, DaemonMsg, Entry, Environment, Frame, Json, Mode, Outcome,
@@ -487,8 +488,8 @@ pub struct Live {
     pub id: SessionId,
     pub workspace: PathBuf,
     pub parent: Option<Parent>,
-    /// The committed entries, encoded once for every client.
-    frames: Arc<FrameLog>,
+    /// The committed log boundary shared by history readers.
+    pub(super) frames: Arc<FrameLog>,
     followers: Mutex<Subscribers>,
     /// Live text of calls whose `model_call` entry is not shown yet, with
     /// the fence it was streamed under: a stream can start before its call
@@ -608,7 +609,7 @@ enum Msg {
     },
 
     #[cfg(test)]
-    ProjectionCache(bool, oneshot::Sender<[bool; 3]>),
+    ProjectionCache(bool, oneshot::Sender<bool>),
     Reclaim,
     Stop,
     /// Whether the session's work can go to the daemon's next build: see
@@ -855,7 +856,15 @@ impl Live {
             id: header.id,
             workspace: header.workspace.clone(),
             parent: header.parent,
-            frames: Arc::new(FrameLog::new(loaded.lines, loaded.seq)),
+            frames: Arc::new(FrameLog::with_owner(
+                loaded.lines,
+                loaded.seq,
+                crate::history::Owner {
+                    session: header.id,
+                    workspace: protocol::HostPath::lossy(&header.workspace),
+                    generation: protocol::Epoch(loaded.writer.epoch()),
+                },
+            )),
             followers: Mutex::default(),
             early: Mutex::default(),
             busy: AtomicBool::new(busy && read_only.is_none()),
@@ -1799,13 +1808,8 @@ impl Actor {
                     ))
                     .await
                     .unwrap();
-                    self.snapshot(self.journal.ordered_seq).await;
                 }
-                reply.send([
-                    self.projection.transcript.is_some(),
-                    self.projection.snapshot.is_some(),
-                    self.projection.view.is_some(),
-                ]);
+                reply.send(self.projection.transcript.is_some());
                 return None;
             }
             Msg::Sync => return None,
@@ -1814,8 +1818,6 @@ impl Actor {
                 {
                     self.projection.release_model();
                     lock(&self.live.session.incoming_prefix).take();
-                    self.projection.snapshot = None;
-                    self.projection.view = None;
                 }
                 return None;
             }
@@ -2119,7 +2121,7 @@ impl Actor {
         if sync {
             self.sync().await?;
         }
-        self.show_synced();
+        self.show_synced().await;
         Ok(())
     }
 
@@ -2564,7 +2566,19 @@ impl Actor {
         };
         self.journal.ordered_seq = loaded.seq;
         self.journal.durable_seq = loaded.seq;
-        let recovered = FrameLog::new(Arc::clone(&loaded.lines), loaded.seq);
+        let recovered = FrameLog::with_owner(
+            Arc::clone(&loaded.lines),
+            loaded.seq,
+            crate::history::Owner {
+                session: self.live.id,
+                workspace: protocol::HostPath::lossy(&self.live.workspace),
+                generation: protocol::Epoch(loaded.writer.epoch()),
+            },
+        );
+        self.live
+            .frames
+            .history
+            .reset(protocol::Epoch(loaded.writer.epoch()));
         self.live.frames.reloaded(loaded.lines);
         self.journal.writer = Some(loaded.writer);
         self.journal.since_snapshot = loaded.read;
@@ -2592,10 +2606,7 @@ impl Actor {
                 return;
             }
         };
-        for entry in entries {
-            let lines = Encoded::of(std::slice::from_ref(&entry)).expect("loaded entry encodes");
-            self.show(std::slice::from_ref(&entry), &lines);
-        }
+        self.show(entries).await;
         self.publish();
         let load = Load {
             session: Some(self.live.id),
@@ -3298,10 +3309,6 @@ fn relisted(listed: &Record, now: &Record) -> bool {
     listed.busy != now.busy || listed.activity != now.activity
 }
 
-/// How many entries behind a client must be to get a snapshot rather than
-/// a replay.
-const SNAPSHOT_GAP: u64 = 256;
-
 /// The most messages an actor steps together, so that a flood of them
 /// still commits now and then.
 const BURST: usize = 64;
@@ -3322,7 +3329,7 @@ impl Live {
         self.ended.clone()
     }
 
-    pub(crate) fn projection_cache(&self, populate: bool) -> [bool; 3] {
+    pub(crate) fn projection_cache(&self, populate: bool) -> bool {
         let (reply, result) = oneshot::channel();
         self.send(Msg::ProjectionCache(populate, reply));
         rt::block_on(result).unwrap()

@@ -872,20 +872,66 @@ impl Kept {
 }
 
 /// Sharing settled JSON avoids reserializing it on subsequent requests.
+// Leave allocation metadata within a 256 KiB size class. Serialized runs can
+// be arbitrarily long without pinning a multi-MiB serialization allocation.
+const FRAGMENT_BYTES: usize = (256 << 10) - 1024;
+type Run = Arc<[Shared]>;
+
 #[derive(Default)]
-pub(crate) struct Settled(Vec<u8>);
+pub(crate) struct Settled {
+    chunks: Vec<Shared>,
+    buffer: Vec<u8>,
+}
 
 impl Settled {
     pub(crate) fn item(&mut self, item: &(impl Serialize + ?Sized)) {
-        if !self.0.is_empty() {
-            self.0.push(b',');
+        use std::io::Write;
+        if !self.chunks.is_empty() || !self.buffer.is_empty() {
+            let _ = self.write_all(b",");
         }
-        // Writing to memory cannot fail.
-        let _ = serde_json::to_writer(&mut self.0, item);
+        let _ = serde_json::to_writer(self, item);
     }
 
-    fn shared(self) -> Option<Shared> {
-        (!self.0.is_empty()).then(|| self.0.into())
+    fn shared(mut self) -> Option<Run> {
+        if !self.buffer.is_empty() {
+            self.chunks.push(self.buffer.into());
+        }
+        (!self.chunks.is_empty()).then(|| self.chunks.into())
+    }
+}
+
+impl std::io::Write for Settled {
+    fn write(&mut self, mut bytes: &[u8]) -> std::io::Result<usize> {
+        let count = bytes.len();
+        while !bytes.is_empty() {
+            let take = bytes.len().min(FRAGMENT_BYTES - self.buffer.len());
+            let needed = self.buffer.len() + take;
+            if needed > self.buffer.capacity() {
+                let capacity = needed
+                    .max(self.buffer.capacity().saturating_mul(2))
+                    .clamp(128, FRAGMENT_BYTES);
+                self.buffer.reserve_exact(capacity - self.buffer.len());
+            }
+            self.buffer.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            if self.buffer.len() == FRAGMENT_BYTES {
+                self.chunks.push(std::mem::take(&mut self.buffer).into());
+            }
+        }
+        Ok(count)
+    }
+
+    #[inline]
+    fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        if bytes.len() <= self.buffer.capacity() - self.buffer.len() {
+            self.buffer.extend_from_slice(bytes);
+            return Ok(());
+        }
+        self.write(bytes).map(|_| ())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -1028,20 +1074,20 @@ fn fold_retained<F: Fold>(
 
 /// Immutable settled runs; a branch shares the existing chunk tree.
 #[derive(Clone, Default)]
-pub struct Fragments(rpds::VectorSync<Shared>);
+pub struct Fragments(rpds::VectorSync<Run>);
 
 impl Fragments {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &Shared> {
+    pub fn iter(&self) -> impl Iterator<Item = &Run> {
         self.0.iter()
     }
 }
 
-impl Extend<Shared> for Fragments {
-    fn extend<T: IntoIterator<Item = Shared>>(&mut self, runs: T) {
+impl Extend<Run> for Fragments {
+    fn extend<T: IntoIterator<Item = Run>>(&mut self, runs: T) {
         for bytes in runs {
             self.0.push_back_mut(bytes);
         }
@@ -1051,7 +1097,7 @@ impl Extend<Shared> for Fragments {
 impl From<Vec<Shared>> for Fragments {
     fn from(runs: Vec<Shared>) -> Self {
         let mut fragments = Self::default();
-        fragments.extend(runs);
+        fragments.extend(runs.into_iter().map(|bytes| vec![bytes].into()));
         fragments
     }
 }
@@ -1099,9 +1145,11 @@ impl History {
             out.text(open);
             first = true;
         }
-        for bytes in self.settled.iter() {
+        for run in self.settled.iter() {
             out.comma(&mut first);
-            out.shared(Arc::clone(bytes));
+            for bytes in run.iter() {
+                out.shared(Arc::clone(bytes));
+            }
         }
         if let Some((_, close)) = wrap {
             out.text(close);

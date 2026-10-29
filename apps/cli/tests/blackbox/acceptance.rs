@@ -44,7 +44,6 @@ fn a_history_larger_than_the_pending_event_budget_opens_without_loss() {
     // The writer must still progress with a one-event inbox before rendering.
     driver.io(client::Io::Send(ClientMsg::List)).unwrap();
     rt::block_on(driver.flush()).unwrap();
-    let mut replayed = Vec::new();
     loop {
         let event = inbox
             .recv_timeout(std::time::Duration::from_secs(5))
@@ -53,16 +52,18 @@ fn a_history_larger_than_the_pending_event_budget_opens_without_loss() {
             event.kind,
             client::EventKind::Msg(protocol::DaemonMsg::Synced { .. })
         );
-        if let client::EventKind::Msg(protocol::DaemonMsg::Entry(ref entry)) = event.kind {
-            replayed.push(entry.clone());
-        }
         driver.pump(&mut (), session.step(event));
-        if synced {
+        if (synced || session.link().attached())
+            && !session.history_pending()
+            && session.view().history.is_some()
+        {
             break;
         }
         assert!(session.link().attached());
     }
-    assert_eq!(replayed, expected);
+    let canonical =
+        protocol::view::SessionView::from_log(id, env.ws.clone().try_into().unwrap(), expected);
+    assert_eq!(session.view().items, canonical.items);
 }
 
 #[test]
@@ -227,7 +228,7 @@ fn two_terminals_on_one_session_see_identical_state() {
     assert_eq!(seen[0], env.log(id));
     let hashes = [&first, &second, &third].map(|c| c.view.state_hash());
     assert_eq!(hashes, [hashes[0]; 3], "{:#?}", [first.view, third.view]);
-    assert_ne!(first.view.items, []);
+    assert!(!first.view.items.is_empty());
 }
 
 #[test]

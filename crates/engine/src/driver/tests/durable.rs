@@ -94,7 +94,7 @@ fn a_failed_enqueue_releases_transport_for_retry() {
 }
 
 /// The entries `outbox` is sent, until `done` holds of them.
-fn shown(outbox: &Outbox, done: impl Fn(&[Entry]) -> bool) -> Vec<Entry> {
+fn shown(outbox: &Outbox, session: &Live, done: impl Fn(&[Entry]) -> bool) -> Vec<Entry> {
     let mut seen = Vec::new();
     let reading = async {
         while !done(&seen) {
@@ -102,10 +102,18 @@ fn shown(outbox: &Outbox, done: impl Fn(&[Entry]) -> bool) -> Vec<Entry> {
                 .next(&rt::Threads::new(1))
                 .await
                 .expect("the follower is open");
-            if let Ok(Some(DaemonMsg::Entry(e))) =
+            if let Ok(Some(DaemonMsg::Head { head })) =
                 protocol::read_frame::<DaemonMsg>(&mut frame.as_bytes())
             {
-                seen.push(e);
+                let through = seen.last().map_or(0, |entry: &Entry| entry.seq.get());
+                seen.extend(
+                    session
+                        .frames
+                        .entries_after(through)
+                        .unwrap()
+                        .into_iter()
+                        .take_while(|entry| entry.seq.get() <= head.cut.seq),
+                );
             }
         }
     };
@@ -136,7 +144,7 @@ fn a_seq_shown_to_a_client_survives_a_power_cut() {
     let outbox = Outbox::new();
     session.follow(&outbox, 0);
     session.submit("$ echo one; sleep 30").unwrap();
-    let seen = shown(&outbox, |seen| {
+    let seen = shown(&outbox, &session, |seen| {
         seen.iter().any(|e| matches!(e.body, Body::Progress { .. }))
     });
     faulty.cut();

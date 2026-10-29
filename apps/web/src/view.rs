@@ -230,9 +230,14 @@ pub fn item_row<'a>(item: &'a Item, view: &'a SessionView) -> impl Renderable {
     }
 }
 
-/// Where the text streamed for model call `call` goes.
-pub fn reply_id(call: CallId) -> String {
-    format!("#reply-{call}")
+/// The active reply is independent of the committed range being transferred.
+#[component]
+pub fn live_reply<'a>(call: CallId, text: &'a str) -> impl Renderable {
+    maud! {
+        div #live {
+            div style=(style::THEIRS) { span #{ "live-reply-" (call.get()) } { (text) } "▍" }
+        }
+    }
 }
 
 /// A piece of streamed text, as appended to its reply.

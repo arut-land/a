@@ -1,10 +1,11 @@
-//! Native protocol timing without a shell or a process launch in each sample.
+//! Public control-attach timing; committed history is requested separately.
 use std::io::BufReader;
 use std::time::{Duration, Instant};
 
+use protocol::history::{Head, Heads};
 use protocol::{ClientMsg, DaemonMsg, Decode, Entry, Target};
 
-fn attach(home: &sys::Home, target: Target) -> (protocol::SessionId, Vec<Entry>, u64) {
+fn attach(home: &sys::Home, target: Target) -> (protocol::HostPath, Head, u64) {
     let mut stream = home.endpoint().connect().unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
@@ -36,19 +37,32 @@ fn attach(home: &sys::Home, target: Target) -> (protocol::SessionId, Vec<Entry>,
         },
     )
     .unwrap();
-    let Some(DaemonMsg::Attached { session, .. }) = protocol::read_frame(&mut reader).unwrap()
+    let Some(DaemonMsg::Attached { workspace, .. }) = protocol::read_frame(&mut reader).unwrap()
     else {
         panic!("expected attached");
     };
-    let mut replay = Vec::new();
+    let mut head = None;
+    let mut parts = Heads::default();
     loop {
         match protocol::read_frame::<DaemonMsg>(&mut reader)
             .unwrap()
             .expect("daemon closed")
         {
-            DaemonMsg::Entry(entry) => replay.push(entry),
+            DaemonMsg::Head { head: received } => head = Some(*received),
+            DaemonMsg::HeadPart {
+                seq,
+                offset,
+                text,
+                done,
+            } => {
+                if let Some(received) = parts.part(seq, offset, &text, done).unwrap() {
+                    head = Some(received);
+                }
+            }
             DaemonMsg::Activity { .. } => {}
-            DaemonMsg::Synced { seq } => return (session, replay, seq),
+            DaemonMsg::Synced { seq } => {
+                return (workspace, head.expect("attach supplies controls"), seq);
+            }
             message => panic!("unexpected replay message: {message:?}"),
         }
     }
@@ -73,11 +87,12 @@ fn main() {
     let home = sys::Home::from(std::path::PathBuf::from(
         std::env::var_os("A_HOME").expect("isolated A_HOME"),
     ));
-    let (id, replay, seq) = attach(
+    let (workspace, head, seq) = attach(
         &home,
         Target::Prefix(std::env::args().nth(1).expect("session id")),
     );
-    // The persisted log is independent of the replay path under measurement.
+    let id = head.cut.session;
+    // The persisted log is independent of the control path under measurement.
     let text = std::fs::read_to_string(home.sessions_dir().join(id.to_string()).join("log.jsonl"))
         .unwrap();
     assert!(text.ends_with('\n'), "torn session log");
@@ -87,30 +102,31 @@ fn main() {
         .map(|line| Entry::from_json(line.as_bytes()).unwrap())
         .collect();
     assert!(!expected.is_empty(), "attach workload must have history");
-    verify_replay(&expected, &replay, seq);
+    let mut index = protocol::view::Index::new(id, workspace);
+    for entry in &expected {
+        index.apply(entry);
+    }
+    let expected = index.head(head.cut.generation);
+    verify_head(&expected, &head, seq);
     let times: Vec<_> = (0..500)
         .map(|_| {
             let start = Instant::now();
-            let (session, replay, seq) = attach(&home, Target::Id(id));
+            let (_, head, seq) = attach(&home, Target::Id(id));
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-            assert_eq!(session, id);
-            verify_replay(&expected, &replay, seq);
+            assert_eq!(head.cut.session, id);
+            verify_head(&expected, &head, seq);
             elapsed
         })
         .collect();
     println!("{}", serde_json::to_string(&times).unwrap());
 }
 
-fn verify_replay(expected: &[Entry], replay: &[Entry], seq: u64) {
+fn verify_head(expected: &Head, head: &Head, seq: u64) {
     assert_eq!(
-        replay, expected,
-        "attach must replay the complete persisted log"
+        head, expected,
+        "attach must supply complete public controls"
     );
-    assert_eq!(
-        seq,
-        expected.last().unwrap().seq.get(),
-        "synced must cover the replay"
-    );
+    assert_eq!(seq, head.cut.seq, "synced must certify the control cut");
 }
 
 #[cfg(test)]
@@ -118,7 +134,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn missing_changed_or_prematurely_synced_replays_are_never_samples() {
+    fn changed_or_prematurely_synced_controls_are_never_samples() {
         let expected: Vec<_> = (1..=2)
             .map(|seq| {
                 Entry::new(
@@ -134,11 +150,16 @@ mod tests {
                 )
             })
             .collect();
-        verify_replay(&expected, &expected, 2);
+        let mut index = protocol::view::Index::new(protocol::SessionId::new(), "/work".into());
+        for entry in &expected {
+            index.apply(entry);
+        }
+        let expected = index.head(protocol::Epoch(1));
+        verify_head(&expected, &expected, 2);
         let mut changed = expected.clone();
-        changed[0].body = expected[1].body.clone();
-        for (replay, seq) in [(&expected[..1], 2), (&changed[..], 2), (&expected[..], 1)] {
-            assert!(std::panic::catch_unwind(|| verify_replay(&expected, replay, seq)).is_err());
+        changed.count = 0;
+        for (head, seq) in [(&changed, 2), (&expected, 1)] {
+            assert!(std::panic::catch_unwind(|| verify_head(&expected, head, seq)).is_err());
         }
     }
 }

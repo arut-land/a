@@ -6,10 +6,8 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::fs;
 
-use protocol::Decode;
-
 use super::*;
-use crate::store::{FORMAT, seal, unseal};
+use crate::store::{FORMAT, seal};
 
 /// The system allocator, counting the bytes this thread holds and the most
 /// it has held.
@@ -107,18 +105,6 @@ impl OnDisk {
     fn path(&self, id: SessionId) -> PathBuf {
         self.dir.join(format!("{id}/log.jsonl"))
     }
-
-    /// The lines of session `id`'s file after its header, unsealed.
-    fn lines(&self, id: SessionId) -> Vec<Vec<u8>> {
-        let file = fs::read(self.path(id)).unwrap();
-        let lines = file.split_inclusive(|&b| b == b'\n').skip(1);
-        let unsealed = lines.map(|line| {
-            let mut line = line.to_vec();
-            assert!(unseal(&mut line));
-            line
-        });
-        unsealed.collect()
-    }
 }
 
 /// `n` turns' worth of entries, the user's and the answer's in turn, each
@@ -150,89 +136,52 @@ fn sent(session: &Live, since: u64) -> Vec<Frame> {
     std::iter::from_fn(|| outbox.try_next()).collect()
 }
 
-fn entries(frames: impl IntoIterator<Item = Frame>) -> Vec<Frame> {
-    frames.into_iter().filter(|f| f.seq.is_some()).collect()
-}
-
 #[test]
-fn a_committed_entry_is_encoded_exactly_once() {
-    let disk = on_disk("once");
-    // Encoded as no daemon encodes them, with a space after the seq: a
-    // frame that holds the space was read back, not encoded again.
-    let lines: Vec<Vec<u8>> = turns(300, 2)
-        .iter()
-        .map(|e| {
-            let mut line = line(e);
-            let comma = line.iter().position(|&b| b == b',').unwrap();
-            line.insert(comma + 1, b' ');
-            line
-        })
-        .collect();
-    let session = disk.load(&disk.write(&lines));
+fn attach_contains_only_control_state_and_a_seekable_cut() {
+    let disk = on_disk("paging");
+    let session = disk.load(&disk.write(&turns(300, 1024).iter().map(line).collect::<Vec<_>>()));
     settle(&session);
-    let shared = |a: &Frame, b: &Frame| std::ptr::eq(a.as_bytes(), b.as_bytes());
-    let (first, second) = (sent(&session, 0), sent(&session, 0));
-    assert_eq!(first.len(), 4, "attached, snapshot, activity, synced");
-    assert!(shared(&first[1], &second[1]), "one snapshot for both");
-    let near = 300 - SNAPSHOT_GAP;
-    let replayed = entries(sent(&session, near));
-    assert_eq!(replayed.len() as u64, SNAPSHOT_GAP);
-    for (frame, line) in replayed
-        .iter()
-        .zip(&lines[usize::try_from(near).unwrap()..])
-    {
-        let seq = frame.seq.unwrap();
-        let read = Frame::from_line(seq, line).unwrap();
-        assert_eq!(frame.as_bytes(), read.as_bytes(), "entry {seq}");
-    }
-    // Live, then replayed: committed once, and read back as written.
-    let live = Outbox::new();
-    session.follow(&live, 300);
-    session.submit("again").unwrap();
-    settle(&session);
-    let live = entries(std::iter::from_fn(|| live.try_next()));
-    let replayed = entries(sent(&session, 300));
-    session.halt();
-    let written = disk.lines(session.id);
-    assert_eq!(live.len(), 2, "the input and its answer");
-    for (live, replayed) in live.iter().zip(&replayed) {
-        let seq = live.seq.unwrap();
-        let stored = &written[usize::try_from(seq).unwrap() - 1];
-        assert_eq!(*stored, line(&Entry::from_json(stored).unwrap()));
-        assert_eq!(
-            live.as_bytes(),
-            Frame::from_line(seq, stored).unwrap().as_bytes()
-        );
-        assert_eq!(live.as_bytes(), replayed.as_bytes(), "entry {seq}");
-    }
-}
-
-#[test]
-fn replay_from_the_index_equals_the_live_frames() {
-    let disk = on_disk("replay");
-    let header = disk.write(&[]);
-    let session = disk.load(&header);
-    let live = Outbox::new();
-    session.follow(&live, 0);
-    for turn in 0..20 {
-        session.submit(&format!("turn {turn}")).unwrap();
-        settle(&session);
-    }
-    let live = entries(std::iter::from_fn(|| live.try_next()));
-    let replayed = entries(sent(&session, 0));
-    session.halt();
-    let reloaded = disk.load(&header);
-    settle(&reloaded);
-    let after_reload = entries(sent(&reloaded, 0));
-    reloaded.halt();
-    assert_eq!(live.len(), 40);
-    for frames in [&replayed, &after_reload] {
-        assert_eq!(frames.len(), live.len());
-        for (live, frame) in live.iter().zip(frames) {
-            assert_eq!(live.seq, frame.seq);
-            assert_eq!(live.as_bytes(), frame.as_bytes(), "entry {:?}", live.seq);
+    for since in [0, 172, 300] {
+        let frames = sent(&session, since);
+        assert_eq!(frames.len(), 4);
+        let mut view = SessionView::default();
+        for frame in frames {
+            view.fold(
+                &protocol::read_frame::<DaemonMsg>(&mut frame.as_bytes())
+                    .unwrap()
+                    .unwrap(),
+            );
         }
+        assert!(view.items.is_empty());
+        let position = view.history.unwrap();
+        assert_eq!(position.count, 300);
+        assert_eq!(position.cut.seq, 300);
+        let page = session
+            .frames
+            .history
+            .page(
+                &session.frames,
+                &protocol::history::Request {
+                    cut: position.cut,
+                    anchor: 0,
+                    text_offset: None,
+                    direction: protocol::history::Direction::After,
+                    bytes: usize::MAX,
+                    filter: protocol::history::Filter::Transcript,
+                },
+            )
+            .unwrap();
+        let canonical =
+            SessionView::from_log(session.id, "/w".into(), session.frames.entries().unwrap());
+        assert_eq!(
+            page.items
+                .into_iter()
+                .map(|row| row.item)
+                .collect::<Vec<_>>(),
+            canonical.items
+        );
     }
+    session.halt();
 }
 
 /// The bytes loading a session of `n` turns leaves held on this thread,

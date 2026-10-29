@@ -18,7 +18,7 @@ pub use question::{
 };
 
 /// The exact protocol this build speaks.
-pub const PROTO: u32 = 40;
+pub const PROTO: u32 = 41;
 
 /// Ordinary payloads leave 4 KiB per reserved control slot for cancellation.
 #[derive(Clone, Copy)]
@@ -161,6 +161,7 @@ pub mod blob;
 #[macro_use]
 mod decode;
 mod framing;
+pub mod history;
 pub mod ledger;
 mod peer;
 pub mod publication;
@@ -1664,6 +1665,8 @@ pub enum Rejection {
 kinds! {
     #[derive(Clone, Debug, Serialize)]
     pub enum ClientMsg: t = "t" in MsgFields {
+        /// Reads an immutable history range without attaching its full session view.
+        History "history" { id: u64, range: history::Request };
         /// `build` is the client's staged build id (`<version>+<hash>`); it
         /// speaks exactly protocol `proto`, with
         /// capabilities `caps`. Its first messages (attach, input) may follow
@@ -1842,7 +1845,8 @@ impl ClientMsg {
             | Self::Settings { .. }
             | Self::Query { .. }
             | Self::Cancel { .. }
-            | Self::Fetch { .. } => None,
+            | Self::Fetch { .. }
+            | Self::History { .. } => None,
         }
     }
 }
@@ -1919,6 +1923,12 @@ kinds! {
         /// How query `id` ended: its answer, why not, or that it was
         /// cancelled. Nothing about `id` follows.
         Reply "reply" { id: u64, outcome: Outcome } = Control;
+        /// Current controls and a seekable committed cut; no transcript payload.
+        Head "head" { head: Box<history::Head> } = Durable;
+        /// Queued inputs remain complete when controls exceed one frame.
+        HeadPart "head_part" { seq: u64, offset: u64, text: String, done: bool } = Durable;
+        /// A requested page's serialized bytes, chunked independently of item size.
+        HistoryPart "history_part" { id: u64, offset: u64, text: String, done: bool } = Control;
         /// Fetch `id` is refused: no session it may be fetched through
         /// references the blob. In place of its reply; nothing about `id`
         /// follows.
@@ -2015,7 +2025,14 @@ impl Frame {
             },
             msg,
         )?;
-        let mut frame = Self::finish(bytes, None, msg.class())?;
+        let seq = match msg {
+            DaemonMsg::Head { head } => Some(head.cut.seq),
+            DaemonMsg::HeadPart {
+                seq, done: true, ..
+            } => Some(*seq),
+            _ => None,
+        };
+        let mut frame = Self::finish(bytes, seq, msg.class())?;
         frame.replaceable = match msg {
             DaemonMsg::Sessions { .. } => Some(Replaceable::Sessions),
             DaemonMsg::Status { .. } => Some(Replaceable::Status),
@@ -2034,6 +2051,14 @@ impl Frame {
         entry.encode(&mut bytes)?;
         bytes[at] = b',';
         Self::finish(bytes, Some(entry.seq.get()), entry.body.class())
+    }
+
+    pub(crate) fn head_json(seq: u64, json: &str) -> io::Result<Self> {
+        let mut bytes = Self::start();
+        bytes.extend_from_slice(br#"{"t":"head","head":"#);
+        bytes.extend_from_slice(json.as_bytes());
+        bytes.push(b'}');
+        Self::finish(bytes, Some(seq), Class::Durable)
     }
 
     /// Room for the header of a JSON frame, and as much again as

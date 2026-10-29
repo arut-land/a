@@ -13,7 +13,7 @@ use ext::{BoxFuture, Cancel};
 use protocol::{ClientMsg, DaemonMsg, Frame, Json, MachineId, Outcome, QueryInfo, Role, Scope};
 
 use crate::driver::{Failure, contain};
-use crate::outbox::{Outbox, QueuePermit};
+use crate::outbox::{Outbox, QueuePermit, ReadClass};
 use crate::server::{reply, workspace_of};
 use crate::{Daemon, lock};
 
@@ -26,6 +26,10 @@ impl Queries {
     /// Takes a query or a fetch, answered on its own task if it is
     /// admitted, or a cancel of either; hands back any other message.
     /// `bytes` is what its frame weighed.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "route the read-only protocol requests at one connection boundary"
+    )]
     pub(crate) fn take(
         &self,
         daemon: &Arc<Daemon>,
@@ -42,7 +46,7 @@ impl Queries {
                 scope,
                 body,
             } => {
-                let permit = self.admit(outbox, id, bytes)?;
+                let permit = self.admit(outbox, id, bytes, ReadClass::Query)?;
                 let registry = daemon.shared.registry.get();
                 let Some(query) = registry.query(&service) else {
                     return failed(outbox, id, format!("no query named {service}"));
@@ -93,6 +97,18 @@ impl Queries {
                 });
                 self.run(daemon, outbox, id, permit, cancel, answer);
             }
+            ClientMsg::History { id, range } => {
+                let permit = self.admit(outbox, id, bytes, ReadClass::History)?;
+                let answer = crate::history::answer(Arc::clone(daemon), outbox.clone(), id, range);
+                self.run(
+                    daemon,
+                    outbox,
+                    id,
+                    permit,
+                    Cancel::default(),
+                    Box::pin(answer),
+                );
+            }
             ClientMsg::Fetch {
                 id,
                 session,
@@ -100,7 +116,7 @@ impl Queries {
                 offset,
                 len,
             } => {
-                let permit = self.admit(outbox, id, bytes)?;
+                let permit = self.admit(outbox, id, bytes, ReadClass::Query)?;
                 let fetch = crate::fetch::answer(
                     Arc::clone(daemon),
                     outbox.clone(),
@@ -130,14 +146,20 @@ impl Queries {
 
     /// Admission for one more to run as `id`, which no running one has;
     /// `None` once refused, its answer sent.
-    fn admit(&self, outbox: &Outbox, id: u64, bytes: usize) -> Option<QueuePermit> {
+    fn admit(
+        &self,
+        outbox: &Outbox,
+        id: u64,
+        bytes: usize,
+        class: ReadClass,
+    ) -> Option<QueuePermit> {
         // Not a reply: that would read as the running one's.
         if lock(&self.0).contains_key(&id) {
             let message = format!("query {id} is running already");
             reply(outbox, &DaemonMsg::Error { message });
             return None;
         }
-        match QueuePermit::query(bytes) {
+        match QueuePermit::query(bytes, class) {
             Some(permit) => Some(permit),
             None => failed(outbox, id, "daemon admission is full".into()),
         }

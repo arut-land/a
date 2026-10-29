@@ -187,6 +187,11 @@ pub enum Show {
     Link,
     /// [`SessionClient::sessions`] changed.
     Sessions,
+    /// An independently requested range, released when its consumer drops it.
+    History {
+        reader: u64,
+        page: crate::HistoryPage,
+    },
     /// Something to tell the person.
     Notice(Notice),
 }
@@ -195,6 +200,10 @@ pub enum Show {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Notice {
     NotConnected,
+    /// An independent scan must restart after the session history changes generation.
+    HistoryChanged {
+        reader: u64,
+    },
     Backpressure,
     /// A steer or an interrupt while no turn runs.
     NothingRunning,
@@ -217,6 +226,7 @@ impl fmt::Display for Notice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotConnected => f.write_str("not connected"),
+            Self::HistoryChanged { .. } => f.write_str("history changed; request the range again"),
             Self::Backpressure => {
                 f.write_str("waiting for the daemon to acknowledge pending input")
             }
@@ -265,6 +275,9 @@ pub(crate) const MUTATION_BUDGET: crate::QueueBudget = crate::QueueBudget {
 pub struct SessionClient {
     link: Link,
     view: SessionView,
+    history: crate::history::History,
+    heads: protocol::history::Heads,
+    readers: std::collections::BTreeMap<u64, crate::history::History>,
     view_current: bool,
     sessions: SessionList,
     /// The daemon's slash commands.
@@ -291,6 +304,9 @@ impl SessionClient {
         Self {
             link: Link::Connecting,
             view: SessionView::default(),
+            history: crate::history::History::default(),
+            heads: protocol::history::Heads::default(),
+            readers: std::collections::BTreeMap::default(),
             view_current: false,
             sessions: SessionList::default(),
             commands: Vec::new(),
@@ -310,6 +326,70 @@ impl SessionClient {
 
     pub const fn view(&self) -> &SessionView {
         &self.view
+    }
+
+    /// Changes this renderer's demanded history range, preserving drafts and controls.
+    pub fn demand(&mut self, demand: crate::HistoryDemand) -> Vec<Effect> {
+        self.history
+            .demand(demand)
+            .into_iter()
+            .map(|msg| Effect::Io(Io::Send(msg)))
+            .collect()
+    }
+
+    /// Reads history independently of the presentation window (recall, search, export).
+    pub fn read_history(&mut self, reader: u64, demand: crate::HistoryDemand) -> Vec<Effect> {
+        let Some(position) = &self.view.history else {
+            return Vec::new();
+        };
+        self.read_history_at(reader, position.cut, demand)
+    }
+
+    /// Continues a scan at its original immutable cut, even while new turns commit.
+    pub fn read_history_at(
+        &mut self,
+        reader: u64,
+        cut: protocol::history::Cut,
+        demand: crate::HistoryDemand,
+    ) -> Vec<Effect> {
+        let Some(position) = &self.view.history else {
+            return Vec::new();
+        };
+        if cut.session != position.cut.session || cut.generation != position.cut.generation {
+            return vec![Effect::Show(Show::Notice(Notice::HistoryChanged {
+                reader,
+            }))];
+        }
+        self.readers
+            .entry(reader)
+            .or_default()
+            .at(cut, position.count, demand)
+            .into_iter()
+            .map(|msg| Effect::Io(Io::Send(msg)))
+            .collect()
+    }
+
+    pub fn close_history(&mut self, reader: u64) -> Vec<Effect> {
+        self.readers
+            .remove(&reader)
+            .and_then(|mut history| history.close())
+            .into_iter()
+            .map(|msg| Effect::Io(Io::Send(msg)))
+            .collect()
+    }
+
+    pub fn history_pending(&self) -> bool {
+        self.history.pending()
+    }
+
+    /// Withdraws the range demand and releases data already transferred to a renderer.
+    pub fn release_history(&mut self) -> Vec<Effect> {
+        self.view.items = protocol::view::Items::default();
+        self.history
+            .release()
+            .into_iter()
+            .map(|msg| Effect::Io(Io::Send(msg)))
+            .collect()
     }
 
     /// Inputs still owned by this client, oldest first. Recorded inputs are
@@ -562,8 +642,92 @@ impl SessionClient {
         out
     }
 
+    fn history_part(
+        &mut self,
+        id: u64,
+        offset: u64,
+        text: &str,
+        done: bool,
+        out: &mut Vec<Effect>,
+    ) {
+        if let Some((&reader, history)) = self
+            .readers
+            .iter_mut()
+            .find(|(_, history)| history.owns(id))
+        {
+            match history.part(id, offset, text, done) {
+                Ok((loaded, messages)) => {
+                    out.extend(messages.into_iter().map(|msg| Effect::Io(Io::Send(msg))));
+                    if let Some(loaded) = loaded {
+                        out.push(Effect::Show(Show::History {
+                            reader,
+                            page: loaded,
+                        }));
+                    }
+                }
+                Err(error) => {
+                    out.push(Effect::Show(Show::Notice(Notice::NotSent(error.into()))));
+                }
+            }
+            return;
+        }
+        match self.history.part(id, offset, text, done) {
+            Ok((loaded, messages)) => {
+                out.extend(messages.into_iter().map(|msg| Effect::Io(Io::Send(msg))));
+                if let Some(loaded) = loaded {
+                    let update = self.view.range(loaded.items, loaded.range, loaded.fragment);
+                    out.push(Effect::Show(Show::View(update)));
+                }
+            }
+            Err(error) => {
+                out.push(Effect::Show(Show::Notice(Notice::NotSent(error.into()))));
+            }
+        }
+    }
+
     fn msg(&mut self, msg: &DaemonMsg, out: &mut Vec<Effect>) {
         match msg {
+            DaemonMsg::HeadPart {
+                seq,
+                offset,
+                text,
+                done,
+            } => {
+                match self.heads.part(*seq, *offset, text, *done) {
+                    Ok(Some(head)) => self.msg(
+                        &DaemonMsg::Head {
+                            head: Box::new(head),
+                        },
+                        out,
+                    ),
+                    Ok(None) => {}
+                    Err(error) => self.end(End::Lost(error.into()), out),
+                }
+                return;
+            }
+            DaemonMsg::Head { head } => self.accept_head(head, out),
+            DaemonMsg::HistoryPart {
+                id,
+                offset,
+                text,
+                done,
+            } => {
+                self.history_part(*id, *offset, text, *done, out);
+                return;
+            }
+            DaemonMsg::Reply {
+                id,
+                outcome: protocol::Outcome::Failed { error },
+            } => {
+                if self.history.failed(*id)
+                    || self.readers.values_mut().any(|history| history.failed(*id))
+                {
+                    out.push(Effect::Show(Show::Notice(Notice::NotSent(
+                        std::io::Error::other(error.clone()).into(),
+                    ))));
+                    return;
+                }
+            }
             DaemonMsg::ForkRejected { reason } => {
                 out.push(Effect::Show(Show::Notice(Notice::ForkRejected(
                     reason.clone(),
@@ -612,6 +776,42 @@ impl SessionClient {
             }
             _ => {}
         }
+        self.publish(msg, out);
+    }
+
+    fn accept_head(&mut self, head: &protocol::history::Head, out: &mut Vec<Effect>) {
+        self.readers.retain(|&reader, history| {
+            if history.same_generation(head.cut) {
+                return true;
+            }
+            if let Some(cancel) = history.close() {
+                out.push(Effect::Io(Io::Send(cancel)));
+            }
+            out.push(Effect::Show(Show::Notice(Notice::HistoryChanged {
+                reader,
+            })));
+            false
+        });
+        let known = head
+            .state
+            .taken
+            .iter()
+            .filter(|author| author.client == self.opened.client)
+            .map(|author| author.seq.get())
+            .max();
+        if let Some(known) = known {
+            self.unanswered
+                .retain(|m| m.client_seq().is_none_or(|seq| seq > known));
+        }
+        out.extend(
+            self.history
+                .head(head)
+                .into_iter()
+                .map(|msg| Effect::Io(Io::Send(msg))),
+        );
+    }
+
+    fn publish(&mut self, msg: &DaemonMsg, out: &mut Vec<Effect>) {
         let update = self.view.fold(msg);
         if let Some(submission) = &mut self.submission {
             submission.fold(&self.view);
@@ -873,6 +1073,15 @@ mod tests {
         }
     }
 
+    fn controls(head: protocol::history::Head) -> Event {
+        msg(
+            1,
+            DaemonMsg::Head {
+                head: Box::new(head),
+            },
+        )
+    }
+
     fn closed(conn: u64) -> Event {
         Event {
             conn: ConnId(conn),
@@ -880,7 +1089,162 @@ mod tests {
         }
     }
 
-    /// Served while an upgrade waits, every client says what holds it.
+    #[test]
+    fn independent_scans_preserve_sparse_positions_fragments_and_the_original_cut() {
+        let mut client = SessionClient::new(Env::Keep);
+        client.open(Target::New);
+        client.step(live(1, Caps::ALL));
+        let texts = [
+            "unrelated".to_owned(),
+            format!("needle{}", "a".repeat(512)),
+            "other".to_owned(),
+            format!("needle{}", "b".repeat(512)),
+        ];
+        let mut entries: Vec<_> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, text)| {
+                Entry::new(
+                    Seq::new(i as u64 + 1).unwrap(),
+                    Epoch(1),
+                    Body::Assistant { text: text.clone() },
+                )
+            })
+            .collect();
+        let mut index = protocol::view::Index::new(SessionId::new(), protocol::HostPath::default());
+        for entry in &entries {
+            index.apply(entry);
+        }
+        let head = index.head(Epoch(1));
+        client.step(controls(head.clone()));
+        let mut effects = client.read_history_at(
+            7,
+            head.cut,
+            crate::HistoryDemand {
+                anchor: crate::HistoryAnchor::After(0),
+                filter: protocol::history::Filter::Search("needle".into()),
+                bytes: 64,
+            },
+        );
+        let mut delivered = std::collections::BTreeMap::<usize, String>::new();
+        loop {
+            let (id, range) = effects
+                .into_iter()
+                .find_map(|effect| match effect {
+                    Effect::Io(Io::Send(ClientMsg::History { id, range })) => Some((id, range)),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(range.cut, head.cut);
+            assert_eq!(range.bytes, 64);
+            assert_eq!(
+                range.filter,
+                protocol::history::Filter::Search("needle".into())
+            );
+            let page = index
+                .page(&range, |seq| {
+                    Ok(entries[usize::try_from(seq.get()).unwrap() - 1].clone())
+                })
+                .unwrap();
+            let effects_out = client.step(msg(
+                1,
+                DaemonMsg::HistoryPart {
+                    id,
+                    offset: 0,
+                    text: serde_json::to_string(&page).unwrap(),
+                    done: true,
+                },
+            ));
+            let page = effects_out
+                .into_iter()
+                .find_map(|effect| match effect {
+                    Effect::Show(Show::History { reader: 7, page }) => Some(page),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(page.total, 4);
+            for (position, item) in page.indices.iter().zip(page.items.iter()) {
+                assert!([1, 3].contains(position));
+                let protocol::view::Item::Assistant { text, .. } = item else {
+                    panic!("expected assistant text")
+                };
+                delivered.entry(*position).or_default().push_str(text);
+            }
+            if entries.len() == 4 {
+                entries.push(Entry::new(
+                    Seq::new(5).unwrap(),
+                    Epoch(1),
+                    Body::Assistant {
+                        text: "needle future".into(),
+                    },
+                ));
+                index.apply(entries.last().unwrap());
+                client.step(msg(
+                    1,
+                    DaemonMsg::Head {
+                        head: Box::new(index.head(Epoch(1))),
+                    },
+                ));
+            }
+            let Some(next) = page.newer() else { break };
+            effects = client.read_history_at(7, page.cut, next);
+        }
+        assert_eq!(delivered[&1], texts[1]);
+        assert_eq!(delivered[&3], texts[3]);
+    }
+
+    #[test]
+    fn independent_readers_cannot_publish_pages_from_a_superseded_generation() {
+        let mut client = SessionClient::new(Env::Keep);
+        client.open(Target::New);
+        client.step(live(1, Caps::ALL));
+        let index = protocol::view::Index::new(SessionId::new(), protocol::HostPath::default());
+        let head = index.head(Epoch(1));
+        client.step(controls(head.clone()));
+        let effects = client.read_history(7, crate::HistoryDemand::default());
+        let id = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::Io(Io::Send(ClientMsg::History { id, .. })) => Some(*id),
+                _ => None,
+            })
+            .unwrap();
+        let effects = client.step(msg(
+            1,
+            DaemonMsg::Head {
+                head: Box::new(index.head(Epoch(2))),
+            },
+        ));
+        assert!(effects.iter().any(|effect| matches!(effect,
+            Effect::Io(Io::Send(ClientMsg::Cancel { id: cancelled })) if *cancelled == id)));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Show(Show::Notice(Notice::HistoryChanged { reader: 7 }))
+        )));
+        let effects = client.step(msg(
+            1,
+            DaemonMsg::HistoryPart {
+                id,
+                offset: 0,
+                text: "obsolete".into(),
+                done: true,
+            },
+        ));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Show(Show::History { .. })))
+        );
+        assert!(matches!(
+            client
+                .read_history_at(7, head.cut, crate::HistoryDemand::default())
+                .as_slice(),
+            [Effect::Show(Show::Notice(Notice::HistoryChanged {
+                reader: 7
+            }))]
+        ));
+    }
+
     #[test]
     fn a_welcome_while_an_upgrade_waits_tells_what_holds_it() {
         let mut client = SessionClient::new(Env::Keep);

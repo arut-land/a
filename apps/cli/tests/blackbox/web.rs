@@ -494,10 +494,12 @@ fn a_long_transcript_sends_each_item_once() {
         events.until(&text, |p| shown(p).matches(&line).count() >= 2);
     }
     for patch in &events.patches[shown_whole..] {
-        let added =
-            patch.selector.as_deref() == Some("#end") && patch.mode.as_deref() == Some("before");
+        let added = patch.selector.as_deref() == Some("#history-end")
+            && patch.mode.as_deref() == Some("before");
         let end = patch.selector.is_none() && patch.html.starts_with("<div id=\"end\"");
-        assert!(added || end, "{patch:?}");
+        let changed = patch.selector.is_none() && patch.html.starts_with("<div id=\"h-");
+        let cursor = patch.selector.is_none() && patch.html.starts_with("<span id=\"history-end\"");
+        assert!(added || changed || end || cursor, "{patch:?}");
     }
     let html = shown(&events.patches);
     for n in 0..40 {
@@ -563,8 +565,8 @@ fn a_tab_rides_out_a_daemon_upgrade() {
     });
     let since = shown(&events.patches[shown_before..]);
     assert!(!since.contains("reload to reconnect"), "{since}");
-    // Shown whole again once the new daemon synced, then patched.
-    assert!(since.contains(">before<"), "{since}");
+    // Already delivered DOM survives reconnect without retransmitting settled history.
+    assert!(!since.contains(">before<"), "{since}");
     assert_eq!(env.daemons(), [second]);
 }
 

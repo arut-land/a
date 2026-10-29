@@ -158,6 +158,7 @@ impl Peer<'_> {
         loop {
             match self.recv() {
                 DaemonMsg::Entry(_)
+                | DaemonMsg::Head { .. }
                 | DaemonMsg::Delta { .. }
                 | DaemonMsg::Activity { .. }
                 | DaemonMsg::Synced { .. } => {}
@@ -294,7 +295,7 @@ fn a_pipelined_hello_attach_and_input_are_answered_in_order() {
     // A new session's first entry records its extensions.
     let first = peer.recv();
     assert!(
-        matches!(&first, DaemonMsg::Entry(e) if matches!(e.body, Body::Extensions { .. })),
+        matches!(&first, DaemonMsg::Head { head } if head.count == 0),
         "{first:?}"
     );
     assert!(matches!(
@@ -309,14 +310,15 @@ fn a_pipelined_hello_attach_and_input_are_answered_in_order() {
     // logged after it.
     let logged = peer.recv();
     assert!(
-        matches!(&logged, DaemonMsg::Entry(e) if is_input(&e.body)),
+        matches!(&logged, DaemonMsg::Head { head } if head.cut.seq >= 2),
         "{logged:?}"
     );
     let seen = peer.until(|m| matches!(m, DaemonMsg::Ack { client_seq: o } if *o == origin(1, 1)));
     assert_eq!(users(&seen), 0, "the input was already seen");
     assert!(
-        seen.iter()
-            .any(|m| matches!(m, DaemonMsg::Entry(e) if matches!(e.body, Body::Assistant { .. }))),
+        std::iter::once(&logged)
+            .chain(&seen)
+            .any(|m| matches!(m, DaemonMsg::Head { head } if head.count >= 2)),
         "{seen:?}"
     );
 }
@@ -544,7 +546,7 @@ fn a_mismatched_hello_gets_the_exact_version_and_nothing_behind_it_is_done() {
 /// A session longer than a snapshot is worth: a client far behind gets
 /// one, a client near the end the replay.
 #[test]
-fn far_behind_a_client_gets_a_snapshot() {
+fn attach_never_requires_a_whole_session_image() {
     let id = SessionId::new();
     let fixture = Fixture::with("snapshot", |home| {
         let store = Jsonl::open(home.sessions_dir()).unwrap();
@@ -577,21 +579,18 @@ fn far_behind_a_client_gets_a_snapshot() {
         peer.send(&attach(Target::Id(id), since, ClientDecl::default()));
         peer.until(|m| matches!(m, DaemonMsg::Synced { .. }))
     };
-    let snapshotted = replay(10);
-    let Some(DaemonMsg::Snapshot(view)) = snapshotted.get(2) else {
-        panic!("no snapshot: {snapshotted:?}");
-    };
-    // Each was answered as the session recovered, before the attach.
-    assert_eq!((view.items.len(), view.seq), (600, 600));
-    assert_eq!(users(&snapshotted), 0);
-    let replayed = replay(400);
-    assert!(
-        replayed
-            .iter()
-            .all(|m| !matches!(m, DaemonMsg::Snapshot(_)))
-    );
-    let entries = replayed.iter().filter(|m| matches!(m, DaemonMsg::Entry(_)));
-    assert_eq!(entries.count(), 200);
+    for since in [10, 400] {
+        let messages = replay(since);
+        let Some(DaemonMsg::Head { head }) = messages.get(2) else {
+            panic!("no public head: {messages:?}");
+        };
+        assert_eq!((head.count, head.cut.seq), (600, 600));
+        assert!(
+            messages
+                .iter()
+                .all(|m| !matches!(m, DaemonMsg::Entry(_) | DaemonMsg::Snapshot(_)))
+        );
+    }
 }
 
 /// A client that stops reading only lags: it reads what it missed from the
@@ -618,6 +617,29 @@ fn a_client_that_falls_behind_is_caught_up_from_the_log() {
         let msg: DaemonMsg = read_frame(&mut frame.as_bytes()).unwrap().unwrap();
         view.fold(&msg);
     }
+    assert!(view.items.is_empty());
+    let cut = view.history.as_ref().unwrap().cut;
+    let page = session
+        .frames
+        .history
+        .page(
+            &session.frames,
+            &protocol::history::Request {
+                cut,
+                anchor: 0,
+                text_offset: None,
+                direction: protocol::history::Direction::After,
+                bytes: usize::MAX,
+                filter: protocol::history::Filter::Transcript,
+            },
+        )
+        .unwrap();
+    let end = page.end;
+    view.range(
+        page.items.into_iter().map(|located| located.item).collect(),
+        0..end,
+        None,
+    );
     let log = fixture.daemon.shared.store.entries(session.id).unwrap();
     let whole = SessionView::from_log(session.id, "/w".into(), &log);
     assert_eq!(view.state_hash(), whole.state_hash());
@@ -783,4 +805,100 @@ fn fork_refusals_are_typed_and_leave_the_source_attachment_usable() {
                 |entry| matches!(&entry.body, Body::Input { segments: text, .. } if text == "still attached")
             )
     );
+}
+
+#[test]
+fn attaching_history_does_not_materialize_unrequested_text_and_continuations_are_lossless() {
+    use protocol::Decode;
+    use protocol::history::{Direction, Filter, Page, Request};
+    use protocol::view::Item;
+
+    let id = SessionId::new();
+    let text = "é **styled**\n```rust\nlet value = 1;\n```\n".repeat(4096);
+    let fixture = Fixture::with("history-ranges", |home| {
+        let store = Jsonl::open(home.sessions_dir()).unwrap();
+        let mut created = store
+            .create(&Header {
+                id,
+                workspace: "/w".into(),
+                parent: None,
+            })
+            .unwrap();
+        let entry = Entry::new(
+            Seq::new(1).unwrap(),
+            Epoch(created.writer.epoch()),
+            Body::Assistant { text: text.clone() },
+        );
+        created.writer.append_raw(&[entry]).unwrap();
+    });
+    let mut peer = fixture.connect_viewer();
+    peer.send(&hello(Caps::ALL));
+    peer.send(&attach(Target::Id(id), 0, ClientDecl::default()));
+    let attached = peer.until(|msg| matches!(msg, DaemonMsg::Synced { .. }));
+    let head = attached
+        .iter()
+        .find_map(|msg| match msg {
+            DaemonMsg::Head { head } => Some(head),
+            _ => None,
+        })
+        .unwrap();
+    assert!(serde_json::to_vec(&attached).unwrap().len() < 4096);
+    assert_eq!(head.count, 1);
+    let cut = head.cut;
+    let mut recovered = String::new();
+    for id in 100.. {
+        peer.send(&ClientMsg::History {
+            id,
+            range: Request {
+                cut,
+                anchor: 0,
+                text_offset: Some(recovered.len()),
+                direction: Direction::After,
+                bytes: 4096,
+                filter: Filter::Transcript,
+            },
+        });
+        let mut bytes = Vec::new();
+        loop {
+            match peer.recv() {
+                DaemonMsg::HistoryPart {
+                    id: current,
+                    offset,
+                    text,
+                    done,
+                } => {
+                    assert_eq!(current, id);
+                    assert_eq!(offset, bytes.len() as u64);
+                    bytes.extend_from_slice(text.as_bytes());
+                    if done {
+                        break;
+                    }
+                }
+                DaemonMsg::Activity { .. } | DaemonMsg::Head { .. } => {}
+                msg => panic!("unexpected history message: {msg:?}"),
+            }
+        }
+        let page = Page::from_json(&bytes).unwrap();
+        assert_eq!(page.cut, cut);
+        let [
+            protocol::history::Located {
+                item: Item::Assistant { text: fragment, .. },
+                ..
+            },
+        ] = &page.items[..]
+        else {
+            panic!("expected assistant range")
+        };
+        assert!(fragment.len() <= 4096);
+        recovered.push_str(fragment);
+        let completion = peer.recv();
+        assert!(
+            matches!(completion, DaemonMsg::Reply { id: current, outcome: protocol::Outcome::Done { .. } } if current == id)
+        );
+        let span = page.fragment.unwrap();
+        if span.end == span.total {
+            break;
+        }
+    }
+    assert_eq!(recovered, text);
 }

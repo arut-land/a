@@ -111,6 +111,60 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
     };
     vec![
         sample(
+            "history",
+            ClientMsg::History {
+                id: 27,
+                range: protocol::history::Request {
+                    cut: protocol::history::Cut {
+                        session: SESSION,
+                        generation: Epoch(0),
+                        seq: 1,
+                    },
+                    anchor: 0,
+                    text_offset: None,
+                    direction: protocol::history::Direction::After,
+                    bytes: 65536,
+                    filter: protocol::history::Filter::Transcript,
+                },
+            },
+        ),
+        sample(
+            "history_inputs",
+            ClientMsg::History {
+                id: 28,
+                range: protocol::history::Request {
+                    cut: protocol::history::Cut {
+                        session: SESSION,
+                        generation: Epoch(0),
+                        seq: 1,
+                    },
+                    anchor: 10,
+                    text_offset: None,
+                    direction: protocol::history::Direction::Before,
+                    bytes: 1,
+                    filter: protocol::history::Filter::Inputs,
+                },
+            },
+        ),
+        sample(
+            "history_search",
+            ClientMsg::History {
+                id: 29,
+                range: protocol::history::Request {
+                    cut: protocol::history::Cut {
+                        session: SESSION,
+                        generation: Epoch(0),
+                        seq: 1,
+                    },
+                    anchor: 0,
+                    text_offset: Some(65536),
+                    direction: protocol::history::Direction::After,
+                    bytes: 65536,
+                    filter: protocol::history::Filter::Search("needle".into()),
+                },
+            },
+        ),
+        sample(
             "hello",
             ClientMsg::Hello {
                 proto: PROTO,
@@ -1260,7 +1314,56 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
     ]
     .into_iter()
     .chain(input_samples())
+    .chain(history_samples())
     .collect()
+}
+
+fn history_samples() -> Vec<Sample<DaemonMsg>> {
+    let entry = Entry::new(
+        Seq::new(1).unwrap(),
+        Epoch(0),
+        Body::Assistant {
+            text: "# heading\n**a long reply**".into(),
+        },
+    );
+    let mut index = protocol::view::Index::new(SESSION, "/w".into());
+    index.apply(&entry);
+    let head = index.head(Epoch(0));
+    let request = protocol::history::Request {
+        cut: head.cut,
+        anchor: 0,
+        text_offset: None,
+        direction: protocol::history::Direction::After,
+        bytes: 12,
+        filter: protocol::history::Filter::Transcript,
+    };
+    let page = index.page(&request, |_| Ok(entry.clone())).unwrap();
+    vec![
+        sample(
+            "head",
+            DaemonMsg::Head {
+                head: Box::new(head.clone()),
+            },
+        ),
+        sample(
+            "head_part",
+            DaemonMsg::HeadPart {
+                seq: 1,
+                offset: 0,
+                text: serde_json::to_string(&head).unwrap(),
+                done: true,
+            },
+        ),
+        sample(
+            "history_part",
+            DaemonMsg::HistoryPart {
+                id: 27,
+                offset: 0,
+                text: serde_json::to_string(&page).unwrap(),
+                done: true,
+            },
+        ),
+    ]
 }
 
 fn corpus() -> PathBuf {

@@ -1,8 +1,11 @@
 //! Speculative model context and durable client views have separate prefixes.
 
+#[cfg(test)]
+use protocol::view::SessionView;
+
 use super::{
-    Activity, Actor, Admission, Admitted, Arc, Body, CallId, Cpu, DaemonMsg, Encoded, Entry, Frame,
-    Ordering, Outbox, SNAPSHOT_GAP, SessionView, Transcript, io, lock,
+    Activity, Actor, Admission, Admitted, Arc, Body, CallId, Cpu, DaemonMsg, Entry, Frame,
+    Ordering, Outbox, Transcript, io, lock,
 };
 
 impl super::Shared {
@@ -54,10 +57,6 @@ pub(super) struct Projection {
     /// result commits.
     pub(super) replied: Option<(CallId, llm::Assistant)>,
     pub(super) executions: Vec<(CallId, super::Json)>,
-    pub(super) snapshot: Option<(u64, Option<Frame>)>,
-    /// The view a far attach is sent, kept in step with each commit from
-    /// the first time one is asked for: no attach folds the whole log.
-    pub(super) view: Option<SessionView>,
     pub(super) published_activity: Option<(u64, Activity)>,
 }
 
@@ -247,11 +246,11 @@ impl Actor {
         }
     }
 
-    pub(super) fn show(&mut self, entries: &[Entry], lines: &Encoded) {
-        if let Some(view) = &mut self.projection.view {
-            view.extend(entries);
+    pub(super) async fn show(&mut self, entries: Vec<Entry>) {
+        if entries.is_empty() {
+            return;
         }
-        for (e, line) in entries.iter().zip(lines.lines()) {
+        for e in &entries {
             self.journal.index.apply(e);
             let call = match &e.body {
                 Body::ToolResult { call, .. } | Body::ModelResult { call, .. } => Some(*call),
@@ -268,11 +267,27 @@ impl Actor {
                     waiter.reply(&e.body);
                 }
             }
-            // One too large for the tail is not framed: followers read it.
-            let frame = (line.len() <= crate::outbox::TAIL)
-                .then(|| Frame::from_line(e.seq.get(), line).ok())
-                .flatten();
-            self.live.frames.push(e.seq.get(), frame);
+        }
+        let frames = Arc::clone(&self.live.frames);
+        let indexed = frames.history.is_indexed();
+        let publish = move || {
+            for entry in entries {
+                frames.push(entry.seq.get());
+                if indexed {
+                    frames.history.observe(&entry);
+                }
+            }
+        };
+        if indexed {
+            rt::unblock_with(
+                &*self.live.session.shared.rt,
+                Cpu,
+                rt::STORAGE_BYTES,
+                publish,
+            )
+            .await;
+        } else {
+            publish();
         }
         self.live.shown();
         lock(&self.live.followers).retain(|c| c.wake().is_ok());
@@ -414,22 +429,40 @@ impl Actor {
     }
 
     pub(super) async fn attach(&mut self, client: &Outbox, since: u64) {
-        let seq = self.live.frames.seq();
-        let far = seq.saturating_sub(since) > SNAPSHOT_GAP;
-        let snapshot = if far { self.snapshot(seq).await } else { None };
-        let cursor = if snapshot.is_some() {
-            seq
-        } else {
-            since.min(seq)
+        let live = Arc::clone(&self.live);
+        let frames = Arc::clone(&live.frames);
+        let head = rt::try_unblock_with(
+            &*live.session.shared.rt,
+            Cpu,
+            rt::STORAGE_BYTES,
+            move || {
+                let head = frames.history.head(&frames, since)?;
+                let seq = head.cut.seq;
+                head.frames().map(|frames| (seq, frames))
+            },
+        )
+        .await;
+        let (seq, head) = match head {
+            Ok(Ok(head)) => head,
+            Ok(Err(error)) | Err(error) => {
+                let _ = client.send(
+                    Frame::new(&DaemonMsg::Error {
+                        message: error.to_string(),
+                    })
+                    .expect("an error frames"),
+                );
+                return;
+            }
         };
-        let live = &self.live;
         let mut frames = Vec::new();
-        let attached = DaemonMsg::Attached {
-            session: live.id,
-            workspace: protocol::HostPath::lossy(&live.workspace),
-        };
-        frames.extend(Frame::new(&attached).ok().map(|f| (cursor, f)));
-        frames.extend(snapshot.map(|frame| (seq, frame)));
+        frames.extend(
+            Frame::new(&DaemonMsg::Attached {
+                session: live.id,
+                workspace: protocol::HostPath::lossy(&live.workspace),
+            })
+            .ok()
+            .map(|f| (0, f)),
+        );
         if let Some((seq, activity)) = self.current_activity() {
             frames.extend(
                 Frame::new(&DaemonMsg::Activity { seq, activity })
@@ -442,47 +475,8 @@ impl Actor {
                 .ok()
                 .map(|f| (seq, f)),
         );
-        let follower = client.follow(Arc::clone(&live.frames), cursor, frames);
+        let follower = client.follow_head(Arc::clone(&live.frames), head, frames);
         lock(&live.followers).push(&follower);
-    }
-
-    /// The snapshot at entry `seq`, the last committed, made once for every
-    /// client attaching then; `None` if too large for a frame.
-    pub(super) async fn snapshot(&mut self, seq: u64) -> Option<Frame> {
-        if let Some((at, frame)) = &self.projection.snapshot
-            && *at == seq
-        {
-            return frame.clone();
-        }
-        let live = Arc::clone(&self.live);
-        let view = self.projection.view.take();
-        let (view, frame) = rt::try_unblock_with(
-            &*self.live.session.shared.rt,
-            Cpu,
-            rt::STORAGE_BYTES,
-            move || {
-                let view = if let Some(view) = view {
-                    view
-                } else {
-                    let mut view = SessionView::from_log(
-                        live.id,
-                        protocol::HostPath::lossy(&live.workspace),
-                        std::iter::empty::<Entry>(),
-                    );
-                    for batch in live.frames.batches_after(0) {
-                        view.extend(batch.ok()?);
-                    }
-                    view
-                };
-                let frame = Frame::new(&DaemonMsg::Snapshot(Box::new(view.snapshot()))).ok();
-                Some((view, frame))
-            },
-        )
-        .await
-        .ok()??;
-        self.projection.view = Some(view);
-        self.projection.snapshot = Some((seq, frame.clone()));
-        frame
     }
 
     fn canonical_source(
@@ -807,7 +801,7 @@ mod tests {
         let before = reader().unwrap();
         assert!(Json::encode(&before).unwrap().raw().contains("pending"));
         loaded.writer.flush_inline().unwrap();
-        frames.push(pending[0].seq.get(), None);
+        frames.push(pending[0].seq.get());
         assert_eq!(reader().unwrap(), before);
     }
 

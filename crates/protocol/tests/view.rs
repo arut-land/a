@@ -485,7 +485,7 @@ fn attaching_to_another_session_starts_over() {
         }],
     );
     assert_eq!(view.session, Some(other));
-    assert_eq!(view.items, []);
+    assert!(view.items.is_empty());
     assert_eq!(view.seq, 0);
 }
 
@@ -587,14 +587,7 @@ fn a_withdrawn_input_leaves_every_clients_queue_and_hidden_items_never_join_the_
     let (_, queue) = queued(6);
     let shown = |text: &str| (text.to_owned(), true);
     let hidden = |text: &str| (text.to_owned(), false);
-    assert_eq!(
-        queue,
-        [
-            shown("later"),
-            shown("edited"),
-            hidden("[background job 7 ended: exit code 0]")
-        ]
-    );
+    assert_eq!(queue, [shown("later"), shown("edited"), hidden("")]);
     let (view, queue) = queued(8);
     assert_eq!(queue, [shown("edited")]);
     let users: Vec<_> = (view.items.iter())
@@ -1563,7 +1556,7 @@ fn view_snapshots_contain_no_execution_authority() {
 }
 
 #[test]
-fn view_snapshots_preserve_skill_and_mcp_publications() {
+fn client_snapshots_exclude_execution_publication_identities() {
     let session = SESSION;
     let snapshot = |namespace: Option<&str>| {
         let entry = Entry::new(
@@ -1581,14 +1574,6 @@ fn view_snapshots_preserve_skill_and_mcp_publications() {
         let encoded = serde_json::to_vec(&DaemonMsg::Snapshot(Box::new(view.snapshot()))).unwrap();
         let mut reconnected = SessionView::default();
         reconnected.fold(&DaemonMsg::from_json(&encoded).unwrap());
-        if let Some(namespace) = namespace {
-            assert!(
-                reconnected
-                    .state
-                    .publications()
-                    .contains(namespace, &Json::encode(&"loaded-publication").unwrap())
-            );
-        }
         let snapshot = serde_json::to_value(reconnected.snapshot()).unwrap();
         assert!(
             !snapshot
@@ -1599,10 +1584,10 @@ fn view_snapshots_preserve_skill_and_mcp_publications() {
     };
     let unpublished = snapshot(None);
     for namespace in ["skills", "mcp-schemas"] {
-        assert_ne!(
+        assert_eq!(
             snapshot(Some(namespace)),
             unpublished,
-            "reconnected clients must retain effective {namespace} publication identities"
+            "execution publication {namespace} escaped into a client snapshot"
         );
     }
 }
@@ -1645,8 +1630,7 @@ fn inherited_publications() -> Entry {
 }
 
 #[test]
-fn view_publications_follow_edits_to_inherited_context() {
-    let key = Json::encode(&"loaded-publication").unwrap();
+fn execution_context_edits_do_not_install_publications_in_client_views() {
     let spawned = inherited_publications();
     let view = SessionView::from_log(SESSION, "/w".into(), [spawned]);
     let encoded = serde_json::to_vec(&DaemonMsg::Snapshot(Box::new(view.snapshot()))).unwrap();
@@ -1654,7 +1638,11 @@ fn view_publications_follow_edits_to_inherited_context() {
     let mut restored = SessionView::default();
     restored.fold(&DaemonMsg::from_json(&encoded).unwrap());
     for namespace in ["skills", "mcp-schemas"] {
-        assert!(restored.state.publications().contains(namespace, &key));
+        assert!(
+            !serde_json::to_string(&restored.state)
+                .unwrap()
+                .contains(namespace)
+        );
     }
     restored.fold(&DaemonMsg::Entry(Entry::new(
         Seq::new(2).unwrap(),
@@ -1665,7 +1653,11 @@ fn view_publications_follow_edits_to_inherited_context() {
             replace: None,
         },
     )));
-    assert!(restored.state.publications().is_empty());
+    assert!(
+        !serde_json::to_string(&restored.state)
+            .unwrap()
+            .contains("publications")
+    );
 }
 
 fn annotation(target: u64, body: &str) -> Body {

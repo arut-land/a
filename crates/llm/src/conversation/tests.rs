@@ -84,6 +84,60 @@ fn folded() -> usize {
 }
 
 #[test]
+fn large_settled_runs_share_chunks_without_reencoding_the_prefix_or_changing_request_bytes() {
+    for provider in providers() {
+        let mut canonical = Messages::from(vec![
+            Message::system("terse"),
+            Message::user("go"),
+            Message::assistant("🦀 text ".repeat(200_000)),
+            Message::user("next"),
+        ]);
+        let mut tail = canonical.clone();
+        let mut resident = Resident::default();
+        let stored = StoredMessages::new(&canonical);
+        let reads = Arc::new(AtomicU64::new(0));
+        let request = stored.request(&resident, &tail, &reads);
+        let actual = provider
+            .request(&request.model, &request)
+            .unwrap()
+            .into_body();
+        folded();
+        drop(request);
+        resident.retain(&mut tail);
+        assert!(actual.pieces().len() > 4);
+        assert!(actual.pieces().iter().all(|piece| piece.len() <= 256 << 10));
+        assert_eq!(
+            actual.to_vec(),
+            body(&provider, &Messages::from(canonical.to_vec()))
+        );
+        folded();
+        canonical.push(Message::user("one more"));
+        tail.push(Message::user("one more"));
+        stored.write(&canonical);
+        let request = stored.request(&resident, &tail, &reads);
+        let next = provider
+            .request(&request.model, &request)
+            .unwrap()
+            .into_body();
+        assert_eq!(folded(), 1);
+        assert_eq!(reads.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            next.to_vec(),
+            body(&provider, &Messages::from(canonical.to_vec()))
+        );
+        folded();
+        assert_eq!(
+            actual.to_vec(),
+            body(
+                &provider,
+                &Messages::from(canonical[..canonical.len() - 1].to_vec())
+            )
+        );
+        folded();
+    }
+}
+
+#[test]
 fn building_a_request_reserializes_nothing() {
     for provider in providers() {
         let mut messages = Messages::from(vec![Message::system("terse"), Message::user("go")]);
@@ -912,7 +966,7 @@ fn changed_wire_quirks_never_reuse_a_prefix() {
 #[test]
 fn releasing_a_deep_prefix_never_recurses_through_its_ancestry() {
     let mut chunks = Fragments::default();
-    let byte: Shared = vec![b'0'].into();
+    let byte: Run = vec![Shared::from(vec![b'0'])].into();
     for _ in 0..100_000 {
         chunks.extend([Arc::clone(&byte)]);
     }

@@ -43,7 +43,7 @@ fn bridge_speaks_the_protocol_over_stdio() {
     let mut recv = || read_frame::<DaemonMsg>(&mut stdout).unwrap().unwrap();
     assert!(matches!(recv(), DaemonMsg::Welcome { proto: PROTO, .. }));
     assert!(matches!(recv(), DaemonMsg::Attached { .. }));
-    assert!(matches!(recv(), DaemonMsg::Entry(e) if matches!(e.body, Body::Extensions { .. })));
+    assert!(matches!(recv(), DaemonMsg::Head { head } if head.count == 0));
     assert!(matches!(
         recv(),
         DaemonMsg::Activity {
@@ -54,7 +54,7 @@ fn bridge_speaks_the_protocol_over_stdio() {
     assert!(matches!(recv(), DaemonMsg::Synced { seq: 1 }));
     assert!(matches!(
         recv(),
-        DaemonMsg::Entry(e) if matches!(&e.body, Body::Input { segments: text, taken: true, .. } if text == "hi")
+        DaemonMsg::Head { head } if head.count >= 1
     ));
 
     // Closing stdin ends the connection, and with it the bridge.

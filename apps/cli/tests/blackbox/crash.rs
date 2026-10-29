@@ -72,8 +72,8 @@ fn every_entry_shown_survives_kill_9_at_random_points() {
         });
         // Live entries until the daemon dies under us.
         while let Some(msg) = conn.try_recv() {
-            if let DaemonMsg::Entry(entry) = msg {
-                shown.push(entry);
+            if matches!(msg, DaemonMsg::Head { .. }) {
+                shown.extend(conn.certified_entries());
             }
         }
         killer.join().unwrap();
@@ -88,8 +88,8 @@ fn every_entry_shown_survives_kill_9_at_random_points() {
     let mut entries = replay;
     while !matches!(entries.last(), Some(Entry { body: Body::Assistant { text }, .. }) if text == "done")
     {
-        if let DaemonMsg::Entry(entry) = conn.recv() {
-            entries.push(entry);
+        if matches!(conn.recv(), DaemonMsg::Head { .. }) {
+            entries.extend(conn.certified_entries());
         }
     }
     eprintln!("{} entries across {ROUNDS} kills", entries.len());

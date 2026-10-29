@@ -43,11 +43,89 @@ impl ReplyStream {
                     vec![ReplyEvent::Text(suffix)]
                 };
             }
+            if let Some(live) = &view.streaming
+                && live.call == *call
+                && view.items.binary_search_by_key(&call.0, Item::key).is_err()
+                && self.open.as_ref().is_none_or(|(seq, _, _)| *seq >= call.0)
+            {
+                let mut events = Vec::new();
+                if self.open.take().is_some() {
+                    events.push(ReplyEvent::End);
+                }
+                events.extend([ReplyEvent::Start, ReplyEvent::Text(&live.text)]);
+                self.open = Some((call.0, Some(live.attempt), live.text.clone()));
+                return events;
+            }
         }
         self.project(view)
     }
 
+    /// The committed range required to continue a sequential text renderer.
+    pub fn history_demand(
+        &self,
+        view: &SessionView,
+        change: &Change,
+    ) -> Option<crate::HistoryDemand> {
+        if !matches!(change, Change::Snapshot) {
+            return None;
+        }
+        let position = view.history.as_ref()?;
+        if let Some(fragment) = &position.fragment
+            && fragment.key.get() > self.settled
+            && view.items.iter().any(|item| {
+                item.key() == fragment.key
+                    && matches!(item.present().kind, Kind::Reply | Kind::Assistant)
+            })
+        {
+            let printed = self
+                .open
+                .as_ref()
+                .filter(|(key, _, _)| *key == fragment.key)
+                .map_or(0, |(_, _, text)| text.len());
+            let offset = if fragment.start > printed {
+                printed
+            } else {
+                fragment.end
+            };
+            if offset < fragment.total {
+                return Some(crate::HistoryDemand {
+                    anchor: crate::HistoryAnchor::TextAfter {
+                        item: fragment.index,
+                        offset,
+                    },
+                    ..Default::default()
+                });
+            }
+        }
+        Some(if position.end < position.count {
+            crate::HistoryDemand {
+                anchor: crate::HistoryAnchor::After(position.end),
+                ..Default::default()
+            }
+        } else {
+            crate::HistoryDemand::default()
+        })
+    }
+
+    pub fn skip_through(&mut self, view: &SessionView) {
+        self.session = view.session;
+        self.settled = view.seq;
+        self.open = None;
+    }
+
     pub fn project<'a>(&mut self, view: &'a SessionView) -> Vec<ReplyEvent<'a>> {
+        self.project_until(view, None)
+    }
+
+    pub fn through<'a>(&mut self, view: &'a SessionView, key: Seq) -> Vec<ReplyEvent<'a>> {
+        self.project_until(view, Some(key))
+    }
+
+    fn project_until<'a>(
+        &mut self,
+        view: &'a SessionView,
+        through: Option<Seq>,
+    ) -> Vec<ReplyEvent<'a>> {
         let mut events = Vec::new();
         if self.session != view.session {
             events.extend(self.open.take().map(|_| ReplyEvent::End));
@@ -65,6 +143,11 @@ impl ReplyStream {
                     item.key()
                 })
                 .is_err()
+            && view
+                .streaming
+                .as_ref()
+                .is_none_or(|stream| stream.call.0 != *seq)
+            && !view.state.is_open(protocol::CallId(*seq))
         {
             events.push(ReplyEvent::End);
             self.settled = self.settled.max(seq.get());
@@ -77,7 +160,10 @@ impl ReplyStream {
             }
             item.key().get() <= self.settled
         });
-        for item in &view.items[start..] {
+        for item in view.items[start..]
+            .iter()
+            .take_while(|item| through.is_none_or(|key| item.key() <= key))
+        {
             #[cfg(test)]
             {
                 self.inspected += 1;
@@ -109,17 +195,20 @@ impl ReplyStream {
                 events.extend([ReplyEvent::End, ReplyEvent::Start]);
                 printed.clear();
             }
-            if let Some(suffix) = text.strip_prefix(printed.as_str()) {
-                if !suffix.is_empty() {
-                    events.push(ReplyEvent::Text(suffix));
-                    printed.push_str(suffix);
-                }
-            } else if !printed.starts_with(text) {
-                events.extend([ReplyEvent::End, ReplyEvent::Start, ReplyEvent::Text(text)]);
-                printed.clear();
-                printed.push_str(text);
-            }
-            if item.settled() {
+            let fragment = view
+                .history
+                .as_ref()
+                .and_then(|h| h.fragment.as_ref())
+                .filter(|f| f.key == item.key());
+            reconcile(
+                &mut events,
+                &mut printed,
+                text,
+                fragment.filter(|_| live.is_none()),
+            );
+            if item.settled()
+                && fragment.is_none_or(|f| f.end == f.total && printed.len() >= f.total)
+            {
                 events.push(ReplyEvent::End);
                 self.settled = item.key().get();
             } else {
@@ -129,6 +218,32 @@ impl ReplyStream {
             }
         }
         events
+    }
+}
+
+fn reconcile<'a>(
+    events: &mut Vec<ReplyEvent<'a>>,
+    printed: &mut String,
+    text: &'a str,
+    fragment: Option<&protocol::history::TextSpan>,
+) {
+    if let Some(fragment) = fragment {
+        if fragment.start <= printed.len() && printed.len() < fragment.end {
+            let suffix = &text[printed.len() - fragment.start..];
+            if !suffix.is_empty() {
+                events.push(ReplyEvent::Text(suffix));
+                printed.push_str(suffix);
+            }
+        }
+    } else if let Some(suffix) = text.strip_prefix(printed.as_str()) {
+        if !suffix.is_empty() {
+            events.push(ReplyEvent::Text(suffix));
+            printed.push_str(suffix);
+        }
+    } else if !printed.starts_with(text) {
+        events.extend([ReplyEvent::End, ReplyEvent::Start, ReplyEvent::Text(text)]);
+        printed.clear();
+        printed.push_str(text);
     }
 }
 

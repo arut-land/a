@@ -2,6 +2,65 @@
 //! the text: headings, bullets, quotes, fenced code, `**bold**` and
 //! `` `code` ``. Each renderer lays them out; none parses.
 
+/// Parser state at a requested source offset; it owns no transcript text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Checkpoint {
+    pub fenced: bool,
+    pub inline: Option<InlineStyle>,
+    pub block: Option<LineKind>,
+    pub skip: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InlineStyle {
+    pub bold: bool,
+    pub code: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum LineKind {
+    Heading(u8),
+    Bullet(u8),
+    Quote,
+    Fence,
+    Code,
+    Para,
+}
+
+impl Checkpoint {
+    pub fn at(text: &str, offset: usize) -> Self {
+        let prefix = &text[..offset];
+        let line_start = prefix.rfind('\n').map_or(0, |at| at + 1);
+        let mut preceding = blocks(&prefix[..line_start]);
+        while preceding.next().is_some() {}
+        let mut inline = inlines(&prefix[line_start..]);
+        while inline.next().is_some() {}
+        let line_end = text[offset..]
+            .find('\n')
+            .map_or(text.len(), |at| offset + at);
+        let line = &text[line_start..line_end];
+        let (block, prefix) = match blocks(line).fenced(preceding.in_fence()).next().unwrap() {
+            Block::Heading(level, body) => (LineKind::Heading(level), line.len() - body.len()),
+            Block::Bullet { indent, text: body } => {
+                (LineKind::Bullet(indent), line.len() - body.len())
+            }
+            Block::Quote(body) => (LineKind::Quote, line.len() - body.len()),
+            Block::Fence(_) => (LineKind::Fence, line.len()),
+            Block::Code(_) => (LineKind::Code, 0),
+            Block::Para(_) => (LineKind::Para, 0),
+        };
+        Self {
+            fenced: preceding.in_fence(),
+            inline: (line_start != offset).then_some(InlineStyle {
+                bold: inline.bold,
+                code: inline.code,
+            }),
+            block: Some(block),
+            skip: prefix.saturating_sub(offset - line_start),
+        }
+    }
+}
+
 /// One line of a reply, by what it is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Block<'a> {
@@ -27,6 +86,57 @@ pub enum Inline<'a> {
     Text(&'a str),
     Bold(&'a str),
     Code(&'a str),
+}
+
+/// Inline runs for a text continuation, carrying fence and first-line state.
+pub fn fragment(text: &str, checkpoint: Checkpoint) -> Vec<Inline<'_>> {
+    let mut runs = Vec::new();
+    let mut fenced = checkpoint.fenced;
+    for (index, line) in text.split_inclusive('\n').enumerate() {
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        let (kind, body) = if index == 0
+            && let Some(kind) = checkpoint.block
+        {
+            (kind, &content[checkpoint.skip.min(content.len())..])
+        } else {
+            match blocks(content).fenced(fenced).next().unwrap() {
+                Block::Heading(level, body) => (LineKind::Heading(level), body),
+                Block::Bullet { indent, text } => (LineKind::Bullet(indent), text),
+                Block::Quote(body) => (LineKind::Quote, body),
+                Block::Fence(_) => (LineKind::Fence, ""),
+                Block::Code(body) => (LineKind::Code, body),
+                Block::Para(body) => (LineKind::Para, body),
+            }
+        };
+        match kind {
+            LineKind::Fence => fenced = !fenced,
+            LineKind::Code => runs.push(Inline::Code(body)),
+            _ => {
+                if matches!(kind, LineKind::Bullet(_))
+                    && (index != 0 || checkpoint.inline.is_none())
+                {
+                    runs.push(Inline::Text("• "));
+                }
+                let state = if index == 0 {
+                    checkpoint
+                } else {
+                    Checkpoint::default()
+                };
+                runs.extend(inlines(body).resumed(state).map(|run| match run {
+                    Inline::Text(text) if matches!(kind, LineKind::Heading(_)) => {
+                        Inline::Bold(text)
+                    }
+                    run => run,
+                }));
+            }
+        }
+        if let Some(newline) = line.get(content.len()..)
+            && !newline.is_empty()
+        {
+            runs.push(Inline::Text(newline));
+        }
+    }
+    runs
 }
 
 /// The lines of `text` as blocks.
@@ -110,6 +220,15 @@ pub struct Inlines<'a> {
     rest: &'a str,
     bold: bool,
     code: bool,
+}
+
+impl Inlines<'_> {
+    #[must_use]
+    pub fn resumed(mut self, checkpoint: Checkpoint) -> Self {
+        self.bold = checkpoint.inline.is_some_and(|style| style.bold);
+        self.code = checkpoint.inline.is_some_and(|style| style.code);
+        self
+    }
 }
 
 impl<'a> Iterator for Inlines<'a> {

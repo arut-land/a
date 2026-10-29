@@ -52,7 +52,28 @@ impl App {
             }
             self.committed += 1;
         }
+        if let Some(fragment) = self
+            .client
+            .view()
+            .history
+            .as_ref()
+            .and_then(|h| h.fragment.as_ref())
+            && self.committed == self.client.view().items.len()
+        {
+            self.printed_fragment = Some((fragment.key, fragment.end));
+        }
         out
+    }
+
+    pub fn unprinted_history(&self) -> Option<client::HistoryDemand> {
+        if self.viewport != Viewport::Inline
+            || self.verbose
+            || self.client.history_pending()
+            || self.committed < self.client.view().items.len()
+        {
+            return None;
+        }
+        client::HistoryDemand::newer(self.client.view().history.as_ref()?)
     }
 
     /// Inline: the last `n` rows of the items not yet printed, as (item,
@@ -102,13 +123,11 @@ impl App {
         let rule = self.rule(width);
         let working = self.working_row(width);
         let mut out = Vec::new();
-        if let Some(recap) = self
-            .client
-            .view()
-            .recap
-            .as_ref()
-            .filter(|_| !self.recap_hidden)
-        {
+        if let Some(recap) = self.client.view().recap.as_ref().filter(|_| {
+            !self.recap_hidden
+                && !self.client.history_pending()
+                && self.unprinted_history().is_none()
+        }) {
             let cyan = Style::new().fg(Color::Cyan);
             let banner = [Span::new(recap_line(recap), cyan)];
             let first = [Span::new("↺ ", cyan)];
@@ -271,10 +290,18 @@ impl App {
                 Style::new().bold(),
             ));
         }
-        let model = reply.and_then(|i| match &self.client.view().items[i] {
-            Item::Reply { model, .. } => Some(model.as_str()),
-            _ => None,
-        });
+        let model = self
+            .client
+            .view()
+            .history
+            .as_ref()
+            .and_then(|h| h.model.as_deref())
+            .or_else(|| {
+                reply.and_then(|i| match &self.client.view().items[i] {
+                    Item::Reply { model, .. } => Some(model.as_str()),
+                    _ => None,
+                })
+            });
         let mut right = String::new();
         if let Some(model) = model {
             right.push_str(model);

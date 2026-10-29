@@ -24,12 +24,20 @@ use protocol::{HostPath, SessionSummary, Target};
 pub enum Effect {
     /// The session client's to carry out.
     Cmd(Cmd),
+    History(client::HistoryDemand),
+    Recall(client::HistoryDemand),
     OpenUrl(String),
     /// Replace an unresponsive daemon.
     Restart,
     Redraw,
     Detach,
     Quit,
+}
+
+#[derive(Clone, Copy)]
+enum Recall {
+    Committed(usize),
+    Pending(usize),
 }
 
 enum Overlay {
@@ -97,6 +105,10 @@ pub struct App {
     /// Scrolled back: the top row shown, as (item, row within it), which
     /// stays put as output arrives below. `None` follows the latest.
     anchor: Option<(usize, usize)>,
+    range_start: usize,
+    history_transition: Option<protocol::history::Direction>,
+    recall: Option<Recall>,
+    recall_waiting: Option<protocol::history::Direction>,
     /// The transcript area's width and height when last drawn.
     width: usize,
     body: u16,
@@ -124,6 +136,7 @@ pub struct App {
     clock: WorkingClock,
     /// Inline: the items already printed into the scrollback.
     committed: usize,
+    printed_fragment: Option<(protocol::Seq, usize)>,
     /// The attach asked for the latest session: if there is none, the
     /// picker opens instead.
     resuming: bool,
@@ -192,14 +205,25 @@ const HELP: &[(&str, &str)] = &[
 
 impl App {
     pub fn new(viewport: Viewport, target: &Target) -> Self {
+        let mut client = SessionClient::new(Env::Origin);
+        if viewport == Viewport::Inline {
+            client.demand(client::HistoryDemand {
+                anchor: client::HistoryAnchor::After(0),
+                ..Default::default()
+            });
+        }
         Self {
-            client: SessionClient::new(Env::Origin),
+            client,
             viewport,
             workspace: HostPath::default(),
             cache: BTreeMap::new(),
             collapsed: HashSet::new(),
             verbose: false,
             anchor: None,
+            range_start: 0,
+            history_transition: None,
+            recall: None,
+            recall_waiting: None,
             width: 0,
             body: 0,
             editor: Editor::default(),
@@ -217,6 +241,7 @@ impl App {
             tokens: Usage::default(),
             clock: WorkingClock::default(),
             committed: 0,
+            printed_fragment: None,
             resuming: matches!(target, Target::Latest { .. }),
             redraw: true,
         }
@@ -268,7 +293,16 @@ impl App {
             self.overlay = Some(Overlay::Picker { selected: 0 });
             self.redraw = true;
         }
-        self.client.run(cmd)
+        let follows = matches!(cmd, Cmd::Input(_) | Cmd::Steer(_));
+        let mut effects = self.client.run(cmd);
+        if follows
+            && !effects
+                .iter()
+                .any(|effect| matches!(effect, client::Effect::Show(Show::Notice(_))))
+        {
+            effects.extend(self.client.demand(client::HistoryDemand::default()));
+        }
+        effects
     }
 
     /// Folds a daemon message in, as if from the open connection, showing
@@ -333,6 +367,9 @@ impl App {
                     self.collapsed.clear();
                     self.anchor = None;
                     self.committed = 0;
+                    self.printed_fragment = None;
+                    self.range_start = 0;
+                    self.history_transition = None;
                     self.tokens = Usage::default();
                     self.clock = WorkingClock::default();
                     self.recap_hidden = false;
@@ -362,20 +399,49 @@ impl App {
             Change::Mismatch { supported } => {
                 self.flash = Some((mismatch_line(supported), Style::new().fg(Color::Red)));
             }
-            Change::Snapshot => {
-                self.cache.clear();
-                self.anchor = None;
-                self.committed = self.committed.min(len);
-                self.tokens = Usage::default();
-                for item in &self.client.view().items {
-                    spend(&mut self.tokens, item);
-                }
-            }
+            Change::Snapshot => self.install_range(len),
             // A streaming reply's rows catch up with its text when drawn.
             Change::Delta { .. } | Change::Activity | Change::Draining => {}
             Change::Batch { .. } => unreachable!(),
         }
         Vec::new()
+    }
+
+    fn install_range(&mut self, len: usize) {
+        let committed = self.range_start + self.committed;
+        self.cache.clear();
+        if let Some(history) = &self.client.view().history {
+            self.anchor = match self.history_transition.take() {
+                Some(protocol::history::Direction::Before) => None,
+                Some(protocol::history::Direction::After) => Some((0, 0)),
+                None => self.anchor.and_then(|(i, row)| {
+                    (self.range_start + i)
+                        .checked_sub(history.start)
+                        .filter(|i| *i < len)
+                        .map(|i| (i, row))
+                }),
+            };
+            self.range_start = history.start;
+            self.tokens = history.usage;
+        } else {
+            self.anchor = None;
+            self.tokens = Usage::default();
+            for item in &self.client.view().items {
+                spend(&mut self.tokens, item);
+            }
+        }
+        self.committed = if self
+            .client
+            .view()
+            .history
+            .as_ref()
+            .and_then(|h| h.fragment.as_ref())
+            .is_some_and(|f| f.start > 0 && self.printed_fragment == Some((f.key, f.start)))
+        {
+            0
+        } else {
+            committed.saturating_sub(self.range_start).min(len)
+        };
     }
 
     pub fn notice(&mut self, text: impl Into<String>, error: bool) {
@@ -421,6 +487,17 @@ impl App {
         {
             return self.question_key(call, id, &question, key);
         }
+        if self.client.view().history.is_some()
+            && self.editor.recall_edge(key)
+            && (asked.is_none() || !self.editor.is_empty())
+            && self.menu().is_empty()
+        {
+            return self.recall_key(matches!(key, Key::Up | Key::Ctrl('p')));
+        }
+        if !matches!(key, Key::Up | Key::Down | Key::Ctrl('p' | 'n')) {
+            self.recall = None;
+            self.recall_waiting = None;
+        }
         let page = self.page();
         match key {
             Key::Ctrl('c') if self.client.turn().can_interrupt => return Some(self.interrupt()),
@@ -435,8 +512,14 @@ impl App {
                 self.cache.clear();
             }
             Key::Ctrl('l') => return Some(Effect::Redraw),
-            Key::PageUp => self.scroll_by(page),
-            Key::PageDown => self.scroll_by(-page),
+            Key::PageUp => {
+                self.scroll_by(page);
+                return self.history_edge(protocol::history::Direction::Before);
+            }
+            Key::PageDown => {
+                self.scroll_by(-page);
+                return self.history_edge(protocol::history::Direction::After);
+            }
             Key::F(1) => self.overlay = Some(Overlay::Help),
             Key::Char('?') if self.editor.is_empty() && asked.is_none() => {
                 self.overlay = Some(Overlay::Help);
@@ -473,42 +556,46 @@ impl App {
             Key::Esc if self.client.turn().can_interrupt => {
                 return Some(self.interrupt());
             }
-            Key::Esc if self.anchor.is_some() => self.anchor = None,
+            Key::Esc if self.anchor.is_some() => {
+                self.anchor = None;
+                return Some(Effect::History(client::HistoryDemand::default()));
+            }
             Key::Esc => self.recap_hidden = true,
+            key => return self.compose_key(key),
+        }
+        None
+    }
+
+    fn compose_key(&mut self, key: Key) -> Option<Effect> {
+        let menu = self.menu();
+        let last = menu.len().saturating_sub(1);
+        let at = self.menu_at.unwrap_or(0).min(last);
+        match key {
+            Key::Up | Key::Ctrl('p') if !menu.is_empty() => {
+                self.menu_at = Some(at.saturating_sub(1));
+            }
+            Key::Down | Key::Ctrl('n') if !menu.is_empty() => {
+                self.menu_at = Some((at + 1).min(last));
+            }
+            // Tab takes the selected name; a command with
+            // arguments waits for them, one without runs on Enter.
+            Key::Tab | Key::Enter if !menu.is_empty() && self.editor.text() != menu[at].0 => {
+                let (name, usage, _) = &menu[at];
+                let args = usage.len() > name.len();
+                self.editor.clear();
+                self.editor.insert(name);
+                if args {
+                    self.editor.insert(" ");
+                } else if key == Key::Enter
+                    && let Edit::Submit(input) = self.edit(Key::Enter)
+                {
+                    return self.submit(input);
+                }
+            }
             key => {
-                let menu = self.menu();
-                let last = menu.len().saturating_sub(1);
-                let at = self.menu_at.unwrap_or(0).min(last);
-                match key {
-                    Key::Up | Key::Ctrl('p') if !menu.is_empty() => {
-                        self.menu_at = Some(at.saturating_sub(1));
-                    }
-                    Key::Down | Key::Ctrl('n') if !menu.is_empty() => {
-                        self.menu_at = Some((at + 1).min(last));
-                    }
-                    // Tab takes the selected name; a command with
-                    // arguments waits for them, one without runs on Enter.
-                    Key::Tab | Key::Enter
-                        if !menu.is_empty() && self.editor.text() != menu[at].0 =>
-                    {
-                        let (name, usage, _) = &menu[at];
-                        let args = usage.len() > name.len();
-                        self.editor.clear();
-                        self.editor.insert(name);
-                        if args {
-                            self.editor.insert(" ");
-                        } else if key == Key::Enter
-                            && let Edit::Submit(input) = self.edit(Key::Enter)
-                        {
-                            return self.submit(input);
-                        }
-                    }
-                    key => {
-                        self.menu_at = Some(0);
-                        if let Edit::Submit(input) = self.edit(key) {
-                            return self.submit(input);
-                        }
-                    }
+                self.menu_at = Some(0);
+                if let Edit::Submit(input) = self.edit(key) {
+                    return self.submit(input);
                 }
             }
         }
@@ -701,6 +788,54 @@ impl App {
         None
     }
 
+    fn recall_key(&mut self, older: bool) -> Option<Effect> {
+        if self.recall_waiting.is_some() {
+            return None;
+        }
+        let view = self.client.view();
+        let count = view.state.queued().filter(|q| q.source.visible()).count()
+            + self.client.pending_inputs().count();
+        let pending = match (self.recall, older) {
+            (None, true) => count.checked_sub(1),
+            (Some(Recall::Pending(index)), true) => index.checked_sub(1),
+            (Some(Recall::Pending(index)), false) => (index + 1 < count).then_some(index + 1),
+            _ => None,
+        };
+        if let Some(index) = pending {
+            let text = view
+                .state
+                .queued()
+                .filter(|q| q.source.visible())
+                .map(|q| q.text.clone())
+                .chain(self.client.pending_inputs().map(protocol::Segments::text))
+                .nth(index)?;
+            self.editor.recalled(&text);
+            self.recall = Some(Recall::Pending(index));
+            return None;
+        }
+        if !older && !matches!(self.recall, Some(Recall::Committed(_))) {
+            self.editor.restore_draft();
+            self.recall = None;
+            return None;
+        }
+        let direction = if older {
+            protocol::history::Direction::Before
+        } else {
+            protocol::history::Direction::After
+        };
+        let anchor = match (self.recall, older) {
+            (Some(Recall::Committed(index)), true) => client::HistoryAnchor::Before(index),
+            (Some(Recall::Committed(index)), false) => client::HistoryAnchor::After(index + 1),
+            _ => client::HistoryAnchor::Tail,
+        };
+        self.recall_waiting = Some(direction);
+        Some(Effect::Recall(client::HistoryDemand {
+            anchor,
+            bytes: 1,
+            filter: protocol::history::Filter::Inputs,
+        }))
+    }
+
     fn edit(&mut self, key: Key) -> Edit {
         let view = self.client.view();
         self.editor.key_with_history(key, || {
@@ -817,15 +952,38 @@ impl App {
         }
     }
 
-    fn mouse(&mut self, mouse: Mouse) -> Option<Effect> {
-        match mouse {
-            Mouse::WheelUp => self.wheel(-1),
-            Mouse::WheelDown => self.wheel(1),
-            Mouse::Press { x, y } => {
-                return self.canvas.hit(x, y).and_then(|a| self.act(a));
+    fn history_edge(&mut self, direction: protocol::history::Direction) -> Option<Effect> {
+        let history = self.client.view().history.as_ref()?;
+        let demand = match direction {
+            protocol::history::Direction::Before if self.anchor == Some((0, 0)) => {
+                client::HistoryDemand::older(history)
             }
+            protocol::history::Direction::After if self.anchor.is_none() => {
+                client::HistoryDemand::newer(history)
+            }
+            _ => None,
+        }?;
+        self.history_transition = Some(direction);
+        Some(Effect::History(demand))
+    }
+
+    fn mouse(&mut self, mouse: Mouse) -> Option<Effect> {
+        let direction = match mouse {
+            Mouse::WheelUp => {
+                self.wheel(-1);
+                protocol::history::Direction::Before
+            }
+            Mouse::WheelDown => {
+                self.wheel(1);
+                protocol::history::Direction::After
+            }
+            Mouse::Press { x, y } => return self.canvas.hit(x, y).and_then(|a| self.act(a)),
+        };
+        if self.overlay.is_none() {
+            self.history_edge(direction)
+        } else {
+            None
         }
-        None
     }
 
     fn wheel(&mut self, dir: i32) {
@@ -863,7 +1021,12 @@ impl App {
             }
             Action::Dismiss if self.overlay.is_some() => self.overlay = None,
             Action::Dismiss => self.recap_hidden = true,
-            Action::Bottom => self.anchor = None,
+            Action::Bottom => {
+                self.anchor = None;
+                if self.client.view().history.is_some() {
+                    return Some(Effect::History(client::HistoryDemand::default()));
+                }
+            }
             Action::Restart => {
                 self.overlay = None;
                 return Some(Effect::Restart);
@@ -914,8 +1077,67 @@ impl Renderer for App {
                     self.redraw = true;
                     asked.extend(self.changed(update));
                 }
+                Show::History {
+                    reader: 1,
+                    page:
+                        client::HistoryPage {
+                            cut, range, items, ..
+                        },
+                } => {
+                    let direction = self.recall_waiting.take();
+                    if let Some(direction) = direction
+                        && self.client.view().history.as_ref().is_some_and(|h| {
+                            h.cut.session == cut.session && h.cut.generation == cut.generation
+                        })
+                    {
+                        if let Some(item) = items.first() {
+                            let text: std::borrow::Cow<'_, str> = match item {
+                                Item::User { text, .. } => HistoryEntry::Text(text).into(),
+                                Item::Tool { tool, input, .. } => {
+                                    HistoryEntry::Command { tool, input }.into()
+                                }
+                                _ => continue,
+                            };
+                            self.editor.recalled(&text);
+                            self.recall = Some(Recall::Committed(
+                                if direction == protocol::history::Direction::Before {
+                                    range.start
+                                } else {
+                                    range.end - 1
+                                },
+                            ));
+                        } else if direction == protocol::history::Direction::After {
+                            let text = self
+                                .client
+                                .view()
+                                .state
+                                .queued()
+                                .filter(|q| q.source.visible())
+                                .map(|q| q.text.clone())
+                                .chain(self.client.pending_inputs().map(protocol::Segments::text))
+                                .next();
+                            if let Some(text) = text {
+                                self.editor.recalled(&text);
+                                self.recall = Some(Recall::Pending(0));
+                            } else {
+                                self.editor.restore_draft();
+                                self.recall = None;
+                            }
+                        }
+                        self.redraw = true;
+                    }
+                    asked.extend(self.client.close_history(1));
+                }
+                Show::History { .. } => {}
                 Show::Sessions => self.pick_default(),
-                Show::Notice(notice) => self.notice(notice.to_string(), true),
+                Show::Notice(notice) => {
+                    if matches!(notice, client::Notice::HistoryChanged { reader: 1 }) {
+                        self.recall_waiting = None;
+                        self.recall = None;
+                        self.editor.restore_draft();
+                    }
+                    self.notice(notice.to_string(), true);
+                }
                 Show::Link => {
                     self.redraw = true;
                     if let Link::Wedged(d) = self.client.link() {

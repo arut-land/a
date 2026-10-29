@@ -231,9 +231,9 @@ crates, three of them proc-macros, for `Buffer`, `Cell` and `Style`.
   and a row, which stays put as output arrives below). A 6000-item session
   costs about what a short one does to draw, resize or resume. A reply
   streaming in keeps the rows of its finished lines; a delta wraps only the
-  line still open. What the bottom rows need of the whole transcript (the
-  oldest ask, whether a turn runs, the latest model) is found once per
-  change, not per frame.
+  line still open. Bottom-row controls (the oldest ask, whether a turn runs,
+  the latest model) come from the control head, independently of the
+  requested transcript range.
 - Text goes into the grid a cell a character, the columns `wrap` counted
   for it. A zero-width character (a combining mark, a variation selector)
   joins the cell before it; joiners and format characters are dropped,
@@ -421,3 +421,11 @@ Batches include an accept/decline/cancel response field for each prompt.
 Ctrl-O explicitly opens the displayed URL through the native browser; repeated
 actions cycle through all URLs in a batch. Submit/Continue is separate from
 opening. Question paste preserves the literal value, including tabs/newlines.
+
+The transcript is an SDK requested range. Paging above or below its boundary
+requests the adjacent ordinal or large-item byte continuation. Resize reflows
+that range with the shared markdown continuation checkpoint. Recall uses an
+independent input-history reader, preserving the current pasted draft and
+pending submissions while it crosses page boundaries. Returning to the bottom
+requests the current tail. No session-length limit applies to scrolling or
+recall.

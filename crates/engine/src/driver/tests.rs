@@ -662,45 +662,16 @@ fn pressure_retains_cached_projections_while_a_process_is_owned() {
     assert!(session.has_jobs());
     assert!(!session.has_work());
     assert_eq!(session.summary().activity, Activity::Idle);
-    assert_eq!(session.projection_cache(true), [true; 3]);
+    assert!(session.projection_cache(true));
     session.reclaim();
-    assert_eq!(session.projection_cache(false), [true; 3]);
+    assert!(session.projection_cache(false));
     assert!(Arc::ptr_eq(
         &*lock(&session.session.jobs)[0].lease,
         &process
     ));
     lock(&session.session.jobs).clear();
     session.reclaim();
-    assert_eq!(session.projection_cache(false), [false; 3]);
-    session.halt();
-}
-
-#[test]
-fn pressure_discards_a_cached_snapshot_without_changing_its_rebuild() {
-    let script = Script::new(&[]);
-    let fixture = Fixture::new(ext::LOOP, Registry::default(), openai(&script));
-    let entries: Vec<_> = (1..=SNAPSHOT_GAP + 1)
-        .map(|seq| entry(seq, echo("cached message")))
-        .collect();
-    let session = fixture.start(&entries);
-    let attach = || {
-        let outbox = Outbox::new();
-        session.follow(&outbox, 0);
-        std::iter::from_fn(|| outbox.try_next())
-            .map(|frame| frame.as_bytes().to_vec())
-            .collect::<Vec<_>>()
-    };
-    let first = attach();
-    let built = fixture.hops();
-    assert_eq!(attach(), first);
-    assert_eq!(fixture.hops(), built, "an unchanged snapshot is reused");
-    session.reclaim();
-    session.barrier();
-    assert_eq!(attach(), first);
-    assert!(
-        fixture.hops() > built,
-        "pressure released the cached projection"
-    );
+    assert!(!session.projection_cache(false));
     session.halt();
 }
 

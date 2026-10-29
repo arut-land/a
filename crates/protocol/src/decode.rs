@@ -319,6 +319,9 @@ parsed!(
     ToolOutcome,
     ClientId,
     ViewState,
+    Box<crate::history::Head>,
+    crate::history::Request,
+    crate::view::Items,
     Vec<Item>,
     Vec<SessionSummary>
 );
@@ -515,6 +518,9 @@ pub(crate) struct EntryFields {
 #[derive(Deserialize)]
 pub(crate) struct MsgFields {
     pub(crate) t: Option<Tag>,
+    pub(crate) head: Option<Json>,
+    pub(crate) range: Option<Json>,
+    pub(crate) done: Option<bool>,
     pub(crate) seq: Option<u64>,
     pub(crate) call: Option<u64>,
     pub(crate) text: Option<String>,
@@ -752,7 +758,7 @@ impl ItemFields {
                 hook: req(f.hook.take(), "hook")?,
                 call: def(f.call.take())?,
                 tool: f.tool.take().unwrap_or_default(),
-                decision: verdict(&req(f.decision.take(), "decision")?)?,
+                decision: need(f.decision.take(), "decision")?,
             },
             Type::Child => Item::Child {
                 call: need(f.call.take(), "call")?,
@@ -767,11 +773,6 @@ impl ItemFields {
             },
         })
     }
-}
-
-/// A [`Verdict`] as an item nests it, read by the decoder an entry's is.
-fn verdict(json: &Json) -> Result<Verdict> {
-    Verdict::read(&mut read::<EntryFields>(json.raw().as_bytes())?)
 }
 
 /// As a ledger's phase nests it (in a snapshot), read by the decoder an

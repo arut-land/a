@@ -726,6 +726,49 @@ impl Session {
         Ok(())
     }
 
+    /// Demands the preceding range, preserving pending submissions and controls.
+    pub fn history_before(&self, anchor: u64) -> Result<(), ClientError> {
+        let anchor = usize::try_from(anchor).map_err(|_| ClientError::InvalidArgument {
+            message: "history anchor is too large".into(),
+        })?;
+        self.intend(move |client| {
+            let demand = client
+                .view()
+                .history
+                .as_ref()
+                .filter(|h| h.start == anchor)
+                .and_then(client::HistoryDemand::older)
+                .unwrap_or(client::HistoryDemand {
+                    anchor: client::HistoryAnchor::Before(anchor),
+                    ..Default::default()
+                });
+            Ok(client.demand(demand))
+        })
+    }
+
+    pub fn history_after(&self, anchor: u64) -> Result<(), ClientError> {
+        let anchor = usize::try_from(anchor).map_err(|_| ClientError::InvalidArgument {
+            message: "history anchor is too large".into(),
+        })?;
+        self.intend(move |client| {
+            let demand = client
+                .view()
+                .history
+                .as_ref()
+                .filter(|h| h.end == anchor)
+                .and_then(client::HistoryDemand::newer)
+                .unwrap_or(client::HistoryDemand {
+                    anchor: client::HistoryAnchor::After(anchor),
+                    ..Default::default()
+                });
+            Ok(client.demand(demand))
+        })
+    }
+
+    pub fn follow_history(&self) -> Result<(), ClientError> {
+        self.intend(|client| Ok(client.demand(client::HistoryDemand::default())))
+    }
+
     /// Answers the ask for tool call `call`.
     pub fn approve(&self, call: u64, approved: bool) -> Result<(), ClientError> {
         let call = protocol::CallId::new(call).ok_or_else(|| ClientError::InvalidArgument {

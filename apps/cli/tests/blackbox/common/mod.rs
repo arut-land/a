@@ -342,29 +342,31 @@ impl Env {
     /// A session's log as stored, asserting that every line is a complete
     /// entry.
     pub fn log(&self, id: SessionId) -> Vec<Entry> {
-        let mut roots = vec![self.home.sessions_dir()];
-        let path = loop {
-            let root = roots.pop().expect("session log exists");
-            let path = root.join(id.to_string()).join("log.jsonl");
-            if path.is_file() {
-                break path;
-            }
-            for entry in fs::read_dir(root).unwrap() {
-                let children = entry.unwrap().path().join("children");
-                if children.is_dir() {
-                    roots.push(children);
-                }
-            }
-        };
-        let text = fs::read_to_string(path).unwrap();
-        assert!(text.ends_with('\n'), "torn final line in {text}");
-        text.lines()
-            .skip(1)
-            .map(|line| {
-                serde_json::from_str(line).unwrap_or_else(|e| panic!("torn entry {line}: {e}"))
-            })
-            .collect()
+        log(&self.home, id)
     }
+}
+
+fn log(home: &Home, id: SessionId) -> Vec<Entry> {
+    let mut roots = vec![home.sessions_dir()];
+    let path = loop {
+        let root = roots.pop().expect("session log exists");
+        let path = root.join(id.to_string()).join("log.jsonl");
+        if path.is_file() {
+            break path;
+        }
+        for entry in fs::read_dir(root).unwrap() {
+            let children = entry.unwrap().path().join("children");
+            if children.is_dir() {
+                roots.push(children);
+            }
+        }
+    };
+    let text = fs::read_to_string(path).unwrap();
+    assert!(text.ends_with('\n'), "torn final line in {text}");
+    text.lines()
+        .skip(1)
+        .map(|line| serde_json::from_str(line).unwrap_or_else(|e| panic!("torn entry {line}: {e}")))
+        .collect()
 }
 
 /// What the test started is gone before its home is: the watchdog stops
@@ -390,6 +392,9 @@ impl Drop for Env {
 pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct Conn {
+    home: Home,
+    facts: u64,
+    deferred: std::collections::VecDeque<DaemonMsg>,
     reader: BufReader<sys::OwnedConnection>,
     writer: sys::OwnedConnection,
     /// Everything received, folded as a client's view.
@@ -411,7 +416,7 @@ pub fn hello() -> ClientMsg {
 impl Conn {
     /// A connection to `home`'s socket, before any hello.
     pub fn open(home: &Home) -> Self {
-        Self::from(home.endpoint().connect().unwrap())
+        Self::from(home.endpoint().connect().unwrap(), home.clone())
     }
 
     /// [`Conn::open`] to a daemon that is starting by itself: connects
@@ -425,12 +430,15 @@ impl Conn {
             stream = endpoint.connect().ok();
             stream.is_some()
         });
-        Self::from(stream.unwrap())
+        Self::from(stream.unwrap(), home.clone())
     }
 
-    fn from(stream: sys::OwnedConnection) -> Self {
+    fn from(stream: sys::OwnedConnection, home: Home) -> Self {
         stream.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
         Self {
+            home,
+            facts: 0,
+            deferred: std::collections::VecDeque::default(),
             reader: BufReader::new(stream.try_clone().unwrap()),
             writer: stream,
             view: SessionView::default(),
@@ -455,7 +463,10 @@ impl Conn {
     /// The next message, or none once the daemon has gone. A daemon that
     /// is up but silent for [`READ_TIMEOUT`] is a failure of its own.
     pub fn try_recv(&mut self) -> Option<DaemonMsg> {
-        let msg = match protocol::read_frame(&mut self.reader) {
+        let msg = match self.deferred.pop_front().map_or_else(
+            || protocol::read_frame(&mut self.reader),
+            |msg| Ok(Some(msg)),
+        ) {
             Ok(msg) => msg?,
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
                 panic!(
@@ -466,12 +477,11 @@ impl Conn {
             Err(_) => return None,
         };
         match &msg {
-            DaemonMsg::Attached { session, .. } => self.last = Some((*session, 0)),
-            DaemonMsg::Entry(e) => {
-                if let Some((_, seq)) = &mut self.last {
-                    *seq = e.seq.get();
-                }
+            DaemonMsg::Attached { session, .. } => {
+                self.last = Some((*session, 0));
+                self.facts = 0;
             }
+            DaemonMsg::Head { head } => self.last = Some((head.cut.session, head.cut.seq)),
             _ => {}
         }
         self.view.fold(&msg);
@@ -496,16 +506,83 @@ impl Conn {
         let DaemonMsg::Attached { session, .. } = self.recv() else {
             panic!("expected attached");
         };
-        let mut replay = Vec::new();
         loop {
             match self.recv() {
-                DaemonMsg::Entry(e) => replay.push(e),
-                DaemonMsg::Activity { .. } => {}
+                DaemonMsg::Head { .. } | DaemonMsg::Activity { .. } => {}
                 DaemonMsg::Synced { seq } => {
-                    assert_eq!(seq, replay.last().map_or(0, |e| e.seq.get()));
+                    assert_eq!(Some(seq), self.last.map(|(_, seq)| seq));
+                    let replay = self.certified_entries();
+                    self.refresh_history();
                     return (session, replay);
                 }
-                msg => panic!("unexpected during replay: {msg:?}"),
+                msg => panic!("unexpected during attach: {msg:?}"),
+            }
+        }
+    }
+
+    /// Irreducible facts read from the real journal, only through the public certified cut.
+    pub fn certified_entries(&mut self) -> Vec<Entry> {
+        let Some((session, through)) = self.last else {
+            return Vec::new();
+        };
+        let entries: Vec<_> = log(&self.home, session)
+            .into_iter()
+            .filter(|entry| entry.seq.get() > self.facts && entry.seq.get() <= through)
+            .collect();
+        self.facts = through;
+        entries
+    }
+
+    fn refresh_history(&mut self) {
+        use protocol::Decode;
+        let Some(position) = &self.view.history else {
+            return;
+        };
+        let cut = position.cut;
+        let id = u64::MAX;
+        self.send(&ClientMsg::History {
+            id,
+            range: protocol::history::Request {
+                cut,
+                anchor: 0,
+                text_offset: None,
+                direction: protocol::history::Direction::After,
+                bytes: usize::MAX,
+                filter: protocol::history::Filter::Transcript,
+            },
+        });
+        let mut bytes = Vec::new();
+        loop {
+            match protocol::read_frame::<DaemonMsg>(&mut self.reader)
+                .unwrap()
+                .unwrap()
+            {
+                DaemonMsg::HistoryPart {
+                    id: current,
+                    offset,
+                    text,
+                    done,
+                } if current == id => {
+                    assert_eq!(offset, bytes.len() as u64);
+                    bytes.extend_from_slice(text.as_bytes());
+                    if done {
+                        let page = protocol::history::Page::from_json(&bytes).unwrap();
+                        self.view.range(
+                            page.items.into_iter().map(|row| row.item).collect(),
+                            page.start..page.end,
+                            page.fragment,
+                        );
+                    }
+                }
+                DaemonMsg::Reply {
+                    id: current,
+                    outcome: Outcome::Done { .. },
+                } if current == id => break,
+                DaemonMsg::Reply {
+                    id: current,
+                    outcome,
+                } if current == id => panic!("history failed: {outcome:?}"),
+                msg => self.deferred.push_back(msg),
             }
         }
     }
@@ -526,17 +603,25 @@ impl Conn {
         }
     }
 
-    /// Live entries up to and including the first that `last` accepts.
+    /// Certified journal facts through the first accepted fact, plus its requested presentation.
     pub fn until(&mut self, last: impl Fn(&Entry) -> bool) -> Vec<Entry> {
         let mut got = Vec::new();
         loop {
-            if let DaemonMsg::Entry(e) = self.recv() {
-                let done = last(&e);
-                got.push(e);
+            let (session, through) = self.last.expect("attached session");
+            for entry in log(&self.home, session)
+                .into_iter()
+                .filter(|e| e.seq.get() > self.facts && e.seq.get() <= through)
+            {
+                let done = last(&entry);
+                got.push(entry);
                 if done {
+                    self.facts = got.last().unwrap().seq.get();
+                    self.refresh_history();
                     return got;
                 }
             }
+            self.facts = through;
+            self.recv();
         }
     }
 }

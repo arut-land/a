@@ -373,8 +373,13 @@ fn repl(daemon: &client::Daemon, target: Target) -> io::Result<()> {
         screen: Screen::default(),
         input: Some(tx),
         live: false,
+        eof: false,
         exit: None,
     };
+    repl.client.demand(client::HistoryDemand {
+        anchor: client::HistoryAnchor::After(0),
+        ..Default::default()
+    });
     let mut effects = repl.client.open(target);
     loop {
         driver.pump(&mut repl, effects);
@@ -387,7 +392,14 @@ fn repl(daemon: &client::Daemon, target: Target) -> io::Result<()> {
         effects = match input {
             Input::Busy => return Err(client::Error::Busy.into()),
             Input::Client(event) => repl.client.step(event),
-            Input::Line(None) => repl.client.detach(),
+            Input::Line(None) => {
+                repl.eof = true;
+                if repl.client.history_pending() {
+                    Vec::new()
+                } else {
+                    repl.client.detach()
+                }
+            }
             Input::Line(Some(line)) => repl.line(&line)?,
         };
     }
@@ -402,6 +414,7 @@ struct Repl {
     input: Option<client::Post<Input>>,
     /// Attached once at least.
     live: bool,
+    eof: bool,
     /// Set once something shown ends the client.
     exit: Option<io::Result<()>>,
 }
@@ -491,6 +504,7 @@ fn read_lines(input: impl BufRead, post: &client::Post<Input>) {
 /// Shows what the client tells; what ends the client is kept for the loop.
 impl Renderer for Repl {
     fn show(&mut self, shown: Vec<Show>) -> Vec<client::Effect> {
+        let mut effects = Vec::new();
         for show in shown {
             if self.exit.is_some() {
                 break;
@@ -506,6 +520,15 @@ impl Renderer for Repl {
                     }
                     self.screen
                         .show(&update.change, self.client.view(), &mut out);
+                    if let Some(demand) = self
+                        .screen
+                        .history_demand(self.client.view(), &update.change)
+                    {
+                        effects.extend(self.client.demand(demand));
+                    }
+                    if self.eof && !self.client.history_pending() {
+                        effects.extend(self.client.detach());
+                    }
                 }
                 Show::Notice(notice) => eprintln!("[{}]", client::sanitize(&notice.to_string())),
                 Show::Sessions => {
@@ -513,10 +536,11 @@ impl Renderer for Repl {
                         sayln!("  {s}");
                     }
                 }
+                Show::History { .. } => {}
                 Show::Link => self.exit = self.link(),
             }
         }
-        Vec::new()
+        effects
     }
 }
 
@@ -548,16 +572,49 @@ struct Screen {
     stream: client::ReplyStream,
     /// The replay of the latest attach is in.
     synced: bool,
+    shown: u64,
+    user_fragment: Option<(protocol::Seq, usize)>,
+    open_tools: std::collections::BTreeSet<protocol::Seq>,
+    recap_pending: bool,
+    questions: std::collections::BTreeMap<protocol::Seq, (Option<protocol::Seq>, Option<u64>)>,
 }
 
 impl Screen {
+    fn history_demand(&self, view: &SessionView, change: &Change) -> Option<client::HistoryDemand> {
+        if matches!(change, Change::Snapshot)
+            && let Some(fragment) = view
+                .history
+                .as_ref()
+                .and_then(|position| position.fragment.as_ref())
+            && view
+                .items
+                .iter()
+                .any(|item| item.key() == fragment.key && matches!(item, Item::User { .. }))
+        {
+            let printed = self
+                .user_fragment
+                .filter(|(key, _)| *key == fragment.key)
+                .map_or(0, |(_, bytes)| bytes);
+            if printed < fragment.total {
+                return Some(client::HistoryDemand {
+                    anchor: client::HistoryAnchor::TextAfter {
+                        item: fragment.index,
+                        offset: printed,
+                    },
+                    ..Default::default()
+                });
+            }
+        }
+        self.stream.history_demand(view, change)
+    }
+
     fn show(
         &mut self,
         change: &Change,
         view: &SessionView,
         emit: &mut dyn FnMut(fmt::Arguments<'_>),
     ) {
-        if !matches!(change, Change::Batch { .. }) {
+        if !matches!(change, Change::Batch { .. } | Change::Snapshot) {
             for event in self.stream.update(view, change) {
                 match event {
                     client::ReplyEvent::Start => emit(format_args!("a    ")),
@@ -576,6 +633,10 @@ impl Screen {
                 session, workspace, ..
             } => {
                 self.synced = false;
+                self.shown = 0;
+                self.user_fragment = None;
+                self.open_tools.clear();
+                self.questions.clear();
                 emit(format_args!(
                     "[session {} · {}]\n",
                     session.short(),
@@ -590,22 +651,14 @@ impl Screen {
                     }
                 }
             }
-            // Sent in place of a long replay: shown as the replay would be.
-            Change::Snapshot => {
-                for item in &view.items {
-                    if matches!(item.present().kind, Kind::Reply | Kind::Assistant) {
-                        continue;
-                    }
-                    print_all(&added(item), emit);
-                    if item.settled() {
-                        print_all(&outcome(&item.present()), emit);
-                    }
-                }
-            }
+            Change::Snapshot => self.show_range(view, emit),
             Change::Updated { index, part } => self.updated(&view.items[*index], *part, view, emit),
             Change::Synced => {
                 self.synced = true;
-                if let Some(recap) = &view.recap {
+                self.recap_pending = view.history.is_some();
+                if view.history.is_none()
+                    && let Some(recap) = &view.recap
+                {
                     emit(format_args!("[{}]\n", recap_line(recap)));
                 }
                 for call in view.state.inbox() {
@@ -617,6 +670,88 @@ impl Screen {
             Change::Mismatch { supported } => eprintln!("[{}]", mismatch_line(*supported)),
             Change::Error { message } => eprintln!("[error: {}]", client::sanitize(message)),
             Change::Delta { .. } | Change::Activity | Change::Draining => {}
+        }
+    }
+
+    fn show_range(&mut self, view: &SessionView, emit: &mut dyn FnMut(fmt::Arguments<'_>)) {
+        let mut questions = Vec::new();
+        for item in &view.items {
+            if matches!(item.present().kind, Kind::Reply | Kind::Assistant) {
+                for event in self.stream.through(view, item.key()) {
+                    match event {
+                        client::ReplyEvent::Start => emit(format_args!("a    ")),
+                        client::ReplyEvent::Text(text) => emit(format_args!("{text}")),
+                        client::ReplyEvent::End => emit(format_args!("\n")),
+                    }
+                }
+                continue;
+            }
+            if let Item::User { text, .. } = item
+                && let Some(fragment) = view
+                    .history
+                    .as_ref()
+                    .and_then(|position| position.fragment.as_ref())
+                    .filter(|f| f.key == item.key())
+            {
+                let printed = self
+                    .user_fragment
+                    .filter(|(key, _)| *key == item.key())
+                    .map_or(0, |(_, bytes)| bytes);
+                if fragment.start <= printed && printed < fragment.end {
+                    if printed == 0 {
+                        emit(format_args!("you  "));
+                    }
+                    emit(format_args!(
+                        "{}",
+                        client::sanitize(&text[printed - fragment.start..])
+                    ));
+                    if fragment.end == fragment.total {
+                        emit(format_args!("\n"));
+                    }
+                    self.user_fragment = Some((item.key(), fragment.end));
+                }
+                self.shown = self.shown.max(item.key().get());
+                continue;
+            }
+            if item.key().get() > self.shown {
+                print_all(&added(item), emit);
+                self.shown = item.key().get();
+                if matches!(item, Item::Tool { .. }) {
+                    self.open_tools.insert(item.key());
+                }
+            }
+            let p = view.present(item);
+            if self.synced && p.buttons != protocol::view::Buttons::None {
+                use std::hash::{Hash, Hasher};
+                let description = p.description.map(|description| {
+                    let mut hash = std::hash::DefaultHasher::new();
+                    description.hash(&mut hash);
+                    hash.finish()
+                });
+                let identity = (p.question_seq, description);
+                if self.questions.insert(item.key(), identity) != Some(identity) {
+                    questions.push(item.key());
+                }
+            } else {
+                self.questions.remove(&item.key());
+            }
+            if item.settled() && self.open_tools.remove(&item.key()) {
+                print_all(&outcome(&view.present(item)), emit);
+            }
+        }
+        if self.recap_pending
+            && self.history_demand(view, &Change::Snapshot)
+                == Some(client::HistoryDemand::default())
+        {
+            if let Some(recap) = &view.recap {
+                emit(format_args!("[{}]\n", recap_line(recap)));
+            }
+            self.recap_pending = false;
+        }
+        for key in questions {
+            if let Some(item) = view.items.iter().find(|item| item.key() == key) {
+                emit(format_args!("{}\n", ask(&view.present(item))));
+            }
         }
     }
 

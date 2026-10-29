@@ -41,9 +41,11 @@ func aLiveSessionChatsRunsAnApprovedToolAndIsListed() async throws {
     }
 
     await store.send("$ echo hello")
-    try await eventually("the ask") { store.turn.asking != nil }
+    try await eventually("the ask and its requested tool row") {
+        guard let call = store.turn.asking else { return false }
+        return store.items.contains { $0.kind == .tool && $0.key == call && $0.presentation.approval.contains(.controls(call: call)) }
+    }
     let call = store.turn.asking!
-    #expect(store.items.contains { $0.kind == .tool && $0.key == call && $0.presentation.approval.contains(.controls(call: call)) })
     await store.approve(call: call, approved: true)
     try await eventually("the outcome") {
         store.items.contains {
@@ -63,7 +65,7 @@ func aLiveSessionChatsRunsAnApprovedToolAndIsListed() async throws {
     let other = SessionStore(session: Session(client: client))
     other.open(.id(id: id))
     try await eventually("the replay and recap") {
-        other.link == .live && other.seq == store.seq && other.recap != nil
+        other.link == .live && other.seq == store.seq && other.recap != nil && other.history?.pending == false
     }
     #expect(other.items == store.items)
     #expect(other.recap?.line.hasPrefix("recap · you: $ echo hello · ran bash") == true)
@@ -234,5 +236,60 @@ func aRejectedSubmissionThrowsWithoutConsumingTheDraft() async throws {
     #expect(store.problem != nil)
     #expect(!store.turn.running)
     #expect(try await store.submit("/help") == .help)
+    await store.detach()
+}
+
+@Test(.enabled(if: live != nil))
+func demanded_history_replaces_the_native_window_without_losing_the_session() async throws {
+    let client = try Client(helper: live!)
+    let workspace = FileManager.default.temporaryDirectory.appending(path: "akit-history-\(UUID())")
+    try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: workspace) }
+    let store = SessionStore(session: Session(client: client))
+    store.open(.new(workspace: workspace.path))
+    try await eventually("the first range") { store.link == .live && store.history?.pending == false }
+    for turn in 0..<4 {
+        let marker = "end of turn \(turn)"
+        await store.send(String(repeating: "history line\n", count: 12_000) + marker)
+        try await eventually("the committed tail") {
+            !store.turn.running && store.history?.pending == false && store.items.contains {
+                $0.kind == .assistant && $0.presentation.body?.text.hasSuffix(marker) == true
+            }
+        }
+    }
+    let session = store.sessionId
+    let tail = try #require(store.history)
+    let cut = tail.cut
+    var windows = 0
+    while let history = store.history, history.start > 0 || history.textStart > 0 {
+        let revision = store.rev
+        store.loadEarlier()
+        try await eventually("the preceding demanded range") { store.rev > revision && store.history?.pending == false }
+        #expect(store.sessionId == session && store.history?.cut == cut)
+        #expect(store.items.reduce(0) { $0 + ($1.presentation.body?.text.utf8.count ?? 0) } < 70_000)
+        windows += 1
+    }
+    #expect(windows > 4)
+    while let history = store.history, history.end < history.total || history.textEnd < history.textTotal {
+        let revision = store.rev
+        store.loadLater()
+        try await eventually("the succeeding demanded range") { store.rev > revision && store.history?.pending == false }
+        #expect(store.sessionId == session && store.history?.cut == cut)
+    }
+    store.loadLater()
+    try await eventually("following the latest range") {
+        store.followsHistory && store.history?.pending == false && store.history?.start == tail.start && store.history?.textStart == tail.textStart
+    }
+    let revision = store.rev
+    store.loadEarlier()
+    try await eventually("leaving the live range") { store.rev > revision && store.history?.pending == false }
+    #expect(!store.followsHistory)
+    store.followLatest()
+    try await eventually("returning directly to the latest reply") {
+        store.followsHistory && store.history?.pending == false && store.history?.start == tail.start && store.history?.textStart == tail.textStart && store.items.contains {
+            $0.kind == .assistant && $0.presentation.body?.text.hasSuffix("end of turn 3") == true
+        }
+    }
+    #expect(store.history?.cut == cut)
     await store.detach()
 }

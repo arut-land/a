@@ -2095,3 +2095,139 @@ fn every_url_in_a_question_requires_an_explicit_open_action() {
         Some(Effect::Cmd(Cmd::Answer { .. }))
     ));
 }
+
+#[test]
+fn recall_crosses_requested_ranges_and_restores_a_draft_with_pastes() {
+    use protocol::view::Index;
+
+    fn answer(app: &mut App, io: Vec<Io>, index: &Index, entries: &[Entry]) {
+        for io in io {
+            if let Io::Send(ClientMsg::History { id, range }) = io {
+                let page = index
+                    .page(&range, |seq| {
+                        Ok(entries[usize::try_from(seq.get()).unwrap() - 1].clone())
+                    })
+                    .unwrap();
+                let io = app.fold(&DaemonMsg::HistoryPart {
+                    id,
+                    offset: 0,
+                    text: serde_json::to_string(&page).unwrap(),
+                    done: true,
+                });
+                answer(app, io, index, entries);
+            }
+        }
+    }
+
+    let (mut app, session) = app(Viewport::Full, &[]);
+    let entries: Vec<_> = (1..=40)
+        .map(|seq| {
+            Entry::new(
+                Seq::new(seq).unwrap(),
+                Epoch(0),
+                Body::Input {
+                    segments: format!("{} input {seq}", "x".repeat(5000)).into(),
+                    taken: true,
+                    mode: protocol::Mode::Queue,
+                    origin: None,
+                    force: false,
+                },
+            )
+        })
+        .collect();
+    let mut index = Index::new(session, ws());
+    for entry in &entries {
+        index.apply(entry);
+    }
+
+    let io = app.fold(&DaemonMsg::Head {
+        head: Box::new(index.head(Epoch(1))),
+    });
+    answer(&mut app, io, &index, &entries);
+    app.fold(&DaemonMsg::Synced { seq: 40 });
+    let visible_start = app.client.view().items[0].key();
+    assert!(visible_start.get() > 1);
+    app.input(Input::Paste("pasted\ntext\nwith\nmany\nlines".into()));
+    let draft = app.editor.text().to_owned();
+    for key in std::iter::repeat_n(Key::Up, 40).chain(std::iter::repeat_n(Key::Down, 40)) {
+        let Some(Effect::Recall(demand)) = app.input(Input::Key(key)) else {
+            panic!("recall requests its own range")
+        };
+        let effects = app.client.read_history(1, demand);
+        let mut sent = Vec::new();
+        client::pump(
+            |io| {
+                sent.push(io);
+                Ok(())
+            },
+            &mut app,
+            effects,
+        );
+        answer(&mut app, sent, &index, &entries);
+        assert_eq!(app.client.view().items[0].key(), visible_start);
+    }
+    assert_eq!(app.editor.text(), draft);
+    let Some(Effect::Cmd(Cmd::Input(segments))) = app.input(Input::Key(Key::Enter)) else {
+        panic!("restored draft submits")
+    };
+    assert!(segments.0.iter().any(|segment| matches!(segment, protocol::Segment::Paste(text) if text == "pasted\ntext\nwith\nmany\nlines")));
+}
+
+#[test]
+fn inline_history_prints_every_large_item_continuation_once_across_resize() {
+    let (mut app, session) = app(Viewport::Inline, &[]);
+    let text = "residency-marker\n".repeat(12_000);
+    let entry = Entry::new(
+        Seq::new(1).unwrap(),
+        Epoch(0),
+        Body::Assistant { text: text.clone() },
+    );
+    let mut index = protocol::view::Index::new(session, ws());
+    index.apply(&entry);
+    let mut requests = std::collections::VecDeque::from(app.fold(&DaemonMsg::Head {
+        head: Box::new(index.head(Epoch(1))),
+    }));
+    let mut shown = String::new();
+    let mut pages = 0;
+    while let Some(io) = requests.pop_front() {
+        let Io::Send(ClientMsg::History { id, range }) = io else {
+            continue;
+        };
+        let page = index.page(&range, |_| Ok(entry.clone())).unwrap();
+        requests.extend(app.fold(&DaemonMsg::HistoryPart {
+            id,
+            offset: 0,
+            text: serde_json::to_string(&page).unwrap(),
+            done: true,
+        }));
+        pages += 1;
+        for line in app.scrollback(if pages % 2 == 0 { 80 } else { 100 }) {
+            for span in &line.spans {
+                shown.push_str(&span.text);
+            }
+            shown.push('\n');
+        }
+        assert_eq!(
+            app.scrollback(80),
+            [],
+            "a draw must not print the same source twice"
+        );
+        if let Some(demand) = app.unprinted_history() {
+            let effects = app.client.demand(demand);
+            client::pump(
+                |io| {
+                    requests.push_back(io);
+                    Ok(())
+                },
+                &mut app,
+                effects,
+            );
+        }
+    }
+    assert!(pages > 2);
+    assert_eq!(
+        shown.matches("residency-marker").count(),
+        text.matches("residency-marker").count()
+    );
+    assert!(app.unprinted_history().is_none());
+}

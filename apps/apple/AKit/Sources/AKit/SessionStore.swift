@@ -28,6 +28,8 @@ private nonisolated func buildRecovery(_ recovery: Recovery) async -> Resync? {
     }
 }
 
+public enum HistoryDirection { case older, newer }
+
 public enum CacheState: Equatable {
     case active, cached, detached
 }
@@ -42,6 +44,11 @@ public enum AttachmentState: Equatable {
 @Observable
 public final class SessionStore {
     public private(set) var items: [DisplayItem] = []
+    public private(set) var history: HistoryWindow?
+    public private(set) var followsHistory = true
+    public private(set) var historyDirection = HistoryDirection.older
+    @ObservationIgnored private var requestingHistory = false
+
     /// Live text of the reply in flight.
     public private(set) var streaming: StreamingText?
     public private(set) var recap: RecapInfo?
@@ -124,7 +131,9 @@ public final class SessionStore {
     }
 
     public func send(_ text: String) async {
-        run { try $0.send(text: text) }
+        guard let session else { return }
+        do { try session.send(text: text); followLatest() }
+        catch { problem = error.localizedDescription }
     }
 
     /// A line typed, parsed by the commands every client shares; what it
@@ -132,7 +141,9 @@ public final class SessionStore {
     public func submit(_ line: String) async throws -> AppAction? {
         guard let session else { throw ClientError.notOpen }
         do {
-            return try session.submit(line: line)
+            let action = try session.submit(line: line)
+            if action == nil { followLatest() }
+            return action
         } catch {
             problem = error.localizedDescription
             throw error
@@ -159,6 +170,38 @@ public final class SessionStore {
         run { try $0.interrupt() }
     }
 
+    public func followLatest() {
+        guard let session else { return }
+        followsHistory = true
+        requestingHistory = true
+        do { try session.followHistory() }
+        catch { requestingHistory = false; problem = error.localizedDescription }
+    }
+
+    public func loadEarlier() {
+        guard !requestingHistory, history?.pending != true, let history, (history.start > 0 || history.textStart > 0), let session else { return }
+        requestingHistory = true
+        followsHistory = false
+        historyDirection = .older
+        do { try session.historyBefore(anchor: history.start) }
+        catch { requestingHistory = false; problem = error.localizedDescription }
+    }
+
+    public func loadLater() {
+        guard !requestingHistory, history?.pending != true, let history, let session else { return }
+        requestingHistory = true
+        historyDirection = .newer
+        do {
+            if (history.end < history.total || history.textEnd < history.textTotal) {
+                followsHistory = false
+                try session.historyAfter(anchor: history.end)
+            } else {
+                followsHistory = true
+                try session.followHistory()
+            }
+        } catch { requestingHistory = false; problem = error.localizedDescription }
+    }
+
     public func detach() async {
         let session = self.session
         releaseAttachment()
@@ -175,6 +218,9 @@ public final class SessionStore {
         recovery?.cancel()
         recovery = nil
         retainedBytes = 0
+        history = nil
+        requestingHistory = false
+        followsHistory = true
         listening?.cancel()
         listening = nil
         session = nil
@@ -242,6 +288,8 @@ public final class SessionStore {
 
     private func adopt(_ s: SessionSnapshot) {
         retainedBytes = s.retainedBytes
+        history = s.history
+        requestingHistory = s.history?.pending == true
         (rev, seq, sessionId, workspace, title) = (s.rev, s.seq, s.session, s.workspace, s.title)
         (items, link, recap, streaming, turn) = (s.items, s.link, s.recap, s.streaming, s.turn)
         if let id = s.session { attachment = .attached(id: id) }
@@ -269,6 +317,8 @@ public final class SessionStore {
             }
         }
         retainedBytes = update.retainedBytes
+        history = update.history
+        requestingHistory = update.history?.pending == true
         (rev, seq, turn, title) = (update.revision, update.seq, update.turn, update.title)
         if streaming?.call != update.streaming?.call || streaming?.attempt != update.streaming?.attempt {
             streaming = update.streaming.map { StreamingText(call: $0.call, attempt: $0.attempt, text: "") }

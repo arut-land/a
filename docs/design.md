@@ -577,9 +577,13 @@ little-endian u32 length, a `FrameKind` byte, then the body, JSON or a
 `Chunk`: a blob's id, a little-endian u64 offset and the bytes, never
 base64. A reader refuses a kind it does not know, and one that wants a
 message refuses a chunk. `protocol::PROTO` defines the current version. Typed ids and message classes distinguish durable entries,
-ephemeral traffic and control. Hello negotiates a supported version; attach
-replays from a seq or supplies a view snapshot, ends replay with `Synced`,
-then follows live entries. `Query { id, service, scope, body }` is
+ephemeral traffic and control. Hello negotiates a supported version. Attach
+supplies a public control `Head`, ends control replay with `Synced`, then follows
+changed heads and live deltas. Committed transcript data arrives only through
+`History` requests at stable session/generation/log cuts, as chunked immutable
+pages. A log-derived fact/ordinal index replaces the full-view far-attach cache;
+clients retain their requested ranges rather than the whole transcript. Internal
+spawn authority and context images never enter the public head or pages. `Query { id, service, scope, body }` is
 answered by `Update`s, if it streams, then exactly one `Reply { id,
 outcome }`, on any connection, attached or not; `Cancel { id }` makes the
 reply interrupted. `Fetch { id, session, blob, offset, len }` shares the
@@ -678,7 +682,7 @@ its Confirm question from its permission
 decision; an extension parks with `WaitOn::Question` and a private checkpoint.
 The log contains the question as asked, the checkpoint required to continue,
 and the answer, decline or cancel. Draft edits and browser opening remain
-client state. Client snapshots omit continuation checkpoints.
+client state. Public control heads omit continuation checkpoints.
 
 `ext::QuestionTool` separates starting an external operation from continuing
 it. Returning Ask releases its execution future. A later answer is validated

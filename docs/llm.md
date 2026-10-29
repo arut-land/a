@@ -55,8 +55,13 @@ must materialize it first.
 decoder state, without retaining the canonical request or sending HTTP.
 The engine prepares on an `rt` CPU worker and dispatches only after logging
 Step decisions. Image fitting reconstructs and edits only the outgoing
-request; the stored history keeps every image. Client transcript paging is
-separate work and is not provided by this representation.
+request; the stored history keeps every image.
+
+Settled encoded runs share immutable byte chunks, so a large reply does not
+require a large contiguous cached allocation. Logical runs retain their JSON
+item boundaries when their chunks are written. Client transcript paging uses
+the separate [log-derived public history index](client.md#demanded-history);
+it does not materialize or evict this active model encoding.
 
 ## Adding a host or a protocol
 

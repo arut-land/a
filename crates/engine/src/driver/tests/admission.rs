@@ -152,10 +152,10 @@ fn no_delta_is_lost_when_a_stream_outruns_its_calls_flush() {
     let mut streamed = String::new();
     while let Some(frame) = outbox.try_next() {
         match protocol::read_frame::<DaemonMsg>(&mut frame.as_bytes()) {
-            Ok(Some(DaemonMsg::Entry(e))) => shown.push(e.seq),
+            Ok(Some(DaemonMsg::Head { head })) => shown.push(head.cut.seq),
             Ok(Some(DaemonMsg::Delta { call, text, .. })) => {
                 assert!(
-                    shown.contains(&call.0),
+                    shown.iter().any(|seq| *seq >= call.get()),
                     "a delta of call {call:?} preceded it"
                 );
                 streamed.push_str(&text);
@@ -1039,9 +1039,7 @@ fn messages(outbox: &Outbox) -> impl Iterator<Item = DaemonMsg> + '_ {
 #[test]
 fn activity_waits_for_the_current_ledgers_flush_on_live_snapshot_and_since_replay() {
     let (fixture, faulty, _) = pipeline(Registry::default().with(&Harbor).unwrap());
-    let history: Vec<_> = (1..=SNAPSHOT_GAP + 1)
-        .map(|seq| entry(seq, echo("earlier")))
-        .collect();
+    let history: Vec<_> = (1..=129).map(|seq| entry(seq, echo("earlier"))).collect();
     let session = fixture.start(&history);
     let before = session.frames.seq();
     let live = Outbox::new();
@@ -1115,7 +1113,7 @@ fn activity_waits_for_the_current_ledgers_flush_on_live_snapshot_and_since_repla
         let mut certifications = 0;
         for msg in messages(&outbox) {
             match msg {
-                DaemonMsg::Snapshot(_) => snapshot = true,
+                DaemonMsg::Head { .. } => snapshot = true,
                 DaemonMsg::Activity {
                     seq,
                     activity: current,
@@ -1127,7 +1125,10 @@ fn activity_waits_for_the_current_ledgers_flush_on_live_snapshot_and_since_repla
                 _ => {}
             }
         }
-        assert_eq!(snapshot, since == 0);
+        assert!(
+            snapshot,
+            "every attach receives its public cut, since {since}"
+        );
         assert_eq!(activity, Some((ordered, Activity::Idle)));
         assert_eq!(
             certifications, 1,

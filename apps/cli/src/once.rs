@@ -96,6 +96,7 @@ pub fn run(
         synced: false,
         turn: None,
         stream: client::ReplyStream::default(),
+        submitted_after: None,
         failed: false,
         ended: None,
     };
@@ -149,6 +150,7 @@ struct Once {
     synced: bool,
     turn: Option<client::SubmissionId>,
     stream: client::ReplyStream,
+    submitted_after: Option<u64>,
     failed: bool,
     ended: Option<io::Result<ExitCode>>,
 }
@@ -167,6 +169,7 @@ impl Once {
             self.end(Ended::Usage);
             return Vec::new();
         }
+        self.submitted_after = Some(self.client.view().seq);
         let mut effects = Vec::new();
         if let Some(mode) = &self.mode {
             effects = self
@@ -236,7 +239,32 @@ impl Once {
             }
         }
         match change {
-            Change::Synced => self.synced = true,
+            Change::Snapshot => {
+                for index in 0..self.client.view().items.len() {
+                    let item = &self.client.view().items[index];
+                    if self
+                        .submitted_after
+                        .is_some_and(|seq| item.key().get() > seq)
+                    {
+                        let p = item.present();
+                        if p.kind == Kind::Command && p.glyph == Glyph::Bad {
+                            let why = p.body.text();
+                            let error =
+                                format!("{}: {}", p.title, why.lines().next().unwrap_or(&p.status));
+                            self.fail(io::Error::other(error));
+                        }
+                        if self.taken() {
+                            self.settled(index);
+                        }
+                    }
+                }
+            }
+            Change::Synced => {
+                self.synced = true;
+                if self.turn.is_none() {
+                    self.stream.skip_through(self.client.view());
+                }
+            }
             Change::Error { message } => {
                 // Nothing to attach to (no such session), or the input
                 // refused.
@@ -292,6 +320,9 @@ impl Once {
         let Some(id) = self.turn else {
             return;
         };
+        if self.client.history_pending() {
+            return;
+        }
         let Some(client::SubmissionState::Finished(activity)) = self.client.submission(id) else {
             return;
         };
@@ -358,6 +389,12 @@ impl Renderer for Once {
             match show {
                 Show::View(update) => {
                     self.view(&update.change);
+                    if let Some(demand) = self
+                        .stream
+                        .history_demand(self.client.view(), &update.change)
+                    {
+                        effects.extend(self.client.demand(demand));
+                    }
                     if matches!(update.change, Change::Synced) {
                         effects.extend(self.send());
                     }
@@ -365,7 +402,7 @@ impl Renderer for Once {
                 }
                 Show::Notice(notice) => errln!("[{notice}]"),
                 Show::Link => self.link(),
-                Show::Sessions => {}
+                Show::Sessions | Show::History { .. } => {}
             }
         }
         effects
@@ -456,6 +493,7 @@ mod tests {
             synced: true,
             turn: None,
             stream: client::ReplyStream::default(),
+            submitted_after: None,
             failed: false,
             ended: None,
         };
@@ -537,6 +575,7 @@ mod tests {
             synced: true,
             turn: None,
             stream: client::ReplyStream::default(),
+            submitted_after: None,
             failed: false,
             ended: None,
         };

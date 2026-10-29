@@ -5,6 +5,41 @@ through `crates/ffi`) is a renderer over this crate. It holds everything a
 client of the daemon decides, once, so that no app derives it again; an
 app holds screen state and draws.
 
+## Demanded history
+
+`SessionClient` keeps control state, authored pending inputs, live reply tails and
+its current requested transcript range. Attach receives a public `Head`: a
+session/generation/log cut, item count, changed ordinals and controls. It does
+not receive settled history or internal spawn/context authority images.
+
+`demand(HistoryDemand)` replaces the presentation window. `HistoryAnchor`
+selects the tail, an ordinal before/after, or a byte continuation within a large
+text item. `HistoryDemand::older/newer` advances from the current position.
+`SessionView::history` identifies the installed range and source byte offsets;
+`items` contains that range alone. The default delivery allowance is 64 KiB,
+independent of session length. Presentation and search text continues losslessly across requests;
+an indivisible nontext item may exceed the allowance. Search starts a text
+range at its match. Recall returns a complete editable input, independently
+of the presentation allowance.
+
+`read_history(reader, demand)` delivers `Show::History` independently of the
+presentation window, for recall, search or export. Its `HistoryPage` carries
+the fixed cut, exact item indices, total count and text continuation offsets.
+`older()` and `newer()` preserve the scan filter and delivery allowance; pass
+them to `read_history_at` at the page’s original cut. Normal new turns leave
+that cut stable.
+A new generation cancels old requests and emits `Notice::HistoryChanged`.
+Closing a reader cancels outstanding delivery. There is no history-length cap.
+Immutable item storage is shared by matching requested ranges within a process;
+the cache holds weak references, so the last consumer releases the payloads.
+`release_history()` also withdraws the presentation demand: subsequent heads do
+not read a range already transferred to a renderer such as a browser DOM.
+
+The daemon derives ordinal/fact positions from the log and reconstructs only
+requested items at the requested cut. Public heads replace the former full-view
+far-attach cache. `Synced` certifies controls; a renderer can wait separately for
+`history_pending()` when it needs the requested range before acting.
+
 ## Layers
 
 ```
@@ -92,8 +127,8 @@ transport (lib.rs, link.rs,        Daemon { link: Arc<dyn Link>, staged }: conne
   `TurnView` (running, asking, can interrupt, can send) combines that view
   with pending submitted mutations: input awaiting publication or an ack
   can be interrupted even while the local view is idle. Intents become
-  numbered `ClientMsg`s, kept until the daemon's ack or until the log
-  shows an entry this client authored with that number or a later one
+  numbered `ClientMsg`s, kept until the daemon's ack or until the public head
+  acknowledges this client's authored number or a later one
   (the ack is queued at commit, behind what the session already
   published, so it can trail the turn it started); a message sent while
   reconnecting goes out once the connection is up again. `offer()` refuses

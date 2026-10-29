@@ -310,7 +310,17 @@ fn wait_for_session_entry(
             .set_read_timeout(Some(until - Instant::now()))
             .unwrap();
         match protocol::read_frame::<DaemonMsg>(&mut stream).unwrap() {
-            Some(DaemonMsg::Entry(entry)) if ready(&entry.body) => return,
+            Some(DaemonMsg::Head { head }) => {
+                if env.logs().get(session).is_some_and(|bytes| {
+                    String::from_utf8_lossy(bytes)
+                        .lines()
+                        .skip(1)
+                        .filter_map(|line| serde_json::from_str::<protocol::Entry>(line).ok())
+                        .any(|entry| entry.seq.get() <= head.cut.seq && ready(&entry.body))
+                }) {
+                    return;
+                }
+            }
             Some(_) => {}
             None => panic!("session {session} stopped before the expected entry"),
         }

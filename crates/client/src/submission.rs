@@ -24,7 +24,13 @@ impl Submission {
     }
 
     pub fn fold(&mut self, view: &SessionView) {
-        if self.state == SubmissionState::Queued && view.state.taken.contains(&self.id) {
+        if self.state == SubmissionState::Queued
+            && view
+                .state
+                .taken
+                .iter()
+                .any(|author| author.client == self.id.client && author.seq >= self.id.seq)
+        {
             self.state = SubmissionState::Taken;
         }
         if self.state == SubmissionState::Taken

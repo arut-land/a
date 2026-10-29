@@ -161,6 +161,22 @@ impl Editor {
         self.cursor = range.start + text.len();
     }
 
+    pub fn recall_edge(&self, key: Key) -> bool {
+        match key {
+            Key::Up | Key::Ctrl('p') => self.line_start() == 0,
+            Key::Down | Key::Ctrl('n') => self.line_end() == self.text.len(),
+            _ => false,
+        }
+    }
+
+    pub fn recalled(&mut self, text: &str) {
+        self.recall(-1, &|| std::iter::once(text));
+    }
+
+    pub fn restore_draft(&mut self) {
+        self.recall(1, &std::iter::empty::<&str>);
+    }
+
     #[cfg(test)]
     pub fn key(&mut self, key: Key) -> Edit {
         self.key_with_history(key, std::iter::empty::<&str>)

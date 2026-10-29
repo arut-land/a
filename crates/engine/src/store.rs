@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 pub use faulty::{Faulty, SyncFailure};
 pub use jsonl::Jsonl;
 #[cfg(test)]
-pub(crate) use jsonl::{FORMAT, seal, unseal};
+pub(crate) use jsonl::{FORMAT, seal};
 pub use lease::Local;
 #[cfg(test)]
 pub use memory::Memory;
@@ -186,7 +186,6 @@ impl Writer {
         }
     }
 
-    #[cfg(test)]
     pub const fn epoch(&self) -> u32 {
         self.epoch
     }

@@ -6,6 +6,7 @@ mod context;
 mod driver;
 mod fetch;
 mod handover;
+mod history;
 mod model;
 mod outbox;
 mod query;
@@ -1351,7 +1352,7 @@ struct Exit {
 }
 
 /// How this binary starts the daemon of the build at a path, should a
-/// drain hand over to it ([`handover`]).
+/// drain hand over to it.
 pub type Successor = fn(&std::path::Path) -> std::process::Command;
 
 impl Exit {

@@ -1,8 +1,9 @@
-//! Concurrent file-backed load and snapshot measurements; run instructions
+//! Concurrent file-backed load and control-attach measurements; run instructions
 //! and results are in docs/perf/runtime-demand.md. No network provider is contacted.
 
 use super::*;
 use crate::outbox::Outbox;
+use protocol::Decode;
 use std::sync::Arc;
 
 #[test]
@@ -54,7 +55,7 @@ fn concurrent_session_sizing() {
                 let mut held = Vec::new();
                 if lane == "cpu" {
                     // Resolve without attaching a client: the actor is loaded,
-                    // but its attach snapshot and shared view are still cold.
+                    // but its control projection and seek index are still cold.
                     for header in &headers {
                         held.push(
                             daemon
@@ -76,14 +77,15 @@ fn concurrent_session_sizing() {
                         if cpu {
                             let outbox = Outbox::new();
                             attachment.session().attach(outbox.clone(), 0).await;
-                            let mut bytes = 0;
+                            let mut controls = None;
                             while let Some(frame) = outbox.try_next() {
-                                bytes += frame.as_bytes().len();
+                                if let protocol::DaemonMsg::Head { head: received } =
+                                    protocol::DaemonMsg::from_json(frame.body()).unwrap()
+                                {
+                                    controls = Some(received);
+                                }
                             }
-                            assert!(
-                                bytes > 1_000_000,
-                                "snapshot must include the actual projection"
-                            );
+                            assert_eq!(controls.expect("attach supplies controls").count, 1200);
                         }
                         attachment
                     }));
@@ -647,6 +649,7 @@ struct Client {
     reader: std::io::BufReader<sys::OwnedConnection>,
     received: Instant,
     decoded: Instant,
+    view: protocol::view::SessionView,
 }
 
 impl Client {
@@ -661,6 +664,7 @@ impl Client {
             reader,
             received: Instant::now(),
             decoded: Instant::now(),
+            view: protocol::view::SessionView::default(),
         };
         client.send(&protocol::ClientMsg::Hello {
             proto: protocol::PROTO,
@@ -681,8 +685,7 @@ impl Client {
         client
     }
 
-    /// Session `n`'s turns, each over once the session is idle after both
-    /// of its model calls' results.
+    /// Session `n`'s turns, each over once controls certify idle after its input.
     fn run(&mut self, n: usize, load: &Load) -> Seen {
         // Spread the sessions' first requests over one pace.
         std::thread::sleep(
@@ -696,13 +699,14 @@ impl Client {
         };
         for turn in 0..load.turns {
             let asked = Instant::now();
+            let before = (self.view.seq, self.view.state.turn_start());
             self.send(&protocol::ClientMsg::Input {
                 segments: format!("bench {n} turn {turn}").into(),
                 mode: protocol::Mode::Queue,
                 force: false,
                 client_seq: Some(turn as u64 + 1),
             });
-            let (mut results, mut failed) = (0, false);
+            let mut failed = 0;
             loop {
                 match self.recv() {
                     protocol::DaemonMsg::Delta { text, .. } => {
@@ -715,18 +719,16 @@ impl Client {
                         }));
                         seen.deltas.push(Delta { turn, text, at });
                     }
-                    protocol::DaemonMsg::Entry(entry) => match entry.body {
-                        Body::ModelResult { outcome, .. } => {
-                            results += 1;
-                            failed |= matches!(outcome, Outcome::Failed { .. });
-                        }
-                        Body::ToolResult { outcome, .. } => {
-                            seen.failed += usize::from(!matches!(outcome, Outcome::Done { .. }));
-                        }
-                        _ => {}
-                    },
+                    protocol::DaemonMsg::Head { head } => {
+                        failed = head.recap.as_ref().map_or(0, |recap| recap.failed);
+                    }
                     protocol::DaemonMsg::Activity { activity, .. } => match activity {
-                        Activity::Idle if results == 2 || failed => break,
+                        Activity::Idle
+                            if self.view.seq > before.0
+                                && self.view.state.turn_start() > before.1 =>
+                        {
+                            break;
+                        }
                         Activity::Idle | Activity::Running => {}
                         other => panic!("session {n} turn {turn}: {other:?}"),
                     },
@@ -734,7 +736,7 @@ impl Client {
                 }
             }
             seen.turns.push(asked.elapsed());
-            seen.failed += usize::from(failed);
+            seen.failed += usize::try_from(failed).unwrap();
         }
         seen
     }
@@ -747,6 +749,7 @@ impl Client {
         let (message, received, decoded) = receive(&mut self.reader);
         self.received = received;
         self.decoded = decoded;
+        self.view.fold(&message);
         message
     }
 }

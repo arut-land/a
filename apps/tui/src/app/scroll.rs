@@ -42,6 +42,15 @@ impl App {
                 } else {
                     Layout::Reply
                 })
+                .resumed(
+                    self.client
+                        .view()
+                        .history
+                        .as_ref()
+                        .and_then(|h| h.fragment.as_ref())
+                        .filter(|f| f.key == item.key())
+                        .map_or_default(|f| f.markdown),
+                )
             });
             let card = (matches!(p.kind, Kind::Tool | Kind::Command)
                 && client::approval_parts(&p).is_empty()

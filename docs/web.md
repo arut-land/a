@@ -48,8 +48,13 @@ browser tab ──GET /s/<id>/events?tab=…──> Live: SessionClient + Page +
   page's patches go out after each batch (`Page::settle`).
 - **The page** (`page.rs`, `view.rs`, `patch.rs`): the chat page renders
   at once without its transcript; the transcript arrives over the stream,
-  whole once the attach is synced (and again after an upgrade), then each
-  change alone. Every item renders inside an element of its own (`#i{key}`)
+  in requested ranges after controls are synced. Each delivered range is
+  appended to the native DOM, and its SDK payloads are released. All delivered
+  history remains available to native find, selection, copy and accessibility;
+  offscreen content is not hidden. Changed ordinals replace their stable DOM
+  wrappers. Delivery batches admit one oversized committed item when needed
+  to render its canonical Markdown once; partial discovery ranges stay out
+  of the DOM. Active replies stream independently while history transfers. Every item renders inside an element of its own (`#i{key}`)
   so a change replaces just that item; new items go in before `#end`,
   which holds the Stop button while a turn runs, the daemon's latest
   complaint, and whether it went away. Streamed text is appended to the

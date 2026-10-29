@@ -161,6 +161,14 @@ impl Feed {
                 _ => {}
             }
         }
+        if changes
+            .iter()
+            .any(|change| matches!(change, ViewChange::Snapshot { .. }))
+        {
+            // Recovery reads the current window; retaining displaced windows duplicates history.
+            self.recent.clear();
+            self.bytes = 0;
+        }
         self.rev += 1;
         let mut update = self.update(changes);
         // View data can be recovered; notices still cross intact.
@@ -220,6 +228,7 @@ impl Feed {
     fn update(&self, changes: Vec<ViewChange>) -> ChangeBatch {
         let view = self.client.view();
         ChangeBatch {
+            history: crate::HistoryWindow::of(&self.client),
             revision: self.rev,
             retained_bytes: self.retained_bytes() as u64,
             seq: view.seq,
@@ -242,7 +251,7 @@ impl Feed {
             Show::Notice(notice) => vec![ViewChange::Error {
                 message: notice.to_string(),
             }],
-            Show::Sessions => return None,
+            Show::Sessions | Show::History { .. } => return None,
         };
         Some(self.batch(changes))
     }
@@ -357,6 +366,7 @@ impl Feed {
             retained_bytes: self.retained_bytes() as u64,
             link: self.client.link().into(),
             turn: self.client.turn().into(),
+            history: crate::HistoryWindow::of(&self.client),
         }
     }
 }
@@ -370,6 +380,7 @@ enum PreparedResync {
         retained_bytes: u64,
         link: LinkState,
         turn: TurnInfo,
+        history: Option<crate::HistoryWindow>,
     },
     Patch {
         from: u64,
@@ -390,6 +401,7 @@ impl PreparedResync {
                 retained_bytes,
                 link,
                 turn,
+                history,
             } => {
                 let mut items = Vec::with_capacity(view.items.len());
                 for item in &view.items {
@@ -409,6 +421,7 @@ impl PreparedResync {
                         retained_bytes,
                         link,
                         turn,
+                        history,
                         items,
                     ),
                 }

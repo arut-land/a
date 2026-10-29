@@ -173,15 +173,14 @@ fn pressure_reclamation_retains_attached_sessions_and_pending_approvals() {
     assert_eq!(pending.session().summary().activity, Activity::Approval);
     let pending_live = std::sync::Arc::clone(pending.session());
     for live in [attachment.session(), &pending_live] {
-        assert_eq!(live.projection_cache(true), [true; 3]);
+        assert!(live.projection_cache(true));
     }
     drop(pending);
     daemon.reclaim_idle();
     settle(&daemon);
     for live in [attachment.session(), &pending_live] {
-        assert_eq!(
+        assert!(
             live.projection_cache(false),
-            [true; 3],
             "protected projections are retained without rebuilding"
         );
     }
@@ -190,8 +189,8 @@ fn pressure_reclamation_retains_attached_sessions_and_pending_approvals() {
     drop(attachment);
     daemon.reclaim_idle();
     settle(&daemon);
-    assert_eq!(idle_live.projection_cache(false), [false; 3]);
-    assert_eq!(pending_live.projection_cache(false), [true; 3]);
+    assert!(!idle_live.projection_cache(false));
+    assert!(pending_live.projection_cache(false));
     assert_eq!(daemon.loaded().len(), 2);
     drop(pending_live);
     drop(idle_live);

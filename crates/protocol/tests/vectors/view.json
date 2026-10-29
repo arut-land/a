@@ -7415,11 +7415,11 @@
   {
     "frames": [
       "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
-      "{\"items\":[],\"seq\":2,\"session\":\"00000000-0000-0000-0000-00000000000a\",\"state\":{\"calls\":[],\"publications\":{\"1\":[{\"key\":\"loaded-publication\",\"namespace\":\"skills\"}],\"2\":[{\"key\":\"loaded-publication\",\"namespace\":\"mcp-schemas\"}]},\"queued\":[],\"taken\":[],\"turn\":0},\"t\":\"snapshot\",\"workspace\":\"/w\"}",
+      "{\"items\":[],\"seq\":2,\"session\":\"00000000-0000-0000-0000-00000000000a\",\"state\":{\"calls\":[],\"queued\":[],\"taken\":[],\"turn\":0},\"t\":\"snapshot\",\"workspace\":\"/w\"}",
       "{\"epoch\":0,\"kind\":\"context\",\"publication\":{\"key\":\"later-publication\",\"namespace\":\"mcp-schemas\"},\"seq\":3,\"t\":\"entry\",\"text\":\"later schema\"}",
       "{\"seq\":3,\"t\":\"synced\"}"
     ],
-    "hash": "d6d3d92a71976fdc",
+    "hash": "aa1afdfec8eebfe2",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -7432,20 +7432,6 @@
         "session": "00000000-0000-0000-0000-00000000000a",
         "state": {
           "calls": [],
-          "publications": {
-            "1": [
-              {
-                "key": "loaded-publication",
-                "namespace": "skills"
-              }
-            ],
-            "2": [
-              {
-                "key": "loaded-publication",
-                "namespace": "mcp-schemas"
-              }
-            ]
-          },
           "queued": [],
           "taken": [],
           "turn": 0
@@ -7476,26 +7462,6 @@
       "session": "00000000-0000-0000-0000-00000000000a",
       "state": {
         "calls": [],
-        "publications": {
-          "1": [
-            {
-              "key": "loaded-publication",
-              "namespace": "skills"
-            }
-          ],
-          "2": [
-            {
-              "key": "loaded-publication",
-              "namespace": "mcp-schemas"
-            }
-          ],
-          "3": [
-            {
-              "key": "later-publication",
-              "namespace": "mcp-schemas"
-            }
-          ]
-        },
         "queued": [],
         "taken": [],
         "turn": 0
@@ -7533,11 +7499,11 @@
     "frames": [
       "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
       "{\"epoch\":0,\"intent\":[\"Agent\",\"execution authority\",{\"publications\":{\"1\":[{\"key\":\"loaded-publication\",\"namespace\":\"skills\"}],\"2\":[{\"key\":\"loaded-publication\",\"namespace\":\"mcp-schemas\"}]},\"root\":null,\"runner\":\"Agent\"}],\"kind\":\"spawned\",\"seq\":1,\"t\":\"entry\"}",
-      "{\"items\":[],\"seq\":1,\"session\":\"00000000-0000-0000-0000-00000000000a\",\"state\":{\"calls\":[],\"publications\":{\"1\":[{\"key\":\"loaded-publication\",\"namespace\":\"skills\"},{\"key\":\"loaded-publication\",\"namespace\":\"mcp-schemas\"}]},\"queued\":[],\"taken\":[],\"turn\":0},\"t\":\"snapshot\",\"workspace\":\"/w\"}",
+      "{\"items\":[],\"seq\":1,\"session\":\"00000000-0000-0000-0000-00000000000a\",\"state\":{\"calls\":[],\"queued\":[],\"taken\":[],\"turn\":0},\"t\":\"snapshot\",\"workspace\":\"/w\"}",
       "{\"epoch\":0,\"kind\":\"context\",\"publication\":{\"key\":\"later-publication\",\"namespace\":\"mcp-schemas\"},\"seq\":2,\"t\":\"entry\",\"text\":\"later schema\"}",
       "{\"seq\":2,\"t\":\"synced\"}"
     ],
-    "hash": "232bf08eb94cbe72",
+    "hash": "5c34356c4803ce1f",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -7578,18 +7544,6 @@
         "session": "00000000-0000-0000-0000-00000000000a",
         "state": {
           "calls": [],
-          "publications": {
-            "1": [
-              {
-                "key": "loaded-publication",
-                "namespace": "skills"
-              },
-              {
-                "key": "loaded-publication",
-                "namespace": "mcp-schemas"
-              }
-            ]
-          },
           "queued": [],
           "taken": [],
           "turn": 0
@@ -7620,24 +7574,6 @@
       "session": "00000000-0000-0000-0000-00000000000a",
       "state": {
         "calls": [],
-        "publications": {
-          "1": [
-            {
-              "key": "loaded-publication",
-              "namespace": "skills"
-            },
-            {
-              "key": "loaded-publication",
-              "namespace": "mcp-schemas"
-            }
-          ],
-          "2": [
-            {
-              "key": "later-publication",
-              "namespace": "mcp-schemas"
-            }
-          ]
-        },
         "queued": [],
         "taken": [],
         "turn": 0
@@ -7907,7 +7843,7 @@
       "{\"epoch\":0,\"fact\":{\"annotation\":{\"card\":{\"body\":\"Only lists files.\",\"title\":\"\"},\"lifetime\":\"question\",\"target\":1}},\"kind\":\"fact\",\"seq\":6,\"t\":\"entry\"}",
       "{\"seq\":6,\"t\":\"synced\"}"
     ],
-    "hash": "c2e4c2e4e9ec79f8",
+    "hash": "5c5603a30e36171a",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -8042,14 +7978,7 @@
         },
         {
           "call": 1,
-          "decision": {
-            "d": "pre_tool",
-            "input": {
-              "command": "printf harmless\nrm -rf /tmp/approval-test-sentinel",
-              "extra": "every argument",
-              "timeout": 60000
-            }
-          },
+          "decision": "rewrote the input of bash",
           "hook": "rewrite",
           "seq": 2,
           "tool": "bash",
@@ -8151,14 +8080,7 @@
               "index": 1,
               "item": {
                 "call": 1,
-                "decision": {
-                  "d": "pre_tool",
-                  "input": {
-                    "command": "printf harmless\nrm -rf /tmp/approval-test-sentinel",
-                    "extra": "every argument",
-                    "timeout": 60000
-                  }
-                },
+                "decision": "rewrote the input of bash",
                 "hook": "rewrite",
                 "seq": 2,
                 "tool": "bash",
@@ -8251,7 +8173,7 @@
       "{\"epoch\":0,\"fact\":{\"annotation\":{\"card\":{\"body\":\"Only lists files.\",\"title\":\"\"},\"lifetime\":\"question\",\"target\":1}},\"kind\":\"fact\",\"seq\":6,\"t\":\"entry\"}",
       "{\"seq\":6,\"t\":\"synced\"}"
     ],
-    "hash": "63242e9be170a13e",
+    "hash": "ee2b10a9226b4297",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -8408,25 +8330,7 @@
         },
         {
           "call": 1,
-          "decision": {
-            "d": "pre_tool",
-            "input": {
-              "edits": [
-                {
-                  "new": "allow = true\nkeep = yes",
-                  "old": "allow = false\nkeep = yes"
-                },
-                {
-                  "new": "delete = yes",
-                  "old": "delete = no"
-                }
-              ],
-              "extra": {
-                "flag": true
-              },
-              "path": "/work/deep/config.ini"
-            }
-          },
+          "decision": "rewrote the input of edit",
           "hook": "rewrite",
           "seq": 2,
           "tool": "edit",
@@ -8528,25 +8432,7 @@
               "index": 1,
               "item": {
                 "call": 1,
-                "decision": {
-                  "d": "pre_tool",
-                  "input": {
-                    "edits": [
-                      {
-                        "new": "allow = true\nkeep = yes",
-                        "old": "allow = false\nkeep = yes"
-                      },
-                      {
-                        "new": "delete = yes",
-                        "old": "delete = no"
-                      }
-                    ],
-                    "extra": {
-                      "flag": true
-                    },
-                    "path": "/work/deep/config.ini"
-                  }
-                },
+                "decision": "rewrote the input of edit",
                 "hook": "rewrite",
                 "seq": 2,
                 "tool": "edit",
@@ -9777,7 +9663,7 @@
       "{\"epoch\":0,\"input\":2,\"kind\":\"take\",\"seq\":4,\"t\":\"entry\"}",
       "{\"seq\":4,\"t\":\"synced\"}"
     ],
-    "hash": "421afa831210cc9c",
+    "hash": "9ed8170bdc1f3589",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -9841,11 +9727,7 @@
         },
         {
           "call": 1,
-          "decision": {
-            "attempt": 1,
-            "d": "retry",
-            "error": "rate limited"
-          },
+          "decision": "retried call 1 (attempt 1): rate limited",
           "hook": "retry",
           "seq": 3,
           "type": "hook"
@@ -9896,11 +9778,7 @@
           "index": 1,
           "item": {
             "call": 1,
-            "decision": {
-              "attempt": 1,
-              "d": "retry",
-              "error": "rate limited"
-            },
+            "decision": "retried call 1 (attempt 1): rate limited",
             "hook": "retry",
             "seq": 3,
             "type": "hook"
@@ -11086,7 +10964,7 @@
       "{\"epoch\":0,\"kind\":\"assistant\",\"seq\":29,\"t\":\"entry\",\"text\":\"a38\"}",
       "{\"cwd\":\"/w1\",\"epoch\":0,\"kind\":\"environment\",\"seq\":30,\"t\":\"entry\",\"tty\":false,\"vars\":{}}"
     ],
-    "hash": "5d368bef1194cbad",
+    "hash": "8bf19c97576ef845",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -11518,10 +11396,7 @@
           "watch": 2
         },
         {
-          "decision": {
-            "d": "on_stop",
-            "text": "go on"
-          },
+          "decision": "continued with: go on",
           "hook": "policy",
           "seq": 5,
           "type": "hook"
@@ -11596,10 +11471,7 @@
           "watch": 17
         },
         {
-          "decision": {
-            "d": "on_stop",
-            "text": "go on"
-          },
+          "decision": "continued with: go on",
           "hook": "policy",
           "seq": 19,
           "type": "hook"
@@ -11765,10 +11637,7 @@
           "change": "added",
           "index": 1,
           "item": {
-            "decision": {
-              "d": "on_stop",
-              "text": "go on"
-            },
+            "decision": "continued with: go on",
             "hook": "policy",
             "seq": 5,
             "type": "hook"
@@ -12059,10 +11928,7 @@
           "change": "added",
           "index": 7,
           "item": {
-            "decision": {
-              "d": "on_stop",
-              "text": "go on"
-            },
+            "decision": "continued with: go on",
             "hook": "policy",
             "seq": 19,
             "type": "hook"
@@ -12595,7 +12461,7 @@
       "{\"epoch\":0,\"fact\":{\"annotation\":{\"card\":{\"body\":\"Only lists files.\",\"title\":\"\"},\"lifetime\":\"question\",\"target\":1}},\"kind\":\"fact\",\"seq\":6,\"t\":\"entry\"}",
       "{\"seq\":6,\"t\":\"synced\"}"
     ],
-    "hash": "4d059486e4273588",
+    "hash": "a666249a1cebeaea",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -12729,14 +12595,7 @@
         },
         {
           "call": 1,
-          "decision": {
-            "d": "pre_tool",
-            "input": {
-              "command": "printf harmless\nrm -rf /tmp/approval-test-sentinel",
-              "extra": "every argument",
-              "timeout": 60000
-            }
-          },
+          "decision": "rewrote the input of bash",
           "hook": "rewrite",
           "seq": 2,
           "tool": "bash",
@@ -12836,14 +12695,7 @@
               "index": 1,
               "item": {
                 "call": 1,
-                "decision": {
-                  "d": "pre_tool",
-                  "input": {
-                    "command": "printf harmless\nrm -rf /tmp/approval-test-sentinel",
-                    "extra": "every argument",
-                    "timeout": 60000
-                  }
-                },
+                "decision": "rewrote the input of bash",
                 "hook": "rewrite",
                 "seq": 2,
                 "tool": "bash",
@@ -12936,7 +12788,7 @@
       "{\"epoch\":0,\"fact\":{\"annotation\":{\"card\":{\"body\":\"Only lists files.\",\"title\":\"\"},\"lifetime\":\"question\",\"target\":1}},\"kind\":\"fact\",\"seq\":6,\"t\":\"entry\"}",
       "{\"seq\":6,\"t\":\"synced\"}"
     ],
-    "hash": "7c546636d96e214c",
+    "hash": "01eb6f44d3d52269",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -13092,25 +12944,7 @@
         },
         {
           "call": 1,
-          "decision": {
-            "d": "pre_tool",
-            "input": {
-              "edits": [
-                {
-                  "new": "allow = true\nkeep = yes",
-                  "old": "allow = false\nkeep = yes"
-                },
-                {
-                  "new": "delete = yes",
-                  "old": "delete = no"
-                }
-              ],
-              "extra": {
-                "flag": true
-              },
-              "path": "/work/deep/config.ini"
-            }
-          },
+          "decision": "rewrote the input of edit",
           "hook": "rewrite",
           "seq": 2,
           "tool": "edit",
@@ -13210,25 +13044,7 @@
               "index": 1,
               "item": {
                 "call": 1,
-                "decision": {
-                  "d": "pre_tool",
-                  "input": {
-                    "edits": [
-                      {
-                        "new": "allow = true\nkeep = yes",
-                        "old": "allow = false\nkeep = yes"
-                      },
-                      {
-                        "new": "delete = yes",
-                        "old": "delete = no"
-                      }
-                    ],
-                    "extra": {
-                      "flag": true
-                    },
-                    "path": "/work/deep/config.ini"
-                  }
-                },
+                "decision": "rewrote the input of edit",
                 "hook": "rewrite",
                 "seq": 2,
                 "tool": "edit",

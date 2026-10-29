@@ -299,6 +299,8 @@ impl Client {
                 return Ok(None);
             }
             Effect::Cmd(cmd) => self.app.command(cmd),
+            Effect::Recall(demand) => self.app.client.read_history(1, demand),
+            Effect::History(demand) => self.app.client.demand(demand),
             Effect::Restart => self.app.client.restart(),
             Effect::Redraw => return Err(Redraw),
             Effect::Detach => {
@@ -338,7 +340,15 @@ impl Client {
                         return Ok(());
                     }
                 }
-                result => return result,
+                result => {
+                    if result.is_ok()
+                        && let Some(demand) = self.app.unprinted_history()
+                    {
+                        let effects = self.app.client.demand(demand);
+                        self.driver.pump(&mut self.app, effects);
+                    }
+                    return result;
+                }
             }
         }
     }

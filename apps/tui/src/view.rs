@@ -171,6 +171,9 @@ pub struct Live {
     kept: usize,
     base: usize,
     layout: Layout,
+    initial: md::Checkpoint,
+    skip: usize,
+    resuming_fence: bool,
     fenced: bool,
     sanitizer: Option<client::Sanitizer>,
     open: String,
@@ -204,6 +207,35 @@ enum Leading {
 }
 
 impl Continuation {
+    fn resumed(checkpoint: md::Checkpoint) -> Option<Self> {
+        use md::LineKind;
+        let kind = checkpoint.block?;
+        let block = match kind {
+            LineKind::Heading(level) => Block::Heading(level, ""),
+            LineKind::Bullet(indent) => Block::Bullet { indent, text: "" },
+            LineKind::Quote => Block::Quote(""),
+            LineKind::Fence | LineKind::Code | LineKind::Para => Block::Para(""),
+        };
+        let base = match kind {
+            LineKind::Fence => CODE.dim(),
+            LineKind::Code => CODE,
+            _ => Style::new(),
+        };
+        let (first, rest, _, style) = layout(block, base);
+        Some(Self {
+            first: if checkpoint.inline.is_some() {
+                rest.clone()
+            } else {
+                first
+            },
+            rest,
+            style,
+            bold: checkpoint.inline.is_some_and(|style| style.bold),
+            code: checkpoint.inline.is_some_and(|style| style.code),
+            ..Self::default()
+        })
+    }
+
     fn push(&mut self, text: &str, width: usize) {
         let text = if matches!(self.leading, Leading::Trim) {
             let text = text.trim_start();
@@ -300,6 +332,15 @@ impl Live {
                 identity,
                 kept: 1,
                 layout: self.layout,
+                initial: self.initial,
+                fenced: self.initial.fenced,
+                continuation: Continuation::resumed(self.initial),
+                skip: if self.initial.block == Some(md::LineKind::Fence) {
+                    0
+                } else {
+                    self.initial.skip
+                },
+                resuming_fence: self.initial.block == Some(md::LineKind::Fence),
                 ..Self::default()
             };
             rows.clear();
@@ -321,12 +362,15 @@ impl Live {
             };
         let mut parts = added.split('\n').peekable();
         while let Some(part) = parts.next() {
+            let skip = self.skip.min(part.len());
+            self.skip -= skip;
+            let part = &part[skip..];
             if let Some(c) = &mut self.continuation {
                 #[cfg(test)]
                 {
                     self.parsed += part.len() + usize::from(c.star);
                 }
-                if self.layout == Layout::Reply {
+                if self.layout == Layout::Reply && !self.fenced && !self.resuming_fence {
                     c.push(part, width);
                 } else {
                     c.push_text(part, c.style, width);
@@ -350,6 +394,10 @@ impl Live {
                 } else {
                     markdown_into(rows, &self.open, width, Style::new(), self.fenced)
                 };
+                if self.resuming_fence {
+                    self.fenced = !self.fenced;
+                    self.resuming_fence = false;
+                }
                 self.kept = rows.len();
                 self.open.clear();
                 self.leading = 0;
@@ -562,6 +610,13 @@ impl Cursor {
         }
     }
 
+    pub fn resumed(mut self, checkpoint: md::Checkpoint) -> Self {
+        if self.state.layout == Layout::Reply {
+            self.state.initial = checkpoint;
+        }
+        self
+    }
+
     pub fn update(
         &mut self,
         text: &str,
@@ -573,7 +628,7 @@ impl Cursor {
         let changed =
             self.state.identity != Some((call, attempt, width)) || self.state.seen != text.len();
         if self.state.identity != Some((call, attempt, width)) || text.len() < self.state.seen {
-            *self = Self::new(self.state.layout);
+            *self = Self::new(self.state.layout).resumed(self.state.initial);
         }
         if self.tail.is_empty() {
             self.state
@@ -623,6 +678,7 @@ impl Cursor {
                         (
                             Live {
                                 layout: self.state.layout,
+                                initial: self.state.initial,
                                 ..Live::default()
                             },
                             Vec::new(),
@@ -681,6 +737,9 @@ impl Live {
             kept: self.kept,
             base: self.base,
             layout: self.layout,
+            initial: self.initial,
+            skip: self.skip,
+            resuming_fence: self.resuming_fence,
             fenced: self.fenced,
             sanitizer: None,
             open: self.open.clone(),

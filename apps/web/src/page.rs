@@ -1,6 +1,5 @@
 //! What a tab's chat page shows of its session client, and the patches
-//! that bring the page up to date: the transcript whole once an attach is
-//! synced, then each change alone.
+//! that stream requested history into the native DOM, then each change alone.
 
 use client::{Attach, Cmd, Effect, Env, Link, Renderer, SessionClient, Show};
 use protocol::view::{Change, Item, Part, Status, Update};
@@ -9,9 +8,17 @@ use protocol::{SessionId, Target};
 use crate::patch::Patch;
 use crate::view::{self, End, EndRow, ItemRow, TitleSpan, Transcript, html};
 
+// Amortize range round trips while the browser consumes the full transcript.
+const HISTORY_BYTES: usize = 1 << 20;
+
 pub struct Page {
     pub client: SessionClient,
     session: SessionId,
+    dom_end: usize,
+    /// Canonical Markdown and native selection require one complete item.
+    oversized: Option<(usize, usize)>,
+    refresh: std::collections::BTreeSet<usize>,
+    effects: Vec<Effect>,
     forking: bool,
     /// The daemon's latest complaint, until the transcript moves on.
     error: Option<String>,
@@ -23,6 +30,7 @@ pub struct Page {
     title_dirty: bool,
     /// Text streamed since the last patch, for one reply attempt.
     streamed: Option<(protocol::CallId, u16, String)>,
+    live: Option<(protocol::CallId, u16)>,
     /// Events not yet sent.
     out: Vec<u8>,
 }
@@ -32,16 +40,26 @@ impl Page {
     /// attach it asks the driver for.
     pub fn new(session: SessionId) -> (Self, Vec<Effect>) {
         let mut client = SessionClient::new(Env::Keep);
+        client.demand(client::HistoryDemand {
+            anchor: client::HistoryAnchor::After(0),
+            bytes: HISTORY_BYTES,
+            ..Default::default()
+        });
         let open = client.attach(Attach::new(Target::Id(session), Env::Keep));
         let page = Self {
             client,
             session,
+            dom_end: 0,
+            oversized: None,
+            refresh: std::collections::BTreeSet::default(),
+            effects: Vec::new(),
             forking: false,
             error: None,
             shown: None,
             titled: None,
             title_dirty: true,
             streamed: None,
+            live: None,
             out: Vec::new(),
         };
         (page, open)
@@ -146,21 +164,10 @@ impl Page {
             }
             return;
         }
-        self.title_dirty |= match &update.change {
-            Change::Snapshot | Change::Attached { reset: true, .. } => true,
-            Change::Added { item, .. } => matches!(item,
-                Item::Reply { purpose: Some(purpose), status: Status::Done, .. }
-                    if purpose == "title"
-            ),
-            Change::Updated {
-                index,
-                part: Part::Outcome,
-            } => matches!(
-                &self.client.view().items[*index],
-                Item::Reply { purpose: Some(purpose), .. } if purpose == "title"
-            ),
-            _ => false,
-        };
+        if self.history_update(&update.change) {
+            return;
+        }
+        self.title_dirty |= self.title_changed(&update.change);
         if let Change::Attached { .. } = &update.change
             && self.forking
             && let Some(session) = self.client.view().session
@@ -182,7 +189,14 @@ impl Page {
             Change::Synced => {
                 self.flush();
                 self.shown = Some(self.end_row());
-                self.show_all();
+                if self.client.view().history.is_some() {
+                    if self.dom_end == 0 {
+                        self.show_shell();
+                    }
+                    self.request_range();
+                } else {
+                    self.show_all();
+                }
                 return;
             }
             change if self.synced() && self.shown.is_some() => change,
@@ -209,8 +223,6 @@ impl Page {
         self.flush();
         let view = self.client.view();
         match change {
-            // The first item takes the place of the note that there is
-            // none; a sync brings the recap.
             Change::Added { index: 0, .. }
             | Change::Snapshot
             | Change::Synced
@@ -230,6 +242,59 @@ impl Page {
                 self.patch(&Patch::Replace(&item));
             }
             _ => {}
+        }
+    }
+
+    fn history_update(&mut self, change: &Change) -> bool {
+        if let Change::Activity = change
+            && let Some(history) = &self.client.view().history
+        {
+            self.title_dirty = true;
+            let restart = self
+                .oversized
+                .map(|(index, _)| index)
+                .filter(|index| history.changed.contains(index));
+            self.refresh.extend(
+                history
+                    .changed
+                    .iter()
+                    .copied()
+                    .filter(|index| *index < self.dom_end),
+            );
+            if let Some(index) = restart {
+                self.oversized = None;
+                self.effects
+                    .extend(self.client.demand(client::HistoryDemand {
+                        anchor: client::HistoryAnchor::After(index),
+                        bytes: 1,
+                        ..Default::default()
+                    }));
+            } else {
+                self.request_range();
+            }
+        }
+        if matches!(change, Change::Snapshot) && self.client.view().history.is_some() {
+            self.show_range();
+            return true;
+        }
+        false
+    }
+
+    fn title_changed(&self, change: &Change) -> bool {
+        match change {
+            Change::Snapshot | Change::Attached { reset: true, .. } => true,
+            Change::Added { item, .. } => matches!(item,
+                Item::Reply { purpose: Some(purpose), status: Status::Done, .. }
+                    if purpose == "title"
+            ),
+            Change::Updated {
+                index,
+                part: Part::Outcome,
+            } => matches!(
+                &self.client.view().items[*index],
+                Item::Reply { purpose: Some(purpose), .. } if purpose == "title"
+            ),
+            _ => false,
         }
     }
 
@@ -263,26 +328,132 @@ impl Page {
         let Some((call, attempt, text)) = self.streamed.take() else {
             return;
         };
-        let view = self.client.view();
-        // Shown whole when it started streaming, or started again (a
-        // retry) and so has none of this text.
-        let started = view
-            .streaming
-            .as_ref()
-            .is_none_or(|s| s.call != call || s.attempt != attempt || s.text.len() == text.len());
-        if started {
-            let Some(item) = view.items.iter().find(|i| i.key() == call.0) else {
-                return;
-            };
-            let item = html(ItemRow { item, view });
-            self.patch(&Patch::Replace(&item));
-        } else {
-            let selector = view::reply_id(call);
+        if self.live == Some((call, attempt)) {
+            let selector = format!("#live-reply-{call}");
             self.patch(&Patch::Append {
                 selector: &selector,
                 html: &view::delta(&text),
             });
+        } else {
+            let row = html(view::LiveReply { call, text: &text });
+            self.patch(&Patch::Replace(&row));
+            self.live = Some((call, attempt));
         }
+    }
+
+    fn show_shell(&mut self) {
+        let end = html(EndRow {
+            end: &self.end_row(),
+        });
+        self.patch(&Patch::Replace(&format!("<div id=\"transcript\" style=\"{}\"><span id=\"history-end\" data-loaded=\"0\"></span><div id=\"live\"></div>{end}</div>", crate::style::COLUMN)));
+    }
+
+    fn show_range(&mut self) {
+        let view = self.client.view();
+        let Some(history) = &view.history else {
+            return;
+        };
+        let start = history.start;
+        let end = history.end;
+        let fragment = history.fragment.clone();
+        let settled_live = self.live.is_some_and(|(call, _)| {
+            view.items.iter().any(|item| {
+                item.key() == call.0
+                    && item.settled()
+                    && fragment
+                        .as_ref()
+                        .is_none_or(|f| f.key != call.0 || f.end == f.total)
+            })
+        });
+        let incomplete = fragment.as_ref().filter(|f| f.start > 0 || f.end < f.total);
+        let complete_end = incomplete.map_or(end, |f| f.index);
+        let rows = self.range_rows(start, complete_end);
+        if self.shown.is_none() {
+            self.shown = Some(self.end_row());
+            self.show_shell();
+        }
+        let mut inserted = String::new();
+        for (index, row) in rows {
+            if index < self.dom_end {
+                self.patch(&Patch::Replace(&row));
+            } else {
+                inserted.push_str(&row);
+            }
+            self.refresh.remove(&index);
+        }
+        if !inserted.is_empty() {
+            self.patch(&Patch::Before {
+                selector: "#history-end",
+                html: &inserted,
+            });
+        }
+        self.oversized = incomplete.map(|f| (f.index, f.total));
+        if start <= self.dom_end {
+            self.dom_end = self.dom_end.max(complete_end);
+        }
+        if settled_live {
+            self.patch(&Patch::Replace("<div id=\"live\"></div>"));
+            self.live = None;
+        }
+        self.patch(&Patch::Replace(&format!(
+            "<span id=\"history-end\" data-loaded=\"{}\"></span>",
+            self.dom_end
+        )));
+        self.effects.extend(self.client.release_history());
+        self.request_range();
+    }
+
+    fn range_rows(&self, start: usize, end: usize) -> Vec<(usize, String)> {
+        let view = self.client.view();
+        view.items
+            .iter()
+            .enumerate()
+            .filter(|(offset, _)| {
+                let index = start + offset;
+                index < end && (index >= self.dom_end || self.refresh.contains(&index))
+            })
+            .map(|(offset, item)| {
+                let index = start + offset;
+                (
+                    index,
+                    format!(
+                        "<div id=\"h-{index}\" style=\"display:contents\">{}</div>",
+                        html(ItemRow { item, view })
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    fn request_range(&mut self) {
+        if self.client.history_pending() {
+            return;
+        }
+        let Some(history) = &self.client.view().history else {
+            return;
+        };
+        let demand = if let Some((item, bytes)) = self.oversized {
+            client::HistoryDemand {
+                anchor: client::HistoryAnchor::TextAfter { item, offset: 0 },
+                bytes,
+                ..Default::default()
+            }
+        } else if let Some(index) = self.refresh.first().copied() {
+            client::HistoryDemand {
+                anchor: client::HistoryAnchor::After(index),
+                bytes: 1,
+                ..Default::default()
+            }
+        } else if self.dom_end < history.count {
+            client::HistoryDemand {
+                anchor: client::HistoryAnchor::After(self.dom_end),
+                bytes: HISTORY_BYTES,
+                ..Default::default()
+            }
+        } else {
+            return;
+        };
+        self.effects.extend(self.client.demand(demand));
     }
 
     fn show_all(&mut self) {
@@ -336,10 +507,10 @@ impl Renderer for Page {
                     self.flush();
                     self.show_end();
                 }
-                Show::Link | Show::Sessions => {}
+                Show::Link | Show::Sessions | Show::History { .. } => {}
             }
         }
-        Vec::new()
+        std::mem::take(&mut self.effects)
     }
 }
 
@@ -349,7 +520,7 @@ mod tests {
     use client::{ConnId, Error, Event, EventKind, Welcome};
     use protocol::{Body, CallId, Caps, DaemonMsg, Entry, Epoch, Json, Outcome, Seq, SessionId};
 
-    use super::Page;
+    use super::{HISTORY_BYTES, Page};
 
     fn connected(conn: u64) -> Event {
         Event {
@@ -453,6 +624,286 @@ mod tests {
         out.split_terminator("\n\n").map(str::to_owned).collect()
     }
 
+    fn deliver_history(page: &mut Page, message: DaemonMsg) -> Vec<client::Io> {
+        let effects = page.client.step(Event {
+            conn: page.client.connection(),
+            kind: EventKind::Msg(message),
+        });
+        let mut sent = Vec::new();
+        client::pump(
+            |io| {
+                sent.push(io);
+                Ok(())
+            },
+            page,
+            effects,
+        );
+        sent
+    }
+    fn requested_range(sent: Vec<client::Io>) -> (u64, protocol::history::Request) {
+        sent.into_iter()
+            .find_map(|io| match io {
+                client::Io::Send(protocol::ClientMsg::History { id, range }) => Some((id, range)),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    fn range_json(
+        index: &protocol::view::Index,
+        entries: &[Entry],
+        range: &protocol::history::Request,
+    ) -> String {
+        serde_json::to_string(
+            &index
+                .page(range, |seq| {
+                    Ok(entries[usize::try_from(seq.get()).unwrap() - 1].clone())
+                })
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn replacing_a_pending_oversized_item_cancels_its_old_request() {
+        let mut page = page();
+        let session = page.session;
+        let mut entries = vec![Entry::new(
+            Seq::new(1).unwrap(),
+            Epoch(1),
+            Body::Input {
+                segments: format!("/mode {}auto", " ".repeat(HISTORY_BYTES + 100)).into(),
+                mode: protocol::Mode::Queue,
+                taken: true,
+                origin: None,
+                force: false,
+            },
+        )];
+        let mut index = protocol::view::Index::new(session, "/w".into());
+        index.apply(&entries[0]);
+        deliver_history(
+            &mut page,
+            DaemonMsg::Attached {
+                session,
+                workspace: "/w".into(),
+            },
+        );
+        let (id, range) = requested_range(deliver_history(
+            &mut page,
+            DaemonMsg::Head {
+                head: Box::new(index.head(Epoch(1))),
+            },
+        ));
+        deliver_history(&mut page, DaemonMsg::Synced { seq: 1 });
+        let fetched = range_json(&index, &entries, &range);
+        let (old_id, old_range) = requested_range(deliver_history(
+            &mut page,
+            DaemonMsg::HistoryPart {
+                id,
+                offset: 0,
+                text: fetched,
+                done: true,
+            },
+        ));
+        assert!(page.oversized.is_some());
+        assert_eq!(page.dom_end, 0);
+        page.take();
+        entries.push(Entry::new(
+            Seq::new(2).unwrap(),
+            Epoch(1),
+            Body::ToolCall {
+                invoke: None,
+                tool: "mode".into(),
+                input: Json::encode(&serde_json::json!({"mode":"auto"})).unwrap(),
+                id: None,
+                card: None,
+                by: protocol::Audience::User,
+            },
+        ));
+        index.apply(&entries[1]);
+        let sent = deliver_history(
+            &mut page,
+            DaemonMsg::Head {
+                head: Box::new(index.head_after(Epoch(1), 1)),
+            },
+        );
+        assert!(sent.iter().any(
+            |io| matches!(io, client::Io::Send(protocol::ClientMsg::Cancel { id }) if *id == old_id)
+        ));
+        let (id, range) = requested_range(sent);
+        assert_eq!(range.text_offset, None);
+        let stale = range_json(&index, &entries, &old_range);
+        deliver_history(
+            &mut page,
+            DaemonMsg::HistoryPart {
+                id: old_id,
+                offset: 0,
+                text: stale,
+                done: true,
+            },
+        );
+        assert_eq!(page.take(), [] as [u8; 0]);
+        let fetched = range_json(&index, &entries, &range);
+        deliver_history(
+            &mut page,
+            DaemonMsg::HistoryPart {
+                id,
+                offset: 0,
+                text: fetched,
+                done: true,
+            },
+        );
+        let patches = String::from_utf8(page.take()).unwrap();
+        assert!(patches.contains("id=\"h-0\"") && patches.contains("id=\"i2\""));
+        assert!(patches.contains("data: mode before"));
+        assert_eq!(page.dom_end, 1);
+        assert!(page.oversized.is_none());
+    }
+
+    #[test]
+    fn oversized_items_keep_canonical_markup_and_release_server_pages() {
+        let mut page = page();
+        let session = page.session;
+        let texts: Vec<_> = (1..=3)
+            .map(|seq| {
+                if seq == 1 {
+                    format!("unique-{seq} {}", "x".repeat(1_100_000))
+                } else {
+                    format!("## unique-{seq}\n{}", "x".repeat(1_100_000))
+                }
+            })
+            .collect();
+        let entries: Vec<_> = texts
+            .iter()
+            .enumerate()
+            .map(|(offset, text)| {
+                let body = if offset == 0 {
+                    Body::Input {
+                        segments: text.as_str().into(),
+                        mode: protocol::Mode::Queue,
+                        taken: true,
+                        origin: None,
+                        force: false,
+                    }
+                } else {
+                    Body::Assistant { text: text.clone() }
+                };
+                Entry::new(Seq::new(offset as u64 + 1).unwrap(), Epoch(1), body)
+            })
+            .collect();
+        let mut index = protocol::view::Index::new(session, "/w".into());
+        for entry in &entries {
+            index.apply(entry);
+        }
+        let mut messages = std::collections::VecDeque::from([
+            DaemonMsg::Attached {
+                session,
+                workspace: "/w".into(),
+            },
+            DaemonMsg::Head {
+                head: Box::new(index.head(Epoch(1))),
+            },
+            DaemonMsg::Synced { seq: 3 },
+        ]);
+        let mut whole_items = 0;
+        let mut pages = 0;
+        while let Some(message) = messages.pop_front() {
+            let effects = page.client.step(Event {
+                conn: page.client.connection(),
+                kind: EventKind::Msg(message),
+            });
+            client::pump(
+                |io| {
+                    if let client::Io::Send(protocol::ClientMsg::History { id, range }) = io {
+                        let fetched = index
+                            .page(&range, |seq| {
+                                Ok(entries[usize::try_from(seq.get()).unwrap() - 1].clone())
+                            })
+                            .unwrap();
+                        if range.bytes > HISTORY_BYTES {
+                            assert_eq!(range.text_offset, Some(0));
+                            let span = fetched.fragment.as_ref().unwrap();
+                            assert_eq!((span.start, span.end), (0, span.total));
+                            assert_eq!(fetched.items.len(), 1);
+                            whole_items += 1;
+                        }
+                        pages += 1;
+                        messages.push_back(DaemonMsg::HistoryPart {
+                            id,
+                            offset: 0,
+                            text: serde_json::to_string(&fetched).unwrap(),
+                            done: true,
+                        });
+                    }
+                    Ok(())
+                },
+                &mut page,
+                effects,
+            );
+        }
+        assert!(pages > 3);
+        assert_eq!(whole_items, 3);
+        assert_eq!(page.dom_end, 3);
+        assert!(page.client.view().items.is_empty());
+        let patches = String::from_utf8(page.take()).unwrap();
+        assert_eq!(patches.matches("id=\"transcript\"").count(), 1);
+        for seq in 1..=3 {
+            assert_eq!(patches.matches(&format!("unique-{seq}")).count(), 1);
+            if seq > 1 {
+                assert!(patches.contains(&format!("unique-{seq}</h2>")));
+            }
+        }
+    }
+
+    #[test]
+    fn a_committed_range_is_inserted_with_one_dom_operation() {
+        let mut page = page();
+        let session = page.session;
+        let entries: Vec<_> = (1..=3)
+            .map(|seq| {
+                Entry::new(
+                    Seq::new(seq).unwrap(),
+                    Epoch(1),
+                    Body::Assistant {
+                        text: format!("unique-{seq}"),
+                    },
+                )
+            })
+            .collect();
+        let mut index = protocol::view::Index::new(page.session, "/w".into());
+        for entry in &entries {
+            index.apply(entry);
+        }
+        deliver_history(
+            &mut page,
+            DaemonMsg::Attached {
+                session,
+                workspace: "/w".into(),
+            },
+        );
+        let (id, range) = requested_range(deliver_history(
+            &mut page,
+            DaemonMsg::Head {
+                head: Box::new(index.head(Epoch(1))),
+            },
+        ));
+        deliver_history(&mut page, DaemonMsg::Synced { seq: 3 });
+        deliver_history(
+            &mut page,
+            DaemonMsg::HistoryPart {
+                id,
+                offset: 0,
+                text: range_json(&index, &entries, &range),
+                done: true,
+            },
+        );
+        let patches = String::from_utf8(page.take()).unwrap();
+        assert_eq!(patches.matches("data: mode before\n").count(), 1);
+        for seq in 1..=3 {
+            assert_eq!(patches.matches(&format!("unique-{seq}")).count(), 1);
+        }
+    }
+
     #[test]
     fn submission_admission_includes_sdk_and_driver_rejection() {
         let mut page = synced();
@@ -520,15 +971,15 @@ mod tests {
         let first = events(&mut page);
         assert_eq!(first.len(), 1, "{first:?}");
         assert!(
-            first[0].contains("<div id=\"i2\"")
-                && first[0].contains("<span id=\"reply-2\">a &lt;b&gt;</span>"),
+            first[0].contains("<div id=\"live\"")
+                && first[0].contains("<span id=\"live-reply-2\">a &lt;b&gt;</span>"),
             "{first:?}"
         );
         page.fold(&[delta(2, " c"), delta(2, " d")]);
         assert_eq!(
             events(&mut page),
             ["event: datastar-patch-elements\n\
-              data: selector #reply-2\n\
+              data: selector #live-reply-2\n\
               data: mode append\n\
               data: elements <span> c d</span>"]
         );
@@ -595,7 +1046,7 @@ mod tests {
         let patches = events(&mut page);
         assert_eq!(patches.len(), 1);
         let reply = patches[0]
-            .split_once("<span id=\"reply-2\">")
+            .split_once("<span id=\"live-reply-2\">")
             .and_then(|(_, tail)| tail.split_once("</span>"))
             .map(|(text, _)| text);
         assert_eq!(reply, Some("€new!"), "{patches:?}");
@@ -607,7 +1058,7 @@ mod tests {
         assert_eq!(
             events(&mut page),
             [
-                "event: datastar-patch-elements\ndata: selector #reply-2\ndata: mode append\ndata: elements <span>?</span>"
+                "event: datastar-patch-elements\ndata: selector #live-reply-2\ndata: mode append\ndata: elements <span>?</span>"
             ]
         );
     }

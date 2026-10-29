@@ -299,10 +299,51 @@ pub enum OpenTarget {
     Id { id: String },
 }
 
+/// The demanded immutable range; the complete transcript remains in the daemon.
+#[data]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HistoryWindow {
+    pub generation: u32,
+    pub cut: u64,
+    pub start: u64,
+    pub end: u64,
+    pub total: u64,
+    pub pending: bool,
+    pub text_start: u64,
+    pub text_end: u64,
+    pub text_total: u64,
+}
+
+impl From<&protocol::history::Position> for HistoryWindow {
+    fn from(position: &protocol::history::Position) -> Self {
+        Self {
+            generation: position.cut.generation.0,
+            cut: position.cut.seq,
+            start: position.start as u64,
+            end: position.end as u64,
+            total: position.count as u64,
+            pending: false,
+            text_start: position.fragment.as_ref().map_or(0, |f| f.start as u64),
+            text_end: position.fragment.as_ref().map_or(0, |f| f.end as u64),
+            text_total: position.fragment.as_ref().map_or(0, |f| f.total as u64),
+        }
+    }
+}
+
+impl HistoryWindow {
+    fn of(client: &SessionClient) -> Option<Self> {
+        client.view().history.as_ref().map(|position| Self {
+            pending: client.history_pending(),
+            ..position.into()
+        })
+    }
+}
+
 /// All display changes from one fold cross the boundary under one revision.
 #[data]
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChangeBatch {
+    pub history: Option<HistoryWindow>,
     /// One more than the previous batch; a gap or invalidation requires resynchronization.
     pub revision: u64,
     /// Cached byte charge for the current view and replay cache.
@@ -640,6 +681,22 @@ pub enum StatusGlyph {
 pub struct ShownBody {
     pub kind: BodyKind,
     pub text: String,
+    pub runs: Option<Vec<MarkdownRun>>,
+}
+
+#[data]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MarkdownRun {
+    pub text: String,
+    pub style: MarkdownStyle,
+}
+
+#[data]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarkdownStyle {
+    Text,
+    Bold,
+    Code,
 }
 
 #[data]
@@ -741,6 +798,7 @@ impl From<&Presented<'_>> for Presentation {
         let body = match &p.body {
             Shown::None => None,
             body => Some(ShownBody {
+                runs: None,
                 kind: match body {
                     Shown::Diff(_) => BodyKind::Diff,
                     Shown::Json(_) => BodyKind::Json,
@@ -883,6 +941,7 @@ pub struct StreamingText {
 #[data]
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionSnapshot {
+    pub history: Option<HistoryWindow>,
     pub rev: u64,
     pub retained_bytes: u64,
     pub seq: u64,
@@ -994,6 +1053,33 @@ impl From<protocol::view::Usage> for TokenUsage {
 impl DisplayItem {
     fn in_view(item: &Item, view: &SessionView) -> Self {
         let shown = view.present(item);
+        let mut presentation = Presentation::from(&shown);
+        if let Some(fragment) = view
+            .history
+            .as_ref()
+            .and_then(|h| h.fragment.as_ref())
+            .filter(|f| f.key == item.key())
+            && let Some(body) = &mut presentation.body
+            && body.kind == BodyKind::Markdown
+        {
+            body.runs = Some(
+                protocol::view::md::fragment(&body.text, fragment.markdown)
+                    .into_iter()
+                    .map(|run| {
+                        use protocol::view::md::Inline;
+                        let (text, style) = match run {
+                            Inline::Text(t) => (t, MarkdownStyle::Text),
+                            Inline::Bold(t) => (t, MarkdownStyle::Bold),
+                            Inline::Code(t) => (t, MarkdownStyle::Code),
+                        };
+                        MarkdownRun {
+                            text: text.into(),
+                            style,
+                        }
+                    })
+                    .collect(),
+            );
+        }
         Self {
             key: item.key().get(),
             kind: match shown.kind {
@@ -1007,7 +1093,7 @@ impl DisplayItem {
                 Kind::Child => DisplayKind::Child,
                 Kind::Environment => DisplayKind::Environment,
             },
-            presentation: Presentation::from(&shown),
+            presentation,
             navigation: match item {
                 Item::Child { child, .. } => Some(child.to_string()),
                 _ => None,
@@ -1039,6 +1125,7 @@ impl SessionSnapshot {
             retained_bytes,
             client.link().into(),
             client.turn().into(),
+            HistoryWindow::of(client),
             view.items
                 .iter()
                 .map(|item| DisplayItem::in_view(item, view))
@@ -1052,9 +1139,11 @@ impl SessionSnapshot {
         retained_bytes: u64,
         link: LinkState,
         turn: TurnInfo,
+        history: Option<HistoryWindow>,
         items: Vec<DisplayItem>,
     ) -> Self {
         Self {
+            history,
             rev,
             retained_bytes,
             seq: view.seq,

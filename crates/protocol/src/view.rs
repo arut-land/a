@@ -2,19 +2,19 @@
 //! through their FFI facade) folds daemon messages into, so all of them show
 //! the same session.
 //!
-//! The log holds the facts; everything here is derived from them. A
-//! [`SessionView`]'s serialized form is its log-derived state: identical for
-//! any two clients that have folded the same session up to the same seq,
-//! which [`SessionView::state_hash`] checks. What only this connection saw
-//! (streamed text, the recap of what it missed) is kept beside it and left
-//! out. Kernel activity is also connection state: the daemon sends it after
-//! the entries of a complete burst, including after replay or a snapshot.
-//! Every new entry invalidates it until the next activity frame. This keeps
-//! the gap between a reply and its requested calls from looking idle.
+//! The log holds the facts; this module derives public control state and
+//! requested transcript ranges. Clients at the same immutable cut and range
+//! agree; [`SessionView::state_hash`] checks that requested presentation.
+//! Streaming text, recap, activity, and range identity are connection state.
+//! The daemon certifies activity after each durable burst.
 //! How an item is shown is decided once too, by [`Item::present`].
 
+mod history;
 pub mod md;
 mod present;
+pub use history::Index;
+mod items;
+pub use items::{Items, WeakItems};
 
 use std::borrow::{Borrow, Cow};
 use std::collections::VecDeque;
@@ -25,8 +25,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::ledger::{Keyed, OutcomeKind, Phase};
 use crate::{
-    Activity, ApprovalReason, Audience, Body, CallId, Card, Carried, DaemonMsg, Entry, HostPath,
-    Json, Outcome, Permission, Seq, SessionId, SessionSummary, ToolOutcome, Verdict, WaitOn,
+    Activity, ApprovalReason, Audience, Body, CallId, Card, DaemonMsg, Entry, HostPath, Json,
+    Outcome, Permission, Seq, SessionId, SessionSummary, ToolOutcome, Verdict, WaitOn,
 };
 
 pub use present::{
@@ -41,7 +41,7 @@ pub struct ViewSnapshot {
     pub workspace: HostPath,
     pub seq: u64,
     pub state: ViewState,
-    pub items: Vec<Item>,
+    pub items: Items,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, serde::Deserialize)]
@@ -51,11 +51,6 @@ pub struct ViewState {
     turn: u64,
     /// Transcript replacement must not erase logged input ownership.
     pub taken: Vec<crate::Author>,
-    #[serde(
-        default,
-        skip_serializing_if = "crate::publication::Publications::is_empty"
-    )]
-    publications: crate::publication::Publications,
 }
 
 /// An item of the session's queue, as every client shows it.
@@ -94,6 +89,10 @@ impl ViewCall {
 impl ViewState {
     fn call(&self, call: CallId) -> Option<&ViewCall> {
         self.calls.get(call)
+    }
+
+    pub fn is_open(&self, call: CallId) -> bool {
+        self.calls.get(call).is_some()
     }
 
     pub fn question_id(&self, call: CallId) -> Option<Seq> {
@@ -136,13 +135,23 @@ impl ViewState {
         self.queued.iter()
     }
 
-    pub fn publications(&self) -> &crate::publication::Publications {
-        &self.publications
+    fn remember_taken(&mut self, author: Option<crate::Author>) {
+        let Some(author) = author else { return };
+        if let Some(known) = self
+            .taken
+            .iter_mut()
+            .find(|known| known.client == author.client)
+        {
+            if author.seq > known.seq {
+                *known = author;
+            }
+        } else {
+            self.taken.push(author);
+        }
     }
 
     #[allow(clippy::too_many_lines)]
     fn apply(&mut self, e: &Entry) {
-        self.publications.apply(e);
         match &e.body {
             Body::Input {
                 segments,
@@ -152,7 +161,7 @@ impl ViewState {
                 ..
             } => {
                 if *taken {
-                    self.taken.extend(origin);
+                    self.remember_taken(*origin);
                     self.turn = e.seq.get();
                 } else {
                     self.queued.push_back(Queued {
@@ -166,11 +175,8 @@ impl ViewState {
             }
             Body::Enqueue { envelope } => self.queued.push_back(Queued {
                 seq: e.seq,
-                // An outcome is hidden, shown as no text.
-                text: match envelope.payload() {
-                    Carried::Message(text) | Carried::Job(text) => text.clone(),
-                    Carried::Child(_) | Carried::Detached(_) => String::new(),
-                },
+                // Internal envelopes may carry execution authority; only their status is public.
+                text: String::new(),
                 steer: false,
                 source: envelope.source(),
                 origin: None,
@@ -180,7 +186,7 @@ impl ViewState {
                 if let Some(at) = self.queued.iter().position(|q| q.seq == *input)
                     && let Some(q) = self.queued.remove(at)
                 {
-                    self.taken.extend(q.origin);
+                    self.remember_taken(q.origin);
                     if !q.steer && into.is_none() {
                         self.turn = e.seq.get();
                     }
@@ -296,6 +302,10 @@ impl ViewState {
 /// One session as a client shows it, including transient connection state.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct SessionView {
+    /// The demanded range and its stable log identity, separate from control state.
+    #[serde(skip)]
+    pub history: Option<crate::history::Position>,
+
     /// The kernel's activity at `seq`, or unknown while entries of its next
     /// burst arrive. Never inferred from an entry prefix: a reply may have
     /// settled before the calls it requested arrive. Attach sends this
@@ -308,7 +318,7 @@ pub struct SessionView {
     pub seq: u64,
     pub state: ViewState,
     /// The transcript, in log order.
-    pub items: Vec<Item>,
+    pub items: Items,
     /// What happened since the seq the latest attach started from, once
     /// its replay is in.
     #[serde(skip)]
@@ -316,6 +326,8 @@ pub struct SessionView {
     /// The seq the latest attach started from.
     #[serde(skip)]
     pub(crate) since: u64,
+    #[serde(skip)]
+    replaying: bool,
     /// Live text of the model call in flight; the committed reply replaces
     /// it.
     #[serde(skip)]
@@ -330,7 +342,7 @@ pub struct SessionView {
 /// What happened in a session, for a client that attaches: what its turn
 /// did since the user's last message, as [`SessionView::recap_since`]
 /// reads it.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Recap {
     /// The user's last message, shortened.
     pub prompt: Option<String>,
@@ -409,7 +421,7 @@ pub enum Item {
         call: Option<CallId>,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         tool: String,
-        decision: Verdict,
+        decision: String,
     },
     /// A child session started by call `call`, and its watch.
     Child {
@@ -619,6 +631,36 @@ impl SessionView {
         })
     }
 
+    /// Replaces a demanded immutable range, retaining control and live state.
+    pub fn range(
+        &mut self,
+        items: Items,
+        range: std::ops::Range<usize>,
+        fragment: Option<crate::history::TextSpan>,
+    ) -> Update {
+        if let Some(position) = &mut self.history {
+            position.fragment = fragment;
+            position.start = range.start;
+            position.end = range.end;
+        }
+        if self.streaming.as_ref().is_some_and(|stream| {
+            self.state.call(stream.call).is_none()
+                && items
+                    .iter()
+                    .find(|item| item.key() == stream.call.0)
+                    .is_none_or(Item::settled)
+        }) {
+            self.streaming = None;
+        }
+        self.items = items;
+        self.rev += 1;
+        Update {
+            rev: self.rev,
+            seq: self.seq,
+            change: Change::Snapshot,
+        }
+    }
+
     /// A call's live output comes from the ledger until its final outcome
     /// replaces it, so attaching mid-call shows the same output as watching.
     pub fn present<'a>(&'a self, item: &'a Item) -> Presented<'a> {
@@ -662,6 +704,14 @@ impl SessionView {
     /// say), trimmed and bare of the quotes a model wraps a short answer
     /// in; `None` until there is one.
     pub fn side(&self, purpose: &str) -> Option<&str> {
+        if purpose == "title"
+            && let Some(title) = self
+                .history
+                .as_ref()
+                .and_then(|position| position.title.as_deref())
+        {
+            return Some(title.trim().trim_matches('"').trim()).filter(|title| !title.is_empty());
+        }
         self.items.iter().rev().find_map(|item| match item {
             Item::Reply {
                 text,
@@ -684,6 +734,65 @@ impl SessionView {
         hash.0
     }
 
+    fn install_head(&mut self, head: &crate::history::Head) -> Change {
+        let changed_generation = self.history.as_ref().is_some_and(|position| {
+            position.cut.session != head.cut.session
+                || position.cut.generation != head.cut.generation
+        });
+        if changed_generation {
+            self.items.clear();
+        }
+        let (start, end) = self
+            .history
+            .as_ref()
+            .filter(|_| !changed_generation)
+            .map_or((0, 0), |position| (position.start, position.end));
+        self.session = Some(head.cut.session);
+        self.seq = head.cut.seq;
+        self.activity = None;
+        self.state.clone_from(&head.state);
+        if self.replaying {
+            self.recap.clone_from(&head.recap);
+        }
+        if self.streaming.as_ref().is_some_and(|stream| {
+            self.state.call(stream.call).is_none()
+                && !self.items.iter().any(|item| item.key() == stream.call.0)
+        }) {
+            self.streaming = None;
+        }
+        self.history = Some(crate::history::Position {
+            cut: head.cut,
+            count: head.count,
+            start,
+            end,
+            fragment: self
+                .history
+                .as_ref()
+                .and_then(|h| h.fragment.clone())
+                .filter(|_| !changed_generation),
+            changed: head.changed.clone(),
+            title: head.title.clone(),
+            model: head.model.clone(),
+            usage: head.usage,
+        });
+        let mut changes = vec![Change::Activity];
+        for answer in &head.answers {
+            if let Some(index) = self.call(answer.call) {
+                changes.push(Change::Updated {
+                    index,
+                    part: Part::Answer {
+                        approved: answer.approved,
+                    },
+                });
+            }
+        }
+        if changes.len() == 1 {
+            changes.pop().unwrap()
+        } else {
+            Change::Batch { changes }
+        }
+    }
+
     fn apply(&mut self, msg: &DaemonMsg) -> Option<Change> {
         match msg {
             DaemonMsg::Attached { session, workspace } => {
@@ -698,6 +807,7 @@ impl SessionView {
                 self.activity = None;
                 self.since = self.seq;
                 self.recap = None;
+                self.replaying = true;
                 self.workspace.clone_from(workspace);
                 Some(Change::Attached {
                     session: *session,
@@ -705,6 +815,7 @@ impl SessionView {
                     reset,
                 })
             }
+            DaemonMsg::Head { head } => Some(self.install_head(head)),
             DaemonMsg::Entry(e) => self.entry(e),
             DaemonMsg::Activity { seq, activity } if *seq == self.seq => {
                 self.activity = Some(*activity);
@@ -732,7 +843,10 @@ impl SessionView {
             }
             DaemonMsg::Synced { seq } => {
                 self.seq = self.seq.max(*seq);
-                self.recap = self.recap_since(self.since);
+                if self.history.is_none() {
+                    self.recap = self.recap_since(self.since);
+                }
+                self.replaying = false;
                 Some(Change::Synced)
             }
             DaemonMsg::Draining { .. } => Some(Change::Draining),
@@ -769,6 +883,8 @@ impl SessionView {
             | DaemonMsg::Ack { .. }
             | DaemonMsg::Update { .. }
             | DaemonMsg::Reply { .. }
+            | DaemonMsg::HistoryPart { .. }
+            | DaemonMsg::HeadPart { .. }
             | DaemonMsg::NotHeld { .. }
             | DaemonMsg::Unknown { .. } => None,
         }
@@ -1034,7 +1150,7 @@ impl SessionView {
             hook: by.to_owned(),
             call,
             tool: self.tool_of(call),
-            decision: d.clone(),
+            decision: decision_line(&self.tool_of(call), call, d),
         };
         self.items.push(item.clone());
         let added = Change::Added {

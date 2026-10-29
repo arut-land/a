@@ -3,9 +3,9 @@
 use crate::store::AppendMode;
 
 use super::{
-    Actor, Admission, Arc, AssertUnwindSafe, Encoded, Entry, Flag, Future, Json, Msg, Ordering,
-    Poll, Record, RecoveryImage, Requirement, SYNC_LAG, Snapshot, WorkId, Writer, catch_unwind,
-    channel, io, lock, oneshot, relisted, store_fault, unless,
+    Actor, Admission, Arc, AssertUnwindSafe, Entry, Flag, Future, Json, Msg, Ordering, Poll,
+    Record, RecoveryImage, Requirement, SYNC_LAG, Snapshot, WorkId, Writer, catch_unwind, channel,
+    io, lock, oneshot, relisted, store_fault, unless,
 };
 
 #[derive(Default)]
@@ -18,7 +18,7 @@ pub(super) struct Journal {
     /// Entries written and not yet durable, in order, with whoever waits
     /// for each: shown to no one until a sync. A seq a client has seen is
     /// one that survives a power cut, so it is never given out twice.
-    pub(super) unsynced: Vec<(Vec<Entry>, Encoded)>,
+    pub(super) unsynced: Vec<Vec<Entry>>,
     pub(super) waiting_sync: Vec<(u64, oneshot::Sender<()>)>,
     pub(super) waiting_mutations: Vec<(
         protocol::Seq,
@@ -90,7 +90,7 @@ impl Actor {
         self.journal
             .unsynced
             .iter()
-            .flat_map(|(entries, _)| entries.iter().cloned())
+            .flat_map(|entries| entries.iter().cloned())
     }
 
     pub(super) async fn drain_flushes(
@@ -131,7 +131,7 @@ impl Actor {
 
     pub(super) async fn durable(&mut self, through: u64) {
         self.journal.durable_seq = self.journal.durable_seq.max(through);
-        self.show_synced();
+        self.show_synced().await;
         self.publish();
         self.admit().await;
     }
@@ -278,7 +278,7 @@ impl Actor {
             .map_or(self.journal.ordered_seq, |entry| entry.seq.get());
         self.journal.since_snapshot += lines.lines().map(|line| line.len() as u64 + 1).sum::<u64>();
         self.folded(&entries);
-        self.journal.unsynced.push((entries, lines));
+        self.journal.unsynced.push(entries);
         if let Some(epoch) = epoch {
             self.track(self.journal.ordered_seq, epoch).await?;
         } else if durable_on_order || flush == FlushMode::Immediate {
@@ -417,16 +417,16 @@ impl Actor {
         Ok(())
     }
 
-    pub(super) fn show_synced(&mut self) {
+    pub(super) async fn show_synced(&mut self) {
         let mut pending = Vec::new();
-        for (entries, lines) in std::mem::take(&mut self.journal.unsynced) {
+        for entries in std::mem::take(&mut self.journal.unsynced) {
             if entries
                 .last()
                 .is_some_and(|entry| entry.seq.get() <= self.journal.durable_seq)
             {
-                self.show(&entries, &lines);
+                self.show(entries).await;
             } else {
-                pending.push((entries, lines));
+                pending.push(entries);
             }
         }
         self.journal.unsynced = pending;

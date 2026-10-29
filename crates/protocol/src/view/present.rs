@@ -191,20 +191,11 @@ impl Item {
                 p.input = Some((tool, input));
                 p
             }
-            Self::Hook {
-                hook,
-                call,
-                tool,
-                decision,
-                ..
-            } => {
-                let line = decision_line(tool, *call, decision);
-                plain(
-                    Kind::Hook,
-                    format!("hook {hook}: {line}").into(),
-                    Shown::None,
-                )
-            }
+            Self::Hook { hook, decision, .. } => plain(
+                Kind::Hook,
+                format!("hook {hook}: {decision}").into(),
+                Shown::None,
+            ),
             Self::Child {
                 child,
                 input,

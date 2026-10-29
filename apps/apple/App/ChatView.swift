@@ -7,6 +7,7 @@ struct ChatView: View {
     var perform: (AppAction) -> Void = { _ in }
     @State private var input = ""
     @State private var showsHelp = false
+    @State private var userScrolling = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -16,12 +17,40 @@ struct ChatView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 10) {
+                        if let history = store.history, (history.start > 0 || history.textStart > 0) {
+                            Button("Earlier messages") { store.loadEarlier() }
+                                .disabled(history.pending)
+                        }
                         ForEach(store.items) { item in
-                            ItemView(item: item, store: store)
+                            ItemView(item: item, store: store).id(item.key)
+                        }
+                        if !store.followsHistory {
+                            HStack {
+                                Button("Later messages") { store.loadLater() }
+                                    .disabled(store.history?.pending == true)
+                                Button("Latest messages") { store.followLatest() }
+                            }
                         }
                         Color.clear.frame(height: 1).id("end")
                     }
                     .padding()
+                }
+                .scrollBounceBehavior(.always, axes: .vertical)
+                .onScrollPhaseChange { _, phase, context in
+                    userScrolling = phase.isScrolling && phase != .animating
+                    if userScrolling { page(HistoryEdge.of(context.geometry)) }
+                }
+                .onScrollGeometryChange(for: HistoryEdge.self) { HistoryEdge.of($0) } action: { _, edge in
+                    if userScrolling { page(edge) }
+                }
+                .onChange(of: store.history.map { PageAnchor(start: $0.start, text: $0.textStart) }) {
+                    guard !store.followsHistory else { return }
+                    switch store.historyDirection {
+                    case .older:
+                        if let item = store.items.last { proxy.scrollTo(item.key, anchor: .bottom) }
+                    case .newer:
+                        if let item = store.items.first { proxy.scrollTo(item.key, anchor: .top) }
+                    }
                 }
                 .background(FollowEnd(store: store, proxy: proxy))
             }
@@ -68,6 +97,14 @@ struct ChatView: View {
         }
     }
 
+    private func page(_ edge: HistoryEdge) {
+        switch edge {
+        case .older: store.loadEarlier()
+        case .newer: if !store.followsHistory { store.loadLater() }
+        case .middle: break
+        }
+    }
+
     private func send() {
         let text = input.trimmingCharacters(in: .whitespaces)
         guard !text.isEmpty else { return }
@@ -86,14 +123,29 @@ struct ChatView: View {
     }
 }
 
-/// Scrolls to the newest output as updates arrive. A view of its own, so a
-/// streamed token re-evaluates it rather than the whole transcript.
+private struct PageAnchor: Equatable {
+    let start: UInt64
+    let text: UInt64
+}
+
+private enum HistoryEdge: Equatable {
+    case older, newer, middle
+
+    static func of(_ geometry: ScrollGeometry) -> Self {
+        let y = geometry.contentOffset.y + geometry.contentInsets.top
+        if y <= 0 { return .older }
+        if y + geometry.containerSize.height >= geometry.contentSize.height { return .newer }
+        return .middle
+    }
+}
+
+/// Streamed tokens update this view without rebuilding the transcript.
 struct FollowEnd: View {
     let store: SessionStore
     let proxy: ScrollViewProxy
 
     var body: some View {
-        Color.clear.onChange(of: store.rev) { proxy.scrollTo("end", anchor: .bottom) }
+        Color.clear.onChange(of: store.rev) { if store.followsHistory { proxy.scrollTo("end", anchor: .bottom) } }
     }
 }
 
@@ -233,7 +285,7 @@ struct BodyView: View {
         if let shown = body_ {
             switch shown.kind {
             case .markdown:
-                Text(markdown(shown.text)).textSelection(.enabled)
+                Text(markdown(shown)).textSelection(.enabled)
             case .text, .diff, .json:
                 Text(shown.text.trimmingCharacters(in: .newlines))
                     .font(.callout.monospaced()).textSelection(.enabled)
@@ -241,7 +293,19 @@ struct BodyView: View {
         }
     }
 
-    private func markdown(_ text: String) -> AttributedString {
+    private func markdown(_ shown: ShownBody) -> AttributedString {
+        if let runs = shown.runs {
+            return runs.reduce(into: AttributedString()) { result, run in
+                var text = AttributedString(run.text)
+                switch run.style {
+                case .text: break
+                case .bold: text.font = .body.bold()
+                case .code: text.font = .body.monospaced()
+                }
+                result += text
+            }
+        }
+        let text = shown.text
         let options = AttributedString.MarkdownParsingOptions(
             interpretedSyntax: .inlineOnlyPreservingWhitespace)
         return (try? AttributedString(markdown: text, options: options)) ?? AttributedString(text)

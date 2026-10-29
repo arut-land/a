@@ -542,7 +542,8 @@ impl Conn<'_> {
                 | ClientMsg::Interrupt { .. }
                 | ClientMsg::Query { .. }
                 | ClientMsg::Cancel { .. }
-                | ClientMsg::Fetch { .. } => {}
+                | ClientMsg::Fetch { .. }
+                | ClientMsg::History { .. } => {}
             }
         };
         while let Some((client_seq, answer)) = pending.pop_front() {
@@ -806,7 +807,8 @@ const fn writes(msg: &ClientMsg) -> bool {
         | ClientMsg::Settings { change: None }
         | ClientMsg::Query { .. }
         | ClientMsg::Cancel { .. }
-        | ClientMsg::Fetch { .. } => false,
+        | ClientMsg::Fetch { .. }
+        | ClientMsg::History { .. } => false,
     }
 }
 
