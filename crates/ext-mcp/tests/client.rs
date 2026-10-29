@@ -300,7 +300,15 @@ mod retirement {
         );
         let cx = rig.cx();
         let list = protocol::Json::encode(&json!({"server":"fixture"})).unwrap();
-        rt::block_on(actors.drive(rig.registry.tools().run("mcp_list", &list, None, &cx)));
+        let protocol::Outcome::Done {
+            output: protocol::Payload::Inline(output),
+        } = rt::block_on(actors.drive(rig.registry.tools().run("mcp_list", &list, None, &cx)))
+            .outcome
+        else {
+            panic!("no discovery result");
+        };
+        let listed: Value = output.parse().unwrap();
+        assert!(listed.get("ok").is_some(), "{listed}");
 
         // The scoped owner is not polled again until the replacement has asked for admission.
         assert_eq!(failed(&rig, "wait"), Failure::Timeout);
@@ -359,7 +367,15 @@ mod retirement {
             );
             let cx = rig.cx();
             let list = protocol::Json::encode(&json!({"server":"fixture"})).unwrap();
-            rt::block_on(actors.drive(rig.registry.tools().run("mcp_list", &list, None, &cx)));
+            let protocol::Outcome::Done {
+                output: protocol::Payload::Inline(output),
+            } = rt::block_on(actors.drive(rig.registry.tools().run("mcp_list", &list, None, &cx)))
+                .outcome
+            else {
+                panic!("no discovery result");
+            };
+            let listed: Value = output.parse().unwrap();
+            assert!(listed.get("ok").is_some(), "{listed}");
             let input =
                 protocol::Json::encode(&json!({"server":"fixture","tool":"wait","arguments":{}}))
                     .unwrap();
