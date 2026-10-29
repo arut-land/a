@@ -19,6 +19,8 @@ jobs:
     steps:
       - run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/tgt-main-flakes" >> "$GITHUB_ENV"
       - if: runner.os == 'Linux'
         uses: jdx/mise-action@v5
