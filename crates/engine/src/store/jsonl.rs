@@ -237,7 +237,7 @@ impl LogStore for Jsonl {
         let line = header_line(header)?;
         let (file, publication) = sys::fs::open_log(&path, Some(&line))?;
         self.domain.check(&file)?;
-        let index = Index::new(file, path, line.len() as u64);
+        let index = Index::new(&file, path, line.len() as u64)?;
         index.persist(0);
         let epoch = self.leases.acquire(header.id, 0);
         Ok(index.loaded(0, 0, epoch, Ok(publication), Arc::clone(&self.flusher)))
@@ -361,14 +361,14 @@ impl LogStore for Jsonl {
         let path = self.path(id)?;
         let (file, publication) = sys::fs::open_log(&path, None)?;
         self.domain.check(&file)?;
-        let mut index = Index::new(file, path, 0);
-        let other = index.header()?;
-        index.recall()?;
-        let snapshot = Snap::read(&index.path).filter(|snap| index.places(snap));
+        let mut index = Index::new(&file, path, 0)?;
+        let other = index.header(&file)?;
+        index.recall(&file)?;
+        let snapshot = Snap::read(&index.path).filter(|snap| index.places(&file, snap));
         let placed = std::mem::take(&mut index.ends_mut().ends);
         let mut history = History::default();
         if let Some(snap) = snapshot {
-            let damage = index.scan(other, &mut history, snap.covers, |_| {})?;
+            let damage = index.scan(&file, other, &mut history, snap.covers, |_| {})?;
             let valid =
                 damage.is_none() && history.seq == snap.covers && index.end() == snap.offset;
             if !valid
@@ -382,7 +382,7 @@ impl LogStore for Jsonl {
             }
         }
         let from = index.end();
-        let kept = index.scan(other, &mut history, u64::MAX, each)?;
+        let kept = index.scan(&file, other, &mut history, u64::MAX, each)?;
         let (seq, read) = (index.read().ends.len() as u64, index.end() - from);
         if kept.is_some() {
             ext_logging::emit(ext_logging::Fact::StoreRepair {
@@ -391,14 +391,14 @@ impl LogStore for Jsonl {
                 offset: index.end(),
             });
         }
-        if kept.is_none() && index.end() < index.file.metadata()?.len() {
+        if kept.is_none() && index.end() < file.metadata()?.len() {
             ext_logging::emit(ext_logging::Fact::StoreRepair {
                 session: id,
                 rule: ext_logging::Rule::CutTornTail,
                 offset: index.end(),
             });
-            sys::fs::truncate(&index.file, index.end())?;
-            sys::sync_data(&index.file)?;
+            sys::fs::truncate(&file, index.end())?;
+            sys::sync_data(&file)?;
         }
         let agreed = placed
             .iter()
@@ -420,9 +420,10 @@ impl LogStore for Jsonl {
     fn entries(&self, id: SessionId) -> io::Result<Vec<Entry>> {
         let mut entries = Vec::new();
         let path = self.path(id)?;
-        let mut index = Index::new(File::open(&path)?, path, 0);
-        let other = index.header()?;
-        index.scan(other, &mut History::default(), u64::MAX, |e| {
+        let file = File::open(&path)?;
+        let mut index = Index::new(&file, path, 0)?;
+        let other = index.header(&file)?;
+        index.scan(&file, other, &mut History::default(), u64::MAX, |e| {
             entries.push(e);
         })?;
         Ok(entries)
@@ -446,7 +447,7 @@ impl LogStore for Jsonl {
 /// Eight bytes per complete entry allow positioned reads from the page cache
 /// without retaining payloads. The disposable sidecar avoids rescanning offsets.
 struct Index {
-    file: File,
+    identity: sys::fs::FileIdentity,
     path: PathBuf,
     start: u64,
     ends: RwLock<Ends>,
@@ -456,20 +457,20 @@ struct Ends {
     /// Entry `seq` ends at `seq - 1`, including its newline.
     ends: Vec<u64>,
     /// Failed sidecar writes disable persistence; the next load rebuilds it.
-    idx: Option<File>,
+    idx: Option<sys::fs::FileIdentity>,
 }
 
 impl Index {
-    fn new(file: File, path: PathBuf, start: u64) -> Self {
-        Self {
-            file,
+    fn new(file: &File, path: PathBuf, start: u64) -> io::Result<Self> {
+        Ok(Self {
+            identity: sys::fs::FileIdentity::try_from(file)?,
             path,
             start,
             ends: RwLock::new(Ends {
                 ends: Vec::new(),
                 idx: None,
             }),
-        }
+        })
     }
 
     fn loaded(
@@ -491,6 +492,7 @@ impl Index {
             torn: false,
             flusher,
             read_only,
+            pending: None,
         });
         Loaded {
             lines: index,
@@ -518,19 +520,26 @@ impl Index {
         let from = ends.ends.len();
         (ends.ends).extend(memchr::memchr_iter(b'\n', lines).map(|i| at + i as u64 + 1));
         let bytes = little_endian(&ends.ends[from..]);
-        if let Some(idx) = &mut ends.idx
-            && idx.write_all(&bytes).is_err()
-        {
-            ends.idx = None;
+        if let Some(identity) = ends.idx {
+            let written = OpenOptions::new()
+                .append(true)
+                .open(beside(&self.path, "idx"))
+                .and_then(|mut idx| {
+                    verify(&idx, identity)?;
+                    idx.write_all(&bytes)
+                });
+            if written.is_err() {
+                ends.idx = None;
+            }
         }
     }
 
-    fn header(&mut self) -> io::Result<Option<ReadOnly>> {
+    fn header(&mut self, file: &File) -> io::Result<Option<ReadOnly>> {
         #[derive(Deserialize)]
         struct Format {
             format: u32,
         }
-        let mut reader = BufReader::new(&self.file);
+        let mut reader = BufReader::new(file);
         let mut line = Vec::new();
         self.start = reader.read_until(b'\n', &mut line)? as u64;
         let format = unseal(&mut line)
@@ -542,7 +551,7 @@ impl Index {
 
     /// Offsets must rise within the file and end at the claimed sealed entry.
     /// This validates positions, not log ordering.
-    fn recall(&mut self) -> io::Result<()> {
+    fn recall(&mut self, file: &File) -> io::Result<()> {
         let path = beside(&self.path, "idx");
         let mut ends: Vec<u64> = fs::read(&path).map_or_else(
             |_| Vec::new(),
@@ -555,13 +564,13 @@ impl Index {
                     .collect()
             },
         );
-        let len = self.file.metadata()?.len();
+        let len = file.metadata()?.len();
         let rising = ends.first().is_none_or(|&first| first > self.start)
             && ends.windows(2).all(|w| w[0] < w[1])
             && ends.last().is_none_or(|&last| last <= len);
         let placed = rising
             && ends.len().checked_sub(1).is_none_or(|last| {
-                self.entry(&ends, last)
+                self.entry(file, &ends, last)
                     .is_some_and(|e| e.seq.get() == ends.len() as u64)
             });
         if !placed {
@@ -571,14 +580,14 @@ impl Index {
         Ok(())
     }
 
-    fn entry(&self, ends: &[u64], at: usize) -> Option<Entry> {
+    fn entry(&self, file: &File, ends: &[u64], at: usize) -> Option<Entry> {
         let from = at.checked_sub(1).map_or(self.start, |i| ends[i]);
         let mut line = vec![0; usize::try_from(ends[at].checked_sub(from)?).ok()?];
-        sys::read_exact_at(&self.file, &mut line, from).ok()?;
+        sys::read_exact_at(file, &mut line, from).ok()?;
         unseal(&mut line).then(|| Entry::from_json(&line).ok())?
     }
 
-    fn places(&self, snap: &Snap) -> bool {
+    fn places(&self, file: &File, snap: &Snap) -> bool {
         let ends = &self.read().ends;
         let at = usize::try_from(snap.covers)
             .ok()
@@ -586,7 +595,7 @@ impl Index {
         at.is_some_and(|at| {
             ends.get(at) == Some(&snap.offset)
                 && self
-                    .entry(ends, at)
+                    .entry(file, ends, at)
                     .is_some_and(|e| e.seq.get() == snap.covers)
         })
     }
@@ -604,7 +613,7 @@ impl Index {
                 idx.set_len(agreed as u64 * 8)?;
                 idx.seek(SeekFrom::End(0))?;
                 idx.write_all(&rest)?;
-                Ok(idx)
+                sys::fs::FileIdentity::try_from(&idx)
             });
         ends.idx = written.ok();
     }
@@ -613,12 +622,13 @@ impl Index {
     /// the log read-only, including a header from another format.
     fn scan(
         &mut self,
+        file: &File,
         other: Option<ReadOnly>,
         history: &mut History,
         through: u64,
         mut each: impl FnMut(Entry),
     ) -> io::Result<Option<ReadOnly>> {
-        let mut reader = BufReader::with_capacity(64 * 1024, &self.file);
+        let mut reader = BufReader::with_capacity(64 * 1024, file);
         reader.seek(SeekFrom::Start(self.end()))?;
         let ends = self.ends.get_mut().unwrap_or_else(PoisonError::into_inner);
         scan(
@@ -682,7 +692,9 @@ impl Lines for Index {
         let at = out.len();
         let len = usize::try_from(to - from).map_err(io::Error::other)?;
         out.resize(at + len, 0);
-        sys::read_exact_at(&self.file, &mut out[at..], from)?;
+        let file = File::open(&self.path)?;
+        verify(&file, self.identity)?;
+        sys::read_exact_at(&file, &mut out[at..], from)?;
         unseal_run(out, at);
         Ok(count as u64)
     }
@@ -725,6 +737,8 @@ struct JsonlLog {
     /// indexed, and cutting them off failed too: the next append cuts them
     /// first.
     torn: bool,
+    /// Transferred to the durability epoch; idle history retains no handles.
+    pending: Option<Arc<File>>,
 }
 
 impl Log for JsonlLog {
@@ -737,7 +751,8 @@ impl Log for JsonlLog {
     }
 
     fn sync(&mut self) -> io::Result<()> {
-        sys::sync_data(&self.index.file)?;
+        let file = self.file()?;
+        sys::sync_data(&file)?;
         if let Some(dir) = &self.new_in {
             dir.order()?;
         }
@@ -750,14 +765,11 @@ impl Log for JsonlLog {
     }
 
     fn enroll(&mut self) -> Option<rt::FlushRequest> {
+        let file = self.pending.take()?;
         if !sys::fs::SEPARATE_CACHE_FLUSH {
             return None;
         }
-        let index = Arc::clone(&self.index);
-        Some(
-            self.flusher
-                .enroll(move || sys::fs::flush_cache(&index.file)),
-        )
+        Some(self.flusher.enroll(move || sys::fs::flush_cache(&file)))
     }
 
     fn read_only(&self) -> Option<ReadOnly> {
@@ -794,7 +806,28 @@ fn sealed(lines: &Encoded) -> Vec<u8> {
     out
 }
 
+fn verify(file: &File, identity: sys::fs::FileIdentity) -> io::Result<()> {
+    if sys::fs::FileIdentity::try_from(file)? != identity {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "log source was replaced",
+        ));
+    }
+    Ok(())
+}
+
 impl JsonlLog {
+    fn file(&mut self) -> io::Result<Arc<File>> {
+        if let Some(file) = &self.pending {
+            return Ok(Arc::clone(file));
+        }
+        let (file, _) = sys::fs::open_log(&self.index.path, None)?;
+        verify(&file, self.index.identity)?;
+        let file = Arc::new(file);
+        self.pending = Some(Arc::clone(&file));
+        Ok(file)
+    }
+
     fn write(&mut self, lines: &[u8], sync: bool) -> io::Result<()> {
         if let Some(why) = self.read_only {
             return Err(io::Error::new(
@@ -806,17 +839,17 @@ impl JsonlLog {
             return Ok(());
         }
         let end = self.index.end();
-        let file = &self.index.file;
+        let file = self.file()?;
         if self.torn {
-            sys::fs::truncate(file, end)?;
+            sys::fs::truncate(&file, end)?;
             self.torn = false;
         }
         let written = (|| {
             (&*file).write_all(lines)?;
             if !sync {
-                return sys::fs::order_data(file);
+                return sys::fs::order_data(&file);
             }
-            sys::sync_data(file)?;
+            sys::sync_data(&file)?;
             if let Some(dir) = &self.new_in {
                 dir.order()?;
             }
@@ -831,7 +864,7 @@ impl JsonlLog {
                 Ok(())
             }
             Err(e) => {
-                self.torn = sys::fs::truncate(file, end).is_err();
+                self.torn = sys::fs::truncate(&file, end).is_err();
                 Err(e)
             }
         }
@@ -888,4 +921,44 @@ fn unseal_run(out: &mut Vec<u8>, at: usize) {
 fn hex(crc: u32) -> [u8; 8] {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     std::array::from_fn(|i| DIGITS[(crc >> (28 - 4 * i) & 0xf) as usize])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_history_retains_no_handles_after_durability_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        let (file, publication) = sys::fs::open_log(&path, Some(b"header\n")).unwrap();
+        let index = Arc::new(Index::new(&file, path, 7).unwrap());
+        drop(file);
+        let mut log = JsonlLog {
+            index: Arc::clone(&index),
+            flusher: Arc::default(),
+            read_only: None,
+            new_in: Some(publication),
+            torn: false,
+            pending: None,
+        };
+        assert!(log.enroll().is_none());
+        log.sync().unwrap();
+        let lease = Arc::downgrade(log.pending.as_ref().unwrap());
+        let request = log.enroll();
+        assert!(log.pending.is_none());
+        if let Some(request) = request {
+            assert!(lease.upgrade().is_some());
+            request.leader.unwrap().run();
+            rt::block_on(request.epoch).unwrap();
+        }
+        assert!(lease.upgrade().is_none());
+        assert!(log.enroll().is_none());
+        assert_eq!(index.end(), 7);
+        log.sync().unwrap();
+        if let Some(request) = log.enroll() {
+            request.leader.unwrap().run();
+            rt::block_on(request.epoch).unwrap();
+        }
+    }
 }

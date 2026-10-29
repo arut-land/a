@@ -155,6 +155,29 @@ pub struct FileIdentity {
     id: [u8; 16],
 }
 
+impl TryFrom<&File> for FileIdentity {
+    type Error = io::Error;
+
+    fn try_from(file: &File) -> Result<Self, Self::Error> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let meta = file.metadata()?;
+            let mut id = [0; 16];
+            id[..8].copy_from_slice(&meta.ino().to_le_bytes());
+            Ok(Self {
+                volume: meta.dev(),
+                id,
+            })
+        }
+        #[cfg(windows)]
+        {
+            let (volume, id) = edit::file_id(file)?;
+            Ok(Self { volume, id })
+        }
+    }
+}
+
 /// The identity of what is at `path` now, links followed.
 pub fn identity(path: &Path) -> io::Result<FileIdentity> {
     #[cfg(unix)]
@@ -1406,6 +1429,21 @@ fn windows_lock(file: &File, nonblocking: bool) -> io::Result<()> {
 #[cfg(test)]
 mod identity_tests {
     use super::*;
+
+    #[test]
+    fn an_open_handle_keeps_its_identity_after_path_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source");
+        let fresh = dir.path().join("fresh");
+        fs::write(&path, "old").unwrap();
+        let file = File::open(&path).unwrap();
+        let original = FileIdentity::try_from(&file).unwrap();
+        assert_eq!(original, identity(&path).unwrap());
+        fs::write(&fresh, "new").unwrap();
+        replace(&fresh, &path).unwrap();
+        assert_eq!(original, FileIdentity::try_from(&file).unwrap());
+        assert_ne!(original, identity(&path).unwrap());
+    }
 
     #[test]
     fn a_directory_made_again_at_its_path_has_another_identity() {

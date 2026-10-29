@@ -1270,3 +1270,73 @@ fn covered_cursors_read_only_new_entries_and_reset_on_replacement(store: &dyn Lo
     assert!(reset);
     assert_eq!(entries.len(), 5);
 }
+
+#[test]
+fn a_retained_cursor_never_reads_a_replacement_source() {
+    let store = jsonl();
+    let source = header("/source");
+    let mut loaded = store.create(&source).unwrap();
+    let expected = append(&mut loaded, [1]);
+    let replacement = header("/replacement");
+    let mut other = store.create(&replacement).unwrap();
+    let changed = Entry::new(
+        Seq::new(1).unwrap(),
+        Epoch(0),
+        Body::Context {
+            text: "different source".into(),
+            publication: None,
+        },
+    );
+    other.writer.append_raw(&[changed]).unwrap();
+    let dir = store.dir.as_ref().unwrap();
+    let path = dir.join(source.id.to_string()).join("log.jsonl");
+    let fresh = path.with_extension("replacement");
+    fs::copy(
+        dir.join(replacement.id.to_string()).join("log.jsonl"),
+        &fresh,
+    )
+    .unwrap();
+    sys::fs::replace(&fresh, &path).unwrap();
+    let mut bytes = Vec::new();
+    match loaded.lines.read(1..=1, usize::MAX, &mut bytes) {
+        Ok(count) => {
+            assert_eq!(count, 1);
+            assert_eq!(Entry::from_json(&bytes).unwrap(), expected[0]);
+        }
+        Err(error) => assert_eq!(error.kind(), ErrorKind::InvalidData),
+    }
+    let replacement_bytes = fs::read(&path).unwrap();
+    let _ = loaded.writer.append_raw(&[entry(2, loaded.writer.epoch())]);
+    assert_eq!(fs::read(&path).unwrap(), replacement_bytes);
+}
+
+#[test]
+fn a_pending_flush_keeps_its_source_after_path_replacement() {
+    let store = jsonl();
+    let source = header("/source");
+    let mut loaded = store.create(&source).unwrap();
+    let replacement = header("/replacement");
+    let mut other = store.create(&replacement).unwrap();
+    append(&mut other, [1]);
+    let mut entries = [entry(1, 0)];
+    loaded
+        .writer
+        .append(&mut entries, AppendMode::Order)
+        .unwrap();
+    let pending = loaded.writer.enroll();
+    let dir = store.dir.as_ref().unwrap();
+    let path = dir.join(source.id.to_string()).join("log.jsonl");
+    let fresh = path.with_extension("replacement");
+    fs::copy(
+        dir.join(replacement.id.to_string()).join("log.jsonl"),
+        &fresh,
+    )
+    .unwrap();
+    sys::fs::replace(&fresh, &path).unwrap();
+    if let Some(pending) = pending {
+        if let Some(leader) = pending.leader {
+            leader.run();
+        }
+        rt::block_on(pending.epoch).unwrap();
+    }
+}
