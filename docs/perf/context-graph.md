@@ -9,7 +9,7 @@ execution authority remains private to each session. The initial graph implement
 
 The owner subsequently approved proposals #1 and #2 together. The current
 revision adds forkable prepared encoded prefixes, bounded graph cursors across
-inherited scopes and incremental admission lookup. Its latest operation-scoped handle follow-up removes idle descriptor retention and the measured launch slope; the total CPU gate remains unmet. The final section records the remaining daemon-wide work and tradeoffs. The sections
+inherited scopes and incremental admission lookup. Its operation-scoped handle follow-up removes idle descriptor retention and the measured launch slope. The latest indexed-supervisor follow-up removes all-session pulse scans and reduces wide user CPU; total CPU acceptance remains unmet. The final section records the remaining measured work and tradeoffs. The sections
 below preserve the earlier measurements and their unmet gates as historical
 evidence. Client history paging remains stage B; catalog interning was not
 approved.
@@ -370,3 +370,102 @@ Full tables, all spreads/consumer counters, source attribution, owner-pending it
 cleanup record are in context-graph.handles.report.md under the evidence root above.
 handles-final-provenance.json and handles-attribution-provenance.json pin
 sources/binaries; prior evidence and the public sys::spawn_group probe remain unchanged.
+
+## Indexed supervision follow-up
+
+The owner approved lib.rs and residency/wakeup integration for the remaining
+all-session work. Product commit `ef986c0d`, compared with `7f95b767`, maintains
+identity lookup, loaded/work aggregates and replaceable idle deadlines on
+transitions. A supervisor pulse visits changed identities and expired deadlines;
+it does not rebuild or scan every known/live session. No polling timer was added.
+The canonical ordered registry preserves creation order. Pending loads participate
+in shutdown; pressure reclamation and actual upgrade handover retain their global
+semantics. Upgrade readiness updates its projection from changed identities.
+
+Full Sessions wire snapshots still require O(output bytes) for subscribers, using
+cached summaries rather than rereading Slot/Live state. Only changed rows retain
+previous publication values, replacing the old permanently duplicated full list.
+Visible-prefix initialization prevents duplicate summary transitions exposed by
+that cache. No dependency, wire/log change, recorded fixture edit or feature cap.
+
+All 21 primary cases pass: n=3 interleaved A/B at 1/4/8 roots ×32 plus three
+candidate 64-turn constructions, all with live TUI/FFI/web, complete outcomes,
+graph hashes and warm/cold view hashes. Common main remains `3a32fe61`; fetched and
+merged before implementation and again before delivery. Same release profile and
+workload as above; loopback/dummy providers in allowlisted environments. Native
+heap inspection is outside timings. No build/test/profile runs overlap accepted
+CPU timings. Values are median [min–max], n=3; CPU ms/root turn, OLS slopes 9–32.
+
+| Roots | Arm | Last4 total | Last4 user | Last4 kernel | User slope | Kernel slope | Total slope |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | before | 75.55 [74.20–80.15] | 30.53 [29.89–32.33] | 45.03 [44.30–47.81] | 0.043 [-0.699–0.183] | 0.065 [-0.912–0.247] | 0.108 [-1.611–0.430] |
+| 1 | after | 75.48 [72.82–79.73] | 29.44 [28.56–31.26] | 46.05 [44.26–48.46] | 0.093 [-0.150–0.105] | 0.199 [-0.179–0.203] | 0.293 [-0.329–0.308] |
+| 4 | before | 90.83 [89.31–94.06] | 38.62 [37.91–40.57] | 52.20 [51.40–53.50] | 0.281 [0.114–0.437] | 0.224 [0.020–0.430] | 0.505 [0.135–0.867] |
+| 4 | after | 83.91 [83.48–85.14] | 32.38 [32.35–32.86] | 51.56 [51.10–52.27] | 0.063 [0.029–0.151] | 0.212 [0.145–0.274] | 0.275 [0.174–0.425] |
+| 8 | before | 96.17 [95.71–97.23] | 43.85 [42.80–44.33] | 52.90 [52.31–52.90] | 0.355 [0.333–0.402] | 0.165 [0.159–0.233] | 0.514 [0.498–0.635] |
+| 8 | after | 87.40 [87.05–87.96] | 34.00 [33.02–34.12] | 53.85 [53.04–54.38] | 0.078 [0.034–0.129] | 0.283 [0.188–0.317] | 0.395 [0.222–0.411] |
+
+All three 64-turn cases preserve 65 root turns and 520 tools including live clients.
+Last4 total CPU 83.54 [81.37–128.42] ms, user 31.40 [30.52–50.02], kernel 52.14
+[50.85–78.41]; slopes 9–64: total 0.211 [0.152–0.512], user 0.050 [0.020–0.170],
+kernel 0.161 [0.132–0.342]. The high sample is retained. At eight roots, live heap
+898.83→899.87 MiB, physical footprint 1131.50→1138.60 MiB. The indexes cost about
+1.04 MiB across 2,064 durable sessions. The complete report preserves every spread,
+client process counter, attach/fold latency and lifecycle residency stage.
+
+The real daemon invariant is RED on the old supervisor (64 visits for one changed
+session among 32 idle), GREEN at one visit then zero. Upgrade projection visits 32
+initially, then one changed identity, then zero. Another invariant verifies deadline
+replacement, attachment, expiry, unload and reload. Existing no-polling, pressure,
+shutdown-loading, handover, cancellation, graph/provider parity, restart and blob
+lifetime checks pass: 427 engine tests, 14 skipped; fmt, check, all-target/all-feature
+clippy `-D warnings`, Windows cross-lint and native release pass. Rustdoc succeeds
+with its existing private handover-link warning. Detached 12-second idle CPU is
+0.04–0.36 ms across the candidate primary samples. No CI dispatched.
+
+Twelve separate interleaved plain/profile controls measure TCP send/sendto and real
+posix_spawn thread CPU. At eight roots, last4 sends cost 5.087 [4.544–5.394] ms,
+5.261 [5.023–5.352]% of profiled daemon CPU. Accepted TCP bytes are 15.512 MiB/root
+turn, 99.984% request body. At depth 64, sends cost 7.420 [7.410–9.686] ms,
+8.933 [8.756–9.001]% of CPU, with 31.965 MiB accepted TCP /99.992% body. Full-context
+fork traffic is preserved. Spawn last4 0.805 [0.751–0.812] ms at eight roots, slope
+0.001 [-0.004–0.010]. The non-send/non-spawn residual slope remains 0.491
+[-0.027–1.148] at eight roots, 0.053 [-0.041–0.302] at depth 64. Direct send intervals
+exclude other request preparation/readiness work. Plain/profile deltas, clock
+calibration and all outliers are retained; provider receive wall time is never
+subtracted from CPU.
+
+Three further late-stack diagnostic cases pass 256 root turns each. Native captures
+show no legacy loaded/idle scan frames. Remaining userspace leaf paths include
+durable reads (12.84–18.64% of sampled userspace leaf weight), snapshots (3.47–4.30%),
+provider work (17.29–20.14%) and transport (2.45–3.61%); roughly half remains other
+runtime, extension/event, JSON, allocator and outlined work. These are sampled path
+groups, not CPU-time partitions or an exclusive explanation of the slope. Parent
+stacks identify incremental child-ownership range reads, current context-node
+writes, request transport and checkpoints. The child-ownership cursor already
+advances; these stacks do not show a settled-prefix reread. Kernel/wait leaves
+include file operations/durability and socket sends but are dominated by waits.
+**Total CPU acceptance remains unmet; this branch is not ready to merge.** Further
+narrow native CPU/syscall attribution is owner-pending before another product change
+(estimated 0.5–1 day plus any newly approved matrix). No residual was relabelled as
+necessary transmission without evidence.
+
+The four-root +35 MiB footprint question was examined separately through six
+interleaved native full malloc/free-history cases, without allocator hooks. Live
+malloc is 449.8 MiB in both arms. Logged footprint medians 618.77→645.58 MiB and
+empty-Large dirty 133.0→159.6 MiB reproduce the prior uninstrumented direction.
+Selected empty-region histories identify recovery-image encoding and the second
+whole snapshot Vec in JsonlLog::snapshot→Snap::write; selected encoding records
+reach 7,284,474 bytes, with frees within snapshot operations. Json clones share Arc
+storage. The handle patch changed File/Index lease ownership, not these buffers'
+logical lifetimes. Exact allocator-cache placement remains unassigned. Histories
+are selected address/size records, not total allocation frequencies or exclusive
+resident bytes; logged CPU is not accepted timing. A possible streaming checked
+snapshot writer is owner-pending (1–2 days plus durability/restart checks); its
+footprint gain is unmeasured. No allocator policy or snapshot change was added.
+
+The edit-test TempDir flake remains with its owner. Full phase report:
+`context-graph.supervisor.report.md` in the existing context-graph evidence root;
+`super-final-provenance.json` and `supervisor-attribution-provenance.json` pin code,
+binaries, scripts, raw tables and diagnostic symbols. Earlier reports and the
+native spawn probe remain intact. Phase 1 stops for independent re-review.
