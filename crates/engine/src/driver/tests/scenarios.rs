@@ -274,8 +274,9 @@ fn retained_request_sources_do_not_pin_their_registry() {
         settle(&session);
     }
     session.halt();
-    drop(session);
-    drop(fixture);
+    // The ending actor can still own Shared after signalling ended. Replace
+    // its current generation so that only retained readers could pin the old one.
+    fixture.0.registry.replace(Registry::default());
     assert_eq!(lock(&requests).len(), 3);
     assert!(
         generation.upgrade().is_none(),

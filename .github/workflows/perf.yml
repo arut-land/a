@@ -53,12 +53,102 @@ jobs:
         run: |
           $runners = @((Get-Command pwsh.exe).Source, "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe")
           "A_TEST_POWERSHELL=$($runners -join ';')" >> $env:GITHUB_ENV
-      - name: Release reproduction
+      - name: Build baseline release
+        run: |
+          git restore --source b290c607 -- crates/ext-mcp/src/instance.rs crates/ext-mcp/tests/client.rs crates/client/src/machines.rs crates/engine/src/driver/tests/scenarios.rs
+          mise exec -- cargo nextest list --release -p ext-mcp --features fixture -p client -p engine --lib --test client --test machines --list-type binaries-only --message-format json > "$RUNNER_TEMP/before.json"
+          mise exec -- cargo metadata --format-version 1 --no-deps > "$RUNNER_TEMP/metadata.json"
+      - name: Retain baseline executables
+        run: |
+          python3 - <<'PY'
+          import json, os, shutil
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP'])
+          path = root / 'before.json'
+          data = json.loads(path.read_text())
+          binaries = data['rust-binaries']
+          for index, binary in enumerate(binaries.values() if isinstance(binaries, dict) else binaries):
+              source = Path(binary['binary-path'])
+              destination = root / ('baseline-' + str(index) + source.suffix)
+              shutil.copy2(source, destination)
+              binary['binary-path'] = str(destination)
+          path.write_text(json.dumps(data))
+          PY
+      - name: Build repaired release
+        run: |
+          git restore --source "$GITHUB_SHA" -- crates/ext-mcp/src/instance.rs crates/ext-mcp/tests/client.rs crates/client/src/machines.rs crates/engine/src/driver/tests/scenarios.rs
+          mise exec -- cargo nextest list --release -p ext-mcp --features fixture -p client -p engine --lib --test client --test machines --list-type binaries-only --message-format json > "$RUNNER_TEMP/after.json"
+      - name: Interleaved release pairs
+        run: |
+          python3 - <<'PY'
+          import datetime
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import statistics
+          import subprocess
+          
+          root = Path(os.environ['RUNNER_TEMP'])
+          rows = []
+          filter = 'test(timeout_kills_the_request) | test(the_host_list_follows_its_files) | test(retained_request_sources_do_not_pin)'
+          with (root / 'paired.log').open('w', encoding='utf-8') as log, (root / 'samples.jsonl').open('w', encoding='utf-8') as samples:
+              for iteration in range(50):
+                  for arm in (['before', 'after'] if iteration % 2 == 0 else ['after', 'before']):
+                      timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                      result = subprocess.run(['mise', 'exec', '--', 'cargo', 'nextest', 'run',
+                          '--cargo-metadata', str(root / 'metadata.json'), '--binaries-metadata', str(root / (arm + '.json')),
+                          '-E', filter, '--no-fail-fast', '--status-level', 'pass'],
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                      output = result.stdout.decode(errors='replace')
+                      log.write(timestamp + ' ' + arm + ' ' + str(iteration) + '\n' + output)
+                      log.flush()
+                      found = {}
+                      for line in output.splitlines():
+                          match = re.search(r'(PASS|FAIL(?: \+ LEAK)?)\s+\[\s*([0-9.]+)s\].*?\)\s+(\S+)\s+(\S+)', line)
+                          if match:
+                              name = match[3] + ' ' + match[4]
+                              found[name] = {'timestamp': timestamp, 'iteration': iteration, 'arm': arm, 'test': name,
+                                             'seconds': float(match[2]), 'status': match[1]}
+                      if len(found) != 3:
+                          print(output, flush=True)
+                          raise RuntimeError('expected three test results, got ' + str(found))
+                      for row in found.values():
+                          rows.append(row)
+                          samples.write(json.dumps(row) + '\n')
+                          print(json.dumps(row), flush=True)
+                      samples.flush()
+          summary = []
+          for test in sorted({row['test'] for row in rows}):
+              for arm in ['before', 'after']:
+                  selected = [row for row in rows if row['test'] == test and row['arm'] == arm]
+                  values = [row['seconds'] for row in selected]
+                  summary.append({'test': test, 'arm': arm, 'n': len(values),
+                                  'failures': sum(row['status'] != 'PASS' for row in selected),
+                                  'median': statistics.median(values), 'min': min(values), 'max': max(values),
+                                  'quartiles': statistics.quantiles(values, n=4)})
+          (root / 'summary.json').write_text(json.dumps(summary, indent=2))
+          print(json.dumps(summary, indent=2))
+          if any(row['arm'] == 'after' and row['status'] != 'PASS' for row in rows):
+              raise SystemExit(1)
+          PY
+      - name: Fifty consecutive fixed passes
+        if: always()
         run: |
           set -o pipefail
-          mise exec -- cargo nextest run --release -p ext-mcp --features fixture -p client -p engine -E 'test(timeout_kills_the_request) | test(a_cancelled_session_generation) | test(the_host_list_follows_its_files) | test(retained_request_sources_do_not_pin)' --stress-count 100 --no-fail-fast --status-level pass --success-output immediate 2>&1 | while IFS= read -r line; do printf '%s %s\n' "$(date -u +%FT%TZ)" "$line"; done | tee "$RUNNER_TEMP/probe.log"
+          mise exec -- cargo nextest run --cargo-metadata "$RUNNER_TEMP/metadata.json" --binaries-metadata "$RUNNER_TEMP/after.json" -E 'test(timeout_kills_the_request) | test(a_cancelled_session_generation) | test(cancelling_one_shared_request) | test(the_host_list_follows_its_files) | test(retained_request_sources_do_not_pin)' --stress-count 50 --no-fail-fast --status-level pass --success-output immediate 2>&1 | while IFS= read -r line; do printf '%s %s\n' "$(date -u +%FT%TZ)" "$line"; done | tee "$RUNNER_TEMP/fixed.log"
+      - name: Trace the host-list initial delivery
+        if: always()
+        run: |
+          set -o pipefail
+          mise exec -- cargo nextest run --cargo-metadata "$RUNNER_TEMP/metadata.json" --binaries-metadata "$RUNNER_TEMP/after.json" -E 'test(the_host_list_follows_its_files)' --stress-count 500 --no-fail-fast --status-level pass --success-output immediate 2>&1 | while IFS= read -r line; do printf '%s %s\n' "$(date -u +%FT%TZ)" "$line"; done | tee "$RUNNER_TEMP/host-list.log"
       - uses: actions/upload-artifact@v5
         if: always()
         with:
           name: probe-${{ matrix.os }}
-          path: ${{ runner.temp }}/probe.log
+          path: |
+            ${{ runner.temp }}/paired.log
+            ${{ runner.temp }}/samples.jsonl
+            ${{ runner.temp }}/summary.json
+            ${{ runner.temp }}/fixed.log
+            ${{ runner.temp }}/host-list.log

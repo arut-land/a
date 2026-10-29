@@ -39,6 +39,16 @@ impl std::ops::Deref for Lease {
     }
 }
 
+impl Drop for Lease {
+    fn drop(&mut self) {
+        // Session retention outlives this request; close admission before a
+        // successor can join the failed instance while its owner is waking.
+        if self.state.cancel.is_set() {
+            self.0.retire();
+        }
+    }
+}
+
 impl ScopedResource for Startup {
     fn ended(&self) -> ext::BoxFuture<'_, ()> {
         match &self.outcome {

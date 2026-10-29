@@ -1,7 +1,6 @@
 #![cfg(feature = "fixture")]
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
 
 use ext::host::Registry;
 use ext::testing::Rig;
@@ -213,89 +212,183 @@ fn timeout_kills_the_request_and_a_later_call_gets_a_new_process() {
         &json!({"server":"fixture","tool":"echo","arguments":{}}),
     );
     assert!(result.get("ok").is_some(), "{result}");
+    assert_eq!(
+        std::fs::read_to_string(rig.workspace().join("effects-timeout"))
+            .unwrap()
+            .lines()
+            .filter(|line| line.starts_with("start "))
+            .count(),
+        2
+    );
     finish(rig);
 }
 
-// Drive only the scoped owner on the test thread; process I/O remains on the real runtime.
-struct ScopedActors {
-    tasks: Arc<Mutex<Vec<ext::BoxFuture<'static, ()>>>>,
-    lifetimes: Arc<ext::Lifetimes>,
-}
+mod retirement {
+    use super::*;
+    use std::sync::{Arc, Mutex};
 
-impl Default for ScopedActors {
-    fn default() -> Self {
-        let tasks = Arc::new(Mutex::new(Vec::new()));
-        let queued = Arc::clone(&tasks);
-        Self {
-            tasks,
-            lifetimes: Arc::new(ext::Lifetimes::new(Arc::new(move |task| {
-                queued.lock().unwrap().push(task);
-            }))),
+    // Drive only the scoped owner on the test thread; process I/O remains on the real runtime.
+    struct ScopedActors {
+        tasks: Arc<Mutex<Vec<ext::BoxFuture<'static, ()>>>>,
+        lifetimes: Arc<ext::Lifetimes>,
+    }
+
+    impl Default for ScopedActors {
+        fn default() -> Self {
+            let tasks = Arc::new(Mutex::new(Vec::new()));
+            let queued = Arc::clone(&tasks);
+            Self {
+                tasks,
+                lifetimes: Arc::new(ext::Lifetimes::new(Arc::new(move |task| {
+                    queued.lock().unwrap().push(task);
+                }))),
+            }
         }
     }
-}
 
-impl Extension for ScopedActors {
-    const NAME: &'static str = "scoped-actors";
-    const VERSION: u32 = 1;
+    impl Extension for ScopedActors {
+        const NAME: &'static str = "scoped-actors";
+        const VERSION: u32 = 1;
 
-    fn contribute(&self, r: &mut ext::Registrar) {
-        r.provide(Arc::clone(&self.lifetimes));
+        fn contribute(&self, r: &mut ext::Registrar) {
+            r.provide(Arc::clone(&self.lifetimes));
+        }
     }
-}
 
-impl ScopedActors {
-    async fn drive<F: Future>(&self, future: F) -> F::Output {
-        let mut future = std::pin::pin!(future);
-        std::future::poll_fn(|cx| {
-            let result = future.as_mut().poll(cx);
-            self.tasks.lock().unwrap().retain_mut(|task| task.as_mut().poll(cx).is_pending());
-            result
-        }).await
+    impl ScopedActors {
+        async fn drive<F: Future>(&self, future: F) -> F::Output {
+            let mut future = std::pin::pin!(future);
+            std::future::poll_fn(|cx| {
+                let result = future.as_mut().poll(cx);
+                self.tasks
+                    .lock()
+                    .unwrap()
+                    .retain_mut(|task| task.as_mut().poll(cx).is_pending());
+                result
+            })
+            .await
+        }
     }
-}
 
-#[test]
-fn a_cancelled_session_generation_is_retired_before_its_owner_runs() {
-    use std::future::Future;
-    use std::task::{Context, Waker};
+    #[test]
+    fn a_cancelled_session_generation_is_retired_before_its_owner_runs() {
+        use std::task::{Context, Waker};
 
-    let actors = ScopedActors::default();
-    let mcp = Mcp::new(
-        vec![Server {
-            name: "fixture".parse().unwrap(),
-            description: "test server".into(),
-            transport: Transport::Stdio(vec![
-                env!("CARGO_BIN_EXE_mcp-fixture").into(),
-                "effects-retirement".into(),
-            ]),
-            env: BTreeMap::default(),
-        }],
-        Duration::from_secs(1),
-    ).unwrap();
-    let rig = Rig::new("mcp-retirement", Registry::default()
-        .with(&ext_shell::Shell::default()).unwrap()
-        .with(&actors).unwrap()
-        .with(&mcp).unwrap());
-    let cx = rig.cx();
-    let list = protocol::Json::encode(&json!({"server":"fixture"})).unwrap();
-    rt::block_on(actors.drive(rig.registry.tools().run("mcp_list", &list, None, &cx)));
+        let actors = ScopedActors::default();
+        let mcp = Mcp::new(
+            vec![Server {
+                name: "fixture".parse().unwrap(),
+                description: "test server".into(),
+                transport: Transport::Stdio(vec![
+                    env!("CARGO_BIN_EXE_mcp-fixture").into(),
+                    "effects-retirement".into(),
+                ]),
+                env: BTreeMap::default(),
+            }],
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let rig = Rig::new(
+            "mcp-retirement",
+            Registry::default()
+                .with(&ext_shell::Shell::default())
+                .unwrap()
+                .with(&actors)
+                .unwrap()
+                .with(&mcp)
+                .unwrap(),
+        );
+        let cx = rig.cx();
+        let list = protocol::Json::encode(&json!({"server":"fixture"})).unwrap();
+        rt::block_on(actors.drive(rig.registry.tools().run("mcp_list", &list, None, &cx)));
 
-    // The scoped owner is not polled again until the replacement has asked for admission.
-    assert_eq!(failed(&rig, "wait"), Failure::Timeout);
-    let echo = protocol::Json::encode(&json!({"server":"fixture","tool":"echo","arguments":{}})).unwrap();
-    let mut replacement = rig.registry.tools().run("mcp_call", &echo, None, &cx);
-    assert!(replacement.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending(),
-        "a successor must await native cleanup instead of joining the cancelled instance");
-    let called = rt::block_on(actors.drive(replacement));
-    let protocol::Outcome::Done { output: protocol::Payload::Inline(output) } = called.outcome else {
-        panic!("no typed result");
-    };
-    let result: Value = output.parse().unwrap();
-    assert!(result.get("ok").is_some(), "{result}");
-    actors.lifetimes.close();
-    rt::block_on(actors.drive(actors.lifetimes.ended()));
-    finish(rig);
+        // The scoped owner is not polled again until the replacement has asked for admission.
+        assert_eq!(failed(&rig, "wait"), Failure::Timeout);
+        let echo =
+            protocol::Json::encode(&json!({"server":"fixture","tool":"echo","arguments":{}}))
+                .unwrap();
+        let mut replacement = rig.registry.tools().run("mcp_call", &echo, None, &cx);
+        assert!(
+            replacement
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending(),
+            "a successor must await native cleanup instead of joining the cancelled instance"
+        );
+        let called = rt::block_on(actors.drive(replacement));
+        let protocol::Outcome::Done {
+            output: protocol::Payload::Inline(output),
+        } = called.outcome
+        else {
+            panic!("no typed result");
+        };
+        let result: Value = output.parse().unwrap();
+        assert!(result.get("ok").is_some(), "{result}");
+        actors.lifetimes.close();
+        rt::block_on(actors.drive(actors.lifetimes.ended()));
+        finish(rig);
+    }
+
+    #[test]
+    fn cancelling_one_shared_request_preserves_the_live_generation() {
+        use ext::Configured;
+        use std::task::{Context, Waker};
+
+        for scope in ["workspace", "user"] {
+            let root = Rig::new("mcp-shared-root", Registry::default());
+            let marker = root.workspace().join("effects-shared");
+            let argv = vec![env!("CARGO_BIN_EXE_mcp-fixture"), marker.to_str().unwrap()];
+            let settings: sys::Config = format!(
+                "[ext.mcp]\nservers=[\"fixture\"]\nfixture={}\nfixture_scope={scope:?}\nexperimental_stdio_sharing=true\ntimeout_secs=1\n",
+                serde_json::to_string(&argv).unwrap(),
+            ).parse().unwrap();
+            let mcp = Mcp::configure(&PolicySettings(settings.ext.table("mcp")))
+                .unwrap()
+                .declared_in(root.workspace())
+                .unwrap();
+            let actors = ScopedActors::default();
+            let rig = Rig::new(
+                "mcp-shared-cancel",
+                Registry::default()
+                    .with(&ext_shell::Shell::default())
+                    .unwrap()
+                    .with(&actors)
+                    .unwrap()
+                    .with(&mcp)
+                    .unwrap(),
+            );
+            let cx = rig.cx();
+            let list = protocol::Json::encode(&json!({"server":"fixture"})).unwrap();
+            rt::block_on(actors.drive(rig.registry.tools().run("mcp_list", &list, None, &cx)));
+            let input =
+                protocol::Json::encode(&json!({"server":"fixture","tool":"wait","arguments":{}}))
+                    .unwrap();
+            let mut call = rig.registry.tools().run("mcp_call", &input, None, &cx);
+            assert!(
+                call.as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            drop(call);
+            let result = rig.done(
+                "mcp_call",
+                &json!({"server":"fixture","tool":"echo","arguments":{}}),
+            );
+            assert!(result.get("ok").is_some(), "{scope}: {result}");
+            assert_eq!(
+                std::fs::read_to_string(&marker)
+                    .unwrap()
+                    .lines()
+                    .filter(|line| line.starts_with("start "))
+                    .count(),
+                1,
+                "{scope}"
+            );
+            actors.lifetimes.close();
+            rt::block_on(actors.drive(actors.lifetimes.ended()));
+            finish(rig);
+        }
+    }
 }
 
 #[test]
@@ -522,12 +615,12 @@ fn fragmented_and_adjacent_messages_preserve_exact_results() {
 
 #[test]
 fn concurrent_requests_start_once_and_reordered_replies_keep_their_owner() {
-    let rig = Arc::new(rig("multiplexed", Duration::from_secs(10)));
-    let barrier = Arc::new(std::sync::Barrier::new(128));
+    let rig = std::sync::Arc::new(rig("multiplexed", Duration::from_secs(10)));
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(128));
     let workers: Vec<_> = (0..128)
         .map(|index| {
-            let rig = Arc::clone(&rig);
-            let barrier = Arc::clone(&barrier);
+            let rig = std::sync::Arc::clone(&rig);
+            let barrier = std::sync::Arc::clone(&barrier);
             std::thread::spawn(move || {
                 barrier.wait();
                 let result = rig.done(
@@ -547,13 +640,13 @@ fn concurrent_requests_start_once_and_reordered_replies_keep_their_owner() {
         1
     );
     assert_eq!(effects.lines().filter(|l| *l == "discover").count(), 1);
-    finish(Arc::try_unwrap(rig).ok().unwrap());
+    finish(std::sync::Arc::try_unwrap(rig).ok().unwrap());
 }
 
 struct DiscoveryPeer {
     url: String,
-    requests: Arc<Mutex<Vec<Value>>>,
-    stop: Arc<std::sync::atomic::AtomicBool>,
+    requests: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -761,12 +854,12 @@ fn only_fresh_complete_lists_are_reused_and_every_page_limits_freshness() {
 #[test]
 fn concurrent_cache_demand_sends_one_list_and_notifications_invalidate_it() {
     let peer = DiscoveryPeer::new("single-flight");
-    let rig = Arc::new(peer.rig());
-    let barrier = Arc::new(std::sync::Barrier::new(32));
+    let rig = std::sync::Arc::new(peer.rig());
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(32));
     let workers: Vec<_> = (0..32)
         .map(|_| {
-            let rig = Arc::clone(&rig);
-            let barrier = Arc::clone(&barrier);
+            let rig = std::sync::Arc::clone(&rig);
+            let barrier = std::sync::Arc::clone(&barrier);
             std::thread::spawn(move || {
                 barrier.wait();
                 assert!(
@@ -818,7 +911,7 @@ fn changing_a_sessions_launch_environment_selects_a_distinct_instance() {
             .retain(|key, _| !protocol::Environment::is_secret(key));
         env.vars.insert("A_MCP_IDENTITY".into(), identity.into());
         env.vars.insert("A_MCP_CALLER".into(), identity.into());
-        cx.env = Some(Arc::new(env));
+        cx.env = Some(std::sync::Arc::new(env));
         let input = protocol::Json::encode(
             &json!({"server":"fixture","tool":"launch-context","arguments":{}}),
         )
@@ -847,12 +940,12 @@ fn changing_a_sessions_launch_environment_selects_a_distinct_instance() {
 fn overlapping_cold_consumers_never_reuse_an_uncacheable_list() {
     for mode in ["cold-missing", "cold-zero", "cold-pages"] {
         let peer = DiscoveryPeer::new(mode);
-        let rig = Arc::new(peer.rig());
-        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let rig = std::sync::Arc::new(peer.rig());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
         let workers: Vec<_> = (0..8)
             .map(|_| {
-                let rig = Arc::clone(&rig);
-                let barrier = Arc::clone(&barrier);
+                let rig = std::sync::Arc::clone(&rig);
+                let barrier = std::sync::Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     barrier.wait();
                     let result = rig.done("mcp_list", &json!({"server":"fixture"}));
@@ -1113,7 +1206,6 @@ fn a_hooked_session_cannot_reuse_an_already_admitted_shared_instance() {
 fn form_and_url_rounds_preserve_server_keys_and_state_without_restarting_the_call() {
     use protocol::{Json, QuestionAnswer, Response, Seq};
     use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
     let rig = rig("elicitation", Duration::from_secs(2));
     let cx = rig.cx();
     let input = Json::encode(&json!({"server":"fixture","tool":"ask","arguments":{}})).unwrap();
@@ -1326,7 +1418,7 @@ fn unrelated_inherited_environment_changes_do_not_invalidate_a_saved_continuatio
         .retain(|key, _| !protocol::Environment::is_secret(key));
     env.vars
         .insert("UNRELATED_INHERITED_VALUE".into(), "changed".into());
-    cx.env = Some(Arc::new(env));
+    cx.env = Some(std::sync::Arc::new(env));
     let answer = protocol::QuestionAnswer {
         question: protocol::Seq::new(1).unwrap(),
         responses: first

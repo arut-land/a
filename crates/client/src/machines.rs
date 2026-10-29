@@ -155,7 +155,11 @@ impl Sources {
         eprintln!("flake resolve start {:?}", std::time::Instant::now());
         let sources = self.clone();
         let machines = rt::unblock(&**rt, move || sources.machines()).await?;
-        eprintln!("flake machines loaded {} {:?}", machines.len(), std::time::Instant::now());
+        eprintln!(
+            "flake machines loaded {} {:?}",
+            machines.len(),
+            std::time::Instant::now()
+        );
         let resolving: Vec<_> = machines
             .iter()
             .map(|machine| {
@@ -231,7 +235,10 @@ impl Sources {
             .stderr(Stdio::null())
             .output()
             .ok()?;
-        eprintln!("flake ssh complete {host:?} {:?}", std::time::Instant::now());
+        eprintln!(
+            "flake ssh complete {host:?} {:?}",
+            std::time::Instant::now()
+        );
         output.status.success().then_some(())?;
         let text = String::from_utf8_lossy(&output.stdout);
         let value = |key: &str| {
@@ -283,7 +290,11 @@ impl Watched {
                 return;
             };
             let found = shared.sources.resolve_async(&shared.rt).await;
-            eprintln!("flake delivery {generation} current {} {:?}", shared.generation.load(Ordering::Acquire), std::time::Instant::now());
+            eprintln!(
+                "flake delivery {generation} current {} {:?}",
+                shared.generation.load(Ordering::Acquire),
+                std::time::Instant::now()
+            );
             if shared.generation.load(Ordering::Acquire) == generation {
                 (shared.sink)(found);
             }
