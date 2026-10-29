@@ -144,12 +144,20 @@ jobs:
         if: always()
         run: |
           set -o pipefail
-          mise exec -- cargo nextest run --cargo-metadata "$RUNNER_TEMP/metadata.json" --binaries-metadata "$RUNNER_TEMP/after.json" -E 'test(timeout_kills_the_request) | test(a_cancelled_session_generation) | test(cancelling_one_shared_request) | test(the_host_list_follows_its_files) | test(retained_request_sources_do_not_pin)' --stress-count 50 --no-fail-fast --status-level pass --success-output immediate 2>&1 | while IFS= read -r line; do printf '%s %s\n' "$(date -u +%FT%TZ)" "$line"; done | tee "$RUNNER_TEMP/fixed.log"
+          mise exec -- cargo nextest run --cargo-metadata "$RUNNER_TEMP/metadata.json" --binaries-metadata "$RUNNER_TEMP/after.json" -E 'test(timeout_kills_the_request) | test(a_cancelled_session_generation) | test(cancelling_one_shared_request) | test(the_host_list_follows_its_files) | test(retained_request_sources_do_not_pin)' --stress-count 50 --no-fail-fast --status-level pass --success-output immediate 2>&1 | python3 -u -c '
+          import sys, datetime
+          for line in sys.stdin:
+              print(datetime.datetime.now(datetime.timezone.utc).isoformat(), line, end="")
+          ' | tee "$RUNNER_TEMP/fixed.log"
       - name: Trace the host-list initial delivery
         if: always()
         run: |
           set -o pipefail
-          mise exec -- cargo nextest run --cargo-metadata "$RUNNER_TEMP/metadata.json" --binaries-metadata "$RUNNER_TEMP/after.json" -E 'test(the_host_list_follows_its_files)' --stress-count 500 --no-fail-fast --status-level pass --success-output immediate 2>&1 | while IFS= read -r line; do printf '%s %s\n' "$(date -u +%FT%TZ)" "$line"; done | tee "$RUNNER_TEMP/host-list.log"
+          mise exec -- cargo nextest run --cargo-metadata "$RUNNER_TEMP/metadata.json" --binaries-metadata "$RUNNER_TEMP/after.json" -E 'test(the_host_list_follows_its_files)' --stress-count 500 --no-fail-fast --status-level pass --success-output immediate 2>&1 | python3 -u -c '
+          import sys, datetime
+          for line in sys.stdin:
+              print(datetime.datetime.now(datetime.timezone.utc).isoformat(), line, end="")
+          ' | tee "$RUNNER_TEMP/host-list.log"
       - uses: actions/upload-artifact@v5
         if: always()
         with:
@@ -218,7 +226,12 @@ jobs:
           set -o pipefail
           mise exec -- cargo nextest run --cargo-metadata "$RUNNER_TEMP/metadata.json" --binaries-metadata "$RUNNER_TEMP/client.json" -E 'test(ssh_resolves_each_host)' --stress-duration 5m --no-fail-fast --status-level pass > "$RUNNER_TEMP/ssh-load.log" 2>&1 &
           load_pid=$!
-          mise exec -- cargo nextest run --cargo-metadata "$RUNNER_TEMP/metadata.json" --binaries-metadata "$RUNNER_TEMP/client.json" -E 'test(the_host_list_follows_its_files)' --stress-count 1000 --no-fail-fast --status-level pass --success-output immediate 2>&1 | tee "$RUNNER_TEMP/debug-host.log"
+          trap 'wait "$load_pid" || true' EXIT
+          mise exec -- cargo nextest run --cargo-metadata "$RUNNER_TEMP/metadata.json" --binaries-metadata "$RUNNER_TEMP/client.json" -E 'test(the_host_list_follows_its_files)' --stress-count 1000 --no-fail-fast --status-level pass --success-output immediate 2>&1 | python3 -u -c '
+          import sys, datetime
+          for line in sys.stdin:
+              print(datetime.datetime.now(datetime.timezone.utc).isoformat(), line, end="")
+          ' | tee "$RUNNER_TEMP/debug-host.log"
           wait "$load_pid"
       - uses: actions/upload-artifact@v5
         if: always()
