@@ -5,13 +5,16 @@ An immutable content node holds a new local segment and references previous
 segments and inherited cuts in the existing daemon-wide content store. Log
 admission/spawn facts retain graph roots; a collector follows node references.
 The protocol/view envelope still carries effective publication identities, and
-execution authority remains private to each session. No dependency was added.
+execution authority remains private to each session. The initial graph implementation added no dependency; the later persistent compiler dependency is measured in [persistent-compiler.md](persistent-compiler.md).
 
-**Performance acceptance remains incomplete.** The former turn-64 frame failure
-is fixed, and link-image duplication is removed. Late-turn CPU is substantially
-lower but still rises. Proposal #2, forkable prepared encoded prefixes, was not
-started because the owner's condition requires #1 to be green first. Client
-paging remains stage B; compiled-offer/catalog interning was not approved.
+The owner subsequently approved proposals #1 and #2 together. The current
+revision adds forkable prepared encoded prefixes, bounded graph cursors across
+inherited scopes and incremental admission lookup. Its repeated matrix and separate native attribution are complete; the total CPU gate remains unmet because of a measured descriptor-dependent launch cost. The sections
+below preserve the earlier measurements and their unmet gates as historical
+evidence. Client history paging remains stage B; catalog interning was not
+approved.
+
+## Historical initial graph measurement
 
 ## Method
 
@@ -181,3 +184,125 @@ The phase-1 review report and complete evidence are in the scratch directory
 above: `context-graph.review.report.md`, `measured-summary.json`,
 `measured-traffic.json`, `review-provenance.json`, and `review-completion.json`.
 No CI was dispatched. This revision is for re-review; the CPU gate is still open.
+
+## Shared prepared prefixes and final graph cursors
+
+The owner approved proposal #2 on this branch, with #1 and #2 accepted together.
+Forks now share immutable prepared byte fragments and ID maps, with a private
+mutable tail. Compiler identity includes concrete codec and wire quirks,
+model/origin preparation, semantic registration scope, tools/offers, options/body
+and fitting policy. A changed identity rebuilds authoritatively. Repaired or
+uncompiled owner tails cannot claim a settled context prefix. Parent reclaim
+releases its lease without invalidating live children. The four provider codecs
+retain recorded byte parity; no recorded provider fixtures changed.
+
+Bounded side context spends its requested exchange window across inherited
+scopes, preserves system-only model inputs and follows dependencies only in the
+requested suffix. Full-context fork_task remains full-context. Settled admission
+lookup advances only new links. Production append tests cover both fixes and
+provider replay across edits and incremental model-result boundaries.
+
+The final native suite passed 837 engine/LLM/protocol tests, with 28 skipped.
+fmt, package check, clippy -D warnings with both supported TLS variants
+separately, Windows cross-lint, rustdoc, dependency bans and release build passed.
+The FFI suite passed 28 tests after graph/cursor integration. No cancellation
+regression recurred. PROTO 40 integrates the graph format with main's MCP changes;
+wire/view outputs were generated only by their tests.
+
+This comparison uses a common product/main baseline: 61f02b5d with only 928b4442
+reversed before, and 855c100b after. Main 3a32fe61 adds only perf tooling/docs to
+the already integrated main 855d6062. Frozen source trees, patches, binary hashes
+and runner hashes are in context-final-provenance.json. There are three
+interleaved runs per arm and scale, plus three complete after 64 cases. Runtime
+provider environments are allowlisted with loopback URLs and dummy credentials.
+Only context-final-* cases enter these tables; one interrupted case was restarted
+fresh, and all completed cases were preserved. Full consumer, lifecycle and
+latency tables are in the phase report beside the raw evidence.
+
+**CPU acceptance is not met.** The raw CPU slopes below are positive, especially at wide concurrency. Required outgoing bodies are preserved and grow with full history. Independent native controls below show that send work alone does not explain the residual. Provider receive wall time is never subtracted from daemon CPU. This branch is not ready to merge; further store-file ownership is requested in the phase report.
+
+All figures are median [minimum–maximum], n=3; CPU is ms per root turn, memory MiB. Slopes are OLS over rounds 9–32 (64-run slopes9–64). No provider body receive wall time is subtracted from CPU.
+
+### Construction residency and CPU
+
+| Roots ×32 | Arm | Live malloc | RSS | Physical footprint | First4 CPU | Last4 CPU | CPU slope ms/depth |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | before | 222.41 [222.40–222.41] | 243.22 [242.80–246.30] | 235.08 [234.66–238.16] | 69.07 [68.99–71.71] | 116.97 [116.15–128.61] | 2.010 [1.781–2.221] |
+| 1 | after | 112.97 [112.97–112.97] | 163.08 [162.81–163.22] | 154.88 [154.63–155.00] | 67.85 [66.30–68.05] | 70.33 [69.96–72.77] | 0.216 [0.203–0.598] |
+| 4 | before | 872.47 [870.03–878.22] | 930.22 [923.20–936.55] | 922.53 [915.52–928.86] | 75.69 [75.63–76.31] | 146.79 [146.12–147.11] | 2.656 [2.595–2.705] |
+| 4 | after | 449.79 [449.79–449.80] | 617.61 [612.45–626.58] | 609.70 [604.53–618.67] | 74.39 [73.35–80.10] | 98.36 [97.86–103.40] | 1.042 [0.951–1.242] |
+| 8 | before | 1733.72 [1731.82–1735.93] | 1890.28 [1884.34–1892.72] | 1849.71 [1837.80–1859.30] | 80.39 [80.28–80.71] | 182.68 [182.19–188.93] | 3.869 [3.735–4.090] |
+| 8 | after | 898.75 [898.73–898.77] | 1161.31 [1160.81–1162.84] | 1129.11 [1128.55–1130.95] | 77.95 [77.78–80.68] | 133.50 [131.84–134.84] | 2.022 [1.967–2.152] |
+
+### Native CPU and required outbound body traffic
+
+| Roots | Arm | Last4 user CPU | Last4 kernel CPU | User slope | Kernel slope | Last4 body MiB | Body receive wall ms |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | before | 64.62 [64.02–70.87] | 52.35 [52.13–57.74] | 1.369 [1.266–1.496] | 0.640 [0.515–0.725] | 15.51 [15.51–15.51] | 3.39 [3.17–3.44] |
+| 1 | after | 29.28 [28.97–30.01] | 41.05 [40.99–42.75] | 0.063 [0.052–0.221] | 0.164 [0.140–0.376] | 15.51 [15.51–15.51] | 3.84 [3.77–3.88] |
+| 4 | before | 72.95 [72.84–73.09] | 73.85 [73.28–74.03] | 1.456 [1.430–1.491] | 1.199 [1.165–1.214] | 15.51 [15.51–15.51] | 11.16 [9.17–11.52] |
+| 4 | after | 36.34 [36.20–39.60] | 62.16 [61.51–63.80] | 0.214 [0.184–0.349] | 0.827 [0.767–0.893] | 15.51 [15.51–15.51] | 10.41 [10.34–10.59] |
+| 8 | before | 81.34 [80.52–83.22] | 102.17 [100.86–105.71] | 1.725 [1.621–1.807] | 2.144 [2.114–2.282] | 15.51 [15.51–15.51] | 21.17 [18.99–22.41] |
+| 8 | after | 44.56 [43.77–45.57] | 88.94 [88.07–89.27] | 0.418 [0.366–0.469] | 1.655 [1.549–1.683] | 15.51 [15.51–15.51] | 21.56 [20.57–22.99] |
+
+The receive wall interval is measured by the loopback provider after headers and summed across concurrent requests. It is neither sender CPU nor elapsed turn latency.
+
+### Three complete 64-turn cases
+
+| Metric (request_bytes in MiB) | First4 | Last4 | Slope 9–64 |
+| --- | --- | --- | --- |
+| daemon_cpu_ms | 68.23 [66.82–71.51] | 82.54 [82.38–82.86] | 0.342 [0.301–0.353] |
+| daemon_user_ms | 28.76 [28.44–30.73] | 32.37 [32.30–32.70] | 0.088 [0.074–0.092] |
+| daemon_kernel_ms | 39.47 [38.38–40.78] | 50.08 [49.84–50.50] | 0.254 [0.227–0.261] |
+| request_bytes | 1.10 [1.10–1.10] | 31.96 [31.96–31.96] | 0.514 [0.514–0.514] |
+| request_read_ms | 0.25 [0.25–0.42] | 8.83 [8.37–9.28] | 0.150 [0.142–0.151] |
+
+All three include an additional live client turn: 65 root turns and 520 tool calls, complete outcomes, warm/cold recovery and graph checks.
+
+
+## Separate native CPU attribution
+
+All values are median [minimum–maximum], n=3, ms per root turn unless stated. Three interleaved plain/instrumented controls per scale use the same final release binary and construction workload; UI attachments afterward are omitted. All outcomes and graph hashes validate. The diagnostic dylibs are scratch harnesses only. CPU inside native TCP send calls and posix_spawn is measured by thread CPU clocks, with back-to-back clock calibration subtracted. Counters cover every outgoing request body byte. This is a measured subset of networking CPU, not a claim that everything outside it is compiler CPU.
+
+| Workload | Plain total CPU slope | Profile total CPU slope | Send CPU slope | CPU outside send slope |
+| --- | --- | --- | --- | --- |
+| 1x32 | 0.223 [-0.054–0.230] | 0.296 [0.223–0.379] | 0.108 [0.101–0.110] | 0.186 [0.122–0.271] |
+| 4x32 | 0.985 [0.955–1.125] | 1.051 [0.880–1.228] | 0.130 [0.120–0.135] | 0.921 [0.760–1.093] |
+| 8x32 | 2.055 [1.939–2.209] | 2.061 [2.032–2.364] | 0.133 [0.130–0.138] | 1.928 [1.902–2.227] |
+| 1x64 | 0.369 [0.293–0.390] | 0.347 [0.342–0.382] | 0.115 [0.115–0.117] | 0.232 [0.227–0.265] |
+
+The wide residual is real. A second native interposer measured actual posix_spawn calls in three additional interleaved 8-root pairs, recording native open-file counts.
+
+| Metric | First4 | Last4 | Slope 9–32 |
+| --- | --- | --- | --- |
+| daemon_cpu_ms | 78.922 [78.323–79.096] | 134.316 [133.736–134.769] | 2.116 [1.986–2.206] |
+| spawn_ms | 3.350 [3.338–3.417] | 43.852 [43.757–44.239] | 1.490 [1.467–1.539] |
+| send_ms | 0.761 [0.724–0.770] | 4.485 [4.441–4.534] | 0.135 [0.134–0.136] |
+| other_ms | 74.861 [74.136–74.985] | 85.930 [85.012–86.571] | 0.490 [0.385–0.531] |
+| spawn_calls | 2.000 [2.000–2.000] | 2.000 [2.000–2.000] | 0.000 [0.000–0.000] |
+| daemon fds (total) | 402.000 [402.000–402.000] | 3986.000 [3986.000–3986.000] | 128.000 [127.983–128.000] |
+
+Matched profile-minus-plain total CPU deltas: first4 -0.405 [-0.413–0.628] ms; last4 1.246 [-2.901–2.357] ms; slope 0.084 [-0.194–0.098] ms/depth. The raw and calibration counters remain available in every turn record. Non-send/non-spawn residual still grows; it is not relabelled as required transmission.
+
+After construction, direct native descriptor inspection found 2,064 log.jsonl plus 2,064 log.idx handles, exactly one pair per durable session. This inspection occurred after all 32 timed rounds, outside the turn window. The process-control snapshots show growth from 79 descriptors before construction to 4,178 after round 32. The sessions are reachable; this is retained resource ownership, not an unreachable allocation leak.
+
+An isolated release probe uses the real public sys::spawn_group implementation, 64 owned child launches per process. Three fresh processes per descriptor/memory setting, interleaving 0/512 MiB resident memory and reversing descriptor order between repetitions, distinguish open-file cost from parent memory. All files are real close-on-exec handles; no product launch logic is copied into the probe. CPU is the parent probe process only; wall time includes waiting for each child.
+
+| Open files | Parent MiB | CPU ms/launch | Kernel ms/launch | Wall ms/launch |
+| --- | --- | --- | --- | --- |
+| 0 | 0 | 0.208 [0.206–0.240] | 0.201 [0.199–0.232] | 4.034 [3.437–4.214] |
+| 256 | 0 | 0.885 [0.880–0.946] | 0.877 [0.873–0.936] | 4.997 [4.773–5.874] |
+| 1024 | 0 | 2.941 [2.918–2.992] | 2.933 [2.910–2.984] | 16.774 [16.540–16.875] |
+| 4096 | 0 | 11.222 [10.990–11.450] | 11.213 [10.981–11.440] | 64.965 [64.124–65.919] |
+| 0 | 512 | 0.206 [0.206–0.208] | 0.199 [0.198–0.201] | 3.473 [3.456–3.479] |
+| 256 | 512 | 0.868 [0.865–0.875] | 0.860 [0.858–0.868] | 4.984 [4.712–5.067] |
+| 1024 | 512 | 2.932 [2.890–3.007] | 2.924 [2.882–2.998] | 16.581 [16.528–16.894] |
+| 4096 | 512 | 11.825 [11.345–12.977] | 11.815 [11.335–12.966] | 66.038 [65.321–70.490] |
+
+The process control localizes a substantial part of the remaining depth cost to launch work under descriptor pressure. The isolated probe reproduces that dependency without context encoding or a model. It does not establish that the entire residual has a single cause. Source inspection identifies Index.file and Ends.idx in crates/engine/src/store/jsonl.rs as the retained per-session file owners.
+
+**Acceptance gate: not met.** Functional 64-turn completion and all required preservation checks pass, and shared prefix ownership removes repeated inherited compilation. However, total CPU still grows beyond measured transmission. No owner waiver is assumed, and this branch is not ready to merge.
+
+**Owner-pending file allocation:** crates/engine/src/store/jsonl.rs and its real store invariant/restart tests in crates/engine/src/store/tests.rs. The proposed follow-up is operation-scoped log/index file ownership: idle history keeps offsets and source identity, active I/O owns handles, and pending durability epochs retain exactly the handles needed until flush completion. This removes descriptor pressure without limiting sessions, history, tools or recall; it avoids modifying the excluded sys process backend. Preserve append ordering, torn-tail repair, read-only state, delayed cache flushes, concurrent readers, restart and file/source identity. Likelihood/cost: the failure is deterministic in this matrix; directly measured launch growth is about 40 ms/root turn at this scale. Implementation and portable lifetime verification are estimated at 1–2 days, followed by the repeated acceptance matrix. That expected gain is not a measured fix, and further residual attribution may still be needed. No such storage change or speculative hardening was added under the current file allocation.
+
+Raw evidence: context-socket-summary.json, context-process-summary.json, spawn-native-summary.json and their per-case native counters/archives. process-attribution-provenance.json records diagnostic source/binary hashes. The full final-build provenance is context-final-provenance.json.
