@@ -7,6 +7,10 @@ on:
     - cron: '17 4 * * 1'
   workflow_dispatch:
     inputs:
+      residency:
+        description: "Complete lifecycle ownership waves (five alternating A/A rounds)"
+        default: false
+        type: boolean
       idle_charge:
         description: "Validate native idle charge and a throwaway retained allocation"
         default: false
@@ -78,7 +82,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: perf-${{ github.ref }}-${{ inputs.autostart && 'autostart' || 'measure' }}-${{ inputs.runner || 'all' }}-${{ inputs.source_ref || github.sha }}-${{ inputs.paired_ref }}-${{ inputs.build_only }}-${{ inputs.sessions }}-${{ inputs.variant || '{}' }}
+  group: perf-${{ github.ref }}-${{ inputs.autostart && 'autostart' || 'measure' }}-${{ inputs.runner || 'all' }}-${{ inputs.source_ref || github.sha }}-${{ inputs.paired_ref }}-${{ inputs.build_only }}-${{ inputs.sessions }}-${{ inputs.residency }}-${{ inputs.variant || '{}' }}
   cancel-in-progress: false
 
 env:
@@ -88,6 +92,84 @@ env:
   CARGO_BUILD_JOBS: 4
 
 jobs:
+  residency:
+    if: inputs.residency
+    name: residency (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(inputs.runner == 'linux-windows' && '["ubuntu-latest", "windows-latest"]' || inputs.runner && inputs.runner != 'all' && format('["{0}"]', inputs.runner) || '["ubuntu-latest", "ubuntu-24.04-arm", "windows-latest", "windows-11-arm", "macos-latest", "macos-15-intel"]') }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_CODEGEN_BACKEND: llvm
+      PYTHONDONTWRITEBYTECODE: 1
+      PERF_PAIRED_ROUNDS: ${{ inputs.paired_rounds || '5' }}
+    steps:
+      - name: External build directory
+        run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/tgt-residency-waves" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.harness_ref || github.sha }}
+          path: harness
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
+          path: measured
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - run: python -m pip install psutil==7.2.2
+      - name: Select native toolchain
+        working-directory: measured
+        run: |
+          python - <<'PYTHON'
+          import os, tomllib
+          targets = {
+              ('Linux', 'X64'): 'x86_64-unknown-linux-gnu',
+              ('Linux', 'ARM64'): 'aarch64-unknown-linux-gnu',
+              ('Windows', 'X64'): 'x86_64-pc-windows-msvc',
+              ('Windows', 'ARM64'): 'aarch64-pc-windows-msvc',
+              ('macOS', 'X64'): 'x86_64-apple-darwin',
+              ('macOS', 'ARM64'): 'aarch64-apple-darwin',
+          }
+          channel = tomllib.load(open('rust-toolchain.toml', 'rb'))['toolchain']['channel']
+          target = targets[os.environ['RUNNER_OS'], os.environ['RUNNER_ARCH']]
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              env.write(f'RUSTUP_TOOLCHAIN={channel}-{target}\n')
+          PYTHON
+      - working-directory: measured
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rust-src --component rustfmt --component clippy
+      - if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang mold pkg-config libssl-dev
+      - name: Native Cargo path
+        working-directory: measured
+        run: echo "$(dirname "$(rustup which cargo)")" >> "$GITHUB_PATH"
+      - name: Build and measure complete ownership waves
+        working-directory: harness
+        run: python scripts/perf/hosted.py --phase residency --source ../measured --runner '${{ matrix.runner }}' --output "$RUNNER_TEMP/residency-output"
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: residency-${{ matrix.runner }}
+          path: ${{ runner.temp }}/residency-output/*.json*
+          retention-days: 30
+      - name: Clean owned target
+        if: always()
+        working-directory: measured
+        run: |
+          cargo clean --target-dir "$CARGO_TARGET_DIR"
+          python - <<'PYTHON'
+          import os, shutil
+          shutil.rmtree(os.environ['CARGO_TARGET_DIR'], ignore_errors=True)
+          PYTHON
+
   idle-charge:
     if: inputs.idle_charge
     env:
@@ -136,7 +218,7 @@ jobs:
           path: ${{ runner.temp }}/idle-charge-output/*.json
 
   measure:
-    if: github.event_name != 'schedule' && !inputs.autostart && !inputs.idle_charge
+    if: github.event_name != 'schedule' && !inputs.autostart && !inputs.idle_charge && !inputs.residency
     name: perf (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
     # Churn workloads and twenty-round ablations need longer than the standard suite.
