@@ -26,6 +26,7 @@
 //! and a job's end reach the session as they would have. Nothing of this
 //! is logged in a session: what it waits on is the same.
 
+use std::collections::BTreeSet;
 use std::fs::File;
 
 use ext_logging::{Fact, Fault, Operation, Stop, emit};
@@ -117,7 +118,26 @@ impl Daemon {
 
     /// Whether any session works, or owns groups of the user's work.
     pub(crate) fn at_work(&self) -> bool {
-        self.has_work() || self.loaded().iter().any(|s| s.has_jobs())
+        self.refresh();
+        lock(&self.slots).at_work()
+    }
+
+    /// Reconsiders only sessions changed since this upgrade's last preflight.
+    pub(crate) async fn handover_ready(&self, refused: &mut BTreeSet<SessionId>) -> bool {
+        let changed = lock(&self.slots).handover_changed();
+        let retry = !changed.is_empty();
+        for (id, session) in changed {
+            let blocked = match session {
+                Some(session) => session.handable().await.is_err(),
+                None => false,
+            };
+            if blocked {
+                refused.insert(id);
+            } else {
+                refused.remove(&id);
+            }
+        }
+        retry && refused.is_empty()
     }
 
     /// Freezes every loaded session, then commits them all: the groups

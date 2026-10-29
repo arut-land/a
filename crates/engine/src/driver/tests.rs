@@ -373,6 +373,7 @@ impl Fixture {
                 daemon: daemon.clone(),
             }),
             slots: Mutex::default(),
+            visited: AtomicUsize::new(0),
             admission: Mutex::new(true),
             clients: AtomicUsize::new(0),
             pulse: rt::Notify::new(),

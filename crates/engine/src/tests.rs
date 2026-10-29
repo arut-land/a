@@ -1172,7 +1172,10 @@ fn watchers_are_sent_the_session_list_as_it_changes() {
     settle(&daemon);
     daemon.publish_list();
     seen.extend(std::iter::from_fn(|| watcher.try_next()).map(decode));
-    assert!(seen.windows(2).all(|lists| lists[0] != lists[1]));
+    assert!(
+        seen.windows(2).all(|lists| lists[0] != lists[1]),
+        "{seen:#?}"
+    );
     daemon.publish_list();
     assert!(watcher.try_next().is_none(), "only changes are sent");
     stop.set();
@@ -2620,3 +2623,93 @@ fn a_handed_group_no_session_takes_up_is_killed_as_the_daemon_loads() {
 }
 
 mod scoped_processes;
+
+#[test]
+fn a_supervisor_pulse_visits_only_changed_or_expired_sessions() {
+    let (root, home) = home("supervisor-visits");
+    let config = echo();
+    let daemon = Daemon::load(&home, &config).unwrap();
+    let mut ids = Vec::new();
+    for _ in 0..32 {
+        let attachment = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
+        attachment.session().barrier();
+        ids.push(attachment.session().id);
+    }
+    settle(&daemon);
+    daemon.supervise_ready(config.hibernate, daemon.shared.rt.now());
+    assert_eq!(
+        super::lock(&daemon.slots).handover_changed().len(),
+        ids.len()
+    );
+    let attachment = daemon.attach_to(&Target::Id(ids[0]), PathBuf::new).unwrap();
+    attachment.session().barrier();
+    drop(attachment);
+    let before = daemon.visited.load(std::sync::atomic::Ordering::Relaxed);
+    let next = daemon.supervise_ready(config.hibernate, daemon.shared.rt.now());
+    let visited = daemon.visited.load(std::sync::atomic::Ordering::Relaxed) - before;
+    assert_eq!(
+        visited, 1,
+        "a pulse must visit the changed session, not its idle peers"
+    );
+    let changed = super::lock(&daemon.slots).handover_changed();
+    assert_eq!(
+        changed.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        [ids[0]]
+    );
+    assert!(super::lock(&daemon.slots).handover_changed().is_empty());
+    assert_eq!(
+        daemon.supervise_ready(config.hibernate, daemon.shared.rt.now()),
+        next
+    );
+    assert_eq!(
+        daemon.visited.load(std::sync::atomic::Ordering::Relaxed) - before,
+        1
+    );
+    drop(daemon);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn activity_replaces_its_deadline_and_only_expiry_unloads_the_session() {
+    let (root, home) = home("residency-deadlines");
+    let config = echo();
+    let daemon = Daemon::load(&home, &config).unwrap();
+    let attachment = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
+    let id = attachment.session().id;
+    attachment.session().barrier();
+    drop(attachment);
+    let first = daemon
+        .supervise_ready(config.hibernate, daemon.shared.rt.now())
+        .unwrap();
+    assert_eq!(super::lock(&daemon.slots).scheduled(), 1);
+    let attachment = daemon.attach_to(&Target::Id(id), PathBuf::new).unwrap();
+    assert!(daemon.supervise_ready(config.hibernate, first).is_none());
+    assert_eq!(super::lock(&daemon.slots).scheduled(), 0);
+    assert!(daemon.slot(id).unwrap().live().is_some());
+    drop(attachment);
+    let second = daemon
+        .supervise_ready(config.hibernate, daemon.shared.rt.now())
+        .unwrap();
+    assert!(second > first);
+    for _ in 0..32 {
+        let attachment = daemon.attach_to(&Target::Id(id), PathBuf::new).unwrap();
+        drop(attachment);
+        daemon.supervise_ready(config.hibernate, daemon.shared.rt.now());
+        assert_eq!(super::lock(&daemon.slots).scheduled(), 1);
+    }
+    let deadline = daemon.supervise_ready(config.hibernate, first).unwrap();
+    assert!(daemon.slot(id).unwrap().live().is_some());
+    assert!(daemon.supervise_ready(config.hibernate, deadline).is_none());
+    assert!(daemon.loaded().is_empty());
+    if let Some(ended) = daemon.slot(id).unwrap().ending() {
+        rt::block_on(ended.wait());
+    }
+    daemon.slot(id).unwrap().ending();
+    assert_eq!(super::lock(&daemon.slots).scheduled(), 0);
+    let reloaded = daemon.attach_to(&Target::Id(id), PathBuf::new).unwrap();
+    assert_eq!(reloaded.session().id, id);
+    assert_eq!(daemon.loaded().len(), 1);
+    drop(reloaded);
+    drop(daemon);
+    std::fs::remove_dir_all(root).unwrap();
+}

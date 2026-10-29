@@ -230,9 +230,9 @@ fn disconnect_unregisters_session_watches_without_a_later_publication() {
     peer.recv();
     peer.send(&ClientMsg::WatchSessions);
     assert!(matches!(peer.recv(), DaemonMsg::Sessions { .. }));
-    assert!(!lock(&fixture.daemon.watchers).0.is_empty());
+    assert!(!lock(&fixture.daemon.watchers).is_empty());
     drop(peer);
-    assert!(lock(&fixture.daemon.watchers).0.is_empty());
+    assert!(lock(&fixture.daemon.watchers).is_empty());
 }
 
 #[test]

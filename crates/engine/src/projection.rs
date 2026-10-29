@@ -384,10 +384,16 @@ impl Actor {
     pub(super) fn publish(&mut self) {
         let seq = self.live.frames.seq();
         let activity = self.core.ledger().activity();
-        {
+        let changed = {
             let mut summary = lock(&self.live.summary);
+            let changed = summary.entries != seq || summary.activity != activity;
             summary.entries = seq;
             summary.activity = activity;
+            changed
+        };
+        if changed && let Some(daemon) = self.live.session.shared.daemon.upgrade() {
+            daemon.changed(self.live.id);
+            daemon.pulse.notify();
         }
         let current = self.current_activity();
         if self.projection.published_activity == current {

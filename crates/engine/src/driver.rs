@@ -863,6 +863,7 @@ impl Live {
             attached: AtomicUsize::new(0),
             last_active: Mutex::new(Instant::now()),
             summary: Mutex::new(SessionSummary {
+                entries: loaded.seq,
                 read_only,
                 ..summary(header, core.ledger())
             }),
@@ -1083,15 +1084,27 @@ impl Live {
 
     /// How long the session has had no attachments, no work and no jobs.
     pub fn idle_for(&self) -> std::time::Duration {
-        if self.attached.load(Ordering::SeqCst) > 0 || self.has_work() || self.has_jobs() {
-            return std::time::Duration::ZERO;
+        self.residency_state()
+            .idle_since
+            .map_or(std::time::Duration::ZERO, |since| since.elapsed())
+    }
+
+    pub(super) fn residency_state(&self) -> crate::residency::State {
+        let busy = self.has_work();
+        let jobs = self.has_jobs();
+        let idle_since = (self.attached.load(Ordering::SeqCst) == 0 && !busy && !jobs)
+            .then(|| *lock(&self.last_active));
+        crate::residency::State {
+            busy,
+            jobs,
+            idle_since,
         }
-        lock(&self.last_active).elapsed()
     }
 
     fn touch(&self) {
         *lock(&self.last_active) = Instant::now();
         if let Some(daemon) = self.session.shared.daemon.upgrade() {
+            daemon.changed(self.id);
             daemon.pulse.notify();
         }
     }
@@ -1996,6 +2009,10 @@ impl Actor {
             role,
             lease: Arc::clone(&process),
         });
+        if let Some(daemon) = session.shared.daemon.upgrade() {
+            daemon.changed(session.id);
+            daemon.jobs.notify();
+        }
         let fence = session.fence.load(Ordering::SeqCst);
         self.live.session.spawn_work(
             WorkId::Job(Arc::as_ptr(&process).cast::<()>() as usize),
@@ -2027,6 +2044,7 @@ impl Actor {
                     lock(&session.jobs).retain(|job| !Arc::ptr_eq(&job.lease, &process));
                     session.changed.notify();
                     if let Some(daemon) = session.shared.daemon.upgrade() {
+                        daemon.changed(session.id);
                         daemon.jobs.notify();
                     }
                 })
