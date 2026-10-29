@@ -267,7 +267,7 @@ pub(crate) struct Input {
     /// go to `instructions` if they lead.
     open: Vec<Value>,
     /// The system texts lifted to `instructions`.
-    lifted: Vec<String>,
+    lifted: conversation::SharedList<String>,
     /// How many items settled.
     settled: usize,
     /// Whether an item that is not a system message came.
@@ -280,7 +280,7 @@ impl Input {
             cx,
             custom: rpds::RedBlackTreeSetSync::new_sync(),
             open: Vec::new(),
-            lifted: Vec::new(),
+            lifted: conversation::SharedList::default(),
             settled: 0,
             begun: false,
         }
@@ -319,9 +319,14 @@ impl Input {
             let message = format!("a Responses request needs at least one {what}");
             return Err(Error::unsupported(message));
         }
-        let mut lifted = self.lifted;
-        lifted.retain(|text| !text.is_empty());
-        Ok((lifted.join("\n\n"), self.open))
+        let lifted = self
+            .lifted
+            .iter()
+            .filter(|text| !text.is_empty())
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        Ok((lifted, self.open))
     }
 }
 
@@ -405,7 +410,7 @@ impl Fold for Input {
             Message::System(system) => {
                 let text = system.text();
                 if self.cx.instructions == Instructions::All {
-                    self.lifted.push(text.trim().to_owned());
+                    self.lifted.extend([text.trim().to_owned()]);
                 } else {
                     let text = TextPart {
                         text: &text,
@@ -604,5 +609,39 @@ fn reasoning(model: &str, effort: Option<Effort>) -> Option<Value> {
         (Some(Effort::None), _) => Some(json!({"effort": "none"})),
         (Some(effort), _) => Some(json!({"effort": effort.as_str(), "summary": "auto"})),
         (None, Some(true)) => Some(json!({"summary": "auto"})),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_fork_shares_its_settled_instruction_atoms() {
+        let mut fold = Input::new(Cx {
+            stateless: true,
+            quirks: super::super::Quirks::OPENAI,
+            instructions: Instructions::Leading,
+        });
+        let mut out = Settled::default();
+        for (at, message) in [
+            Message::system("shared instruction"),
+            Message::user("start"),
+            Message::assistant("answer"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            fold.push(at, message, &mut out).unwrap();
+        }
+        let fork = fold.clone();
+        assert!(!fold.lifted.is_empty());
+        assert!(
+            std::ptr::eq(
+                fold.lifted.iter().next().unwrap(),
+                fork.lifted.iter().next().unwrap()
+            ),
+            "fork copied settled instruction atoms"
+        );
     }
 }

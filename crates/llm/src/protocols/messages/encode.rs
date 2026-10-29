@@ -400,7 +400,7 @@ pub(super) struct Turns {
     /// Whether the model takes mid-conversation system messages.
     cx: (bool, Quirks),
     /// The top-level system blocks.
-    system: Vec<Value>,
+    system: conversation::SharedList<Value>,
     follows: Option<bool>,
     /// The messages since the turns that settled.
     open: Vec<Message>,
@@ -425,7 +425,7 @@ impl Turns {
     pub(super) fn new(mid: bool, quirks: Quirks) -> Self {
         Self {
             cx: (mid, quirks),
-            system: Vec::new(),
+            system: conversation::SharedList::default(),
             follows: None,
             open: Vec::new(),
             container: None,
@@ -447,7 +447,7 @@ impl Turns {
         });
         let messages = messages.collect();
         Ok(Ended {
-            system: self.system,
+            system: self.system.into(),
             messages,
             container: container(&self.open).or(self.container),
             markers: self.markers,
@@ -720,6 +720,30 @@ mod tests {
     use crate::Meta;
     use crate::protocol::Provider;
 
+    #[test]
+    fn a_fork_shares_its_settled_instruction_atoms() {
+        let mut fold = Turns::new(false, Quirks::ANTHROPIC);
+        let mut out = Settled::default();
+        for (at, message) in [
+            Message::system("shared instruction"),
+            Message::user("start"),
+            Message::assistant("answer"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            fold.push(at, message, &mut out).unwrap();
+        }
+        let fork = fold.clone();
+        assert!(!fold.system.is_empty());
+        assert!(
+            std::ptr::eq(
+                fold.system.iter().next().unwrap(),
+                fork.system.iter().next().unwrap()
+            ),
+            "fork copied settled instruction atoms"
+        );
+    }
     #[test]
     fn placed_system_messages_do_not_reserialize_settled_turns() {
         let provider = Provider::new(

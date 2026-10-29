@@ -18,6 +18,34 @@ use crate::prepare::Prepare;
 use crate::protocol::Target;
 use crate::spec::{Message, SmolStr};
 
+/// Settled instruction atoms share their storage when a compiler forks.
+#[derive(Clone, Default)]
+pub(crate) struct SharedList<T>(rpds::VectorSync<Arc<T>>);
+
+impl<T> SharedList<T> {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &T> {
+        self.0.iter().map(Arc::as_ref)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl<T> Extend<T> for SharedList<T> {
+    fn extend<I: IntoIterator<Item = T>>(&mut self, items: I) {
+        for item in items {
+            self.0.push_back_mut(Arc::new(item));
+        }
+    }
+}
+
+impl<T: Clone> From<SharedList<T>> for Vec<T> {
+    fn from(items: SharedList<T>) -> Self {
+        items.iter().cloned().collect()
+    }
+}
+
 /// Keep the current target and one alternate without unbounded cache growth.
 const KEPT: usize = 2;
 

@@ -124,7 +124,7 @@ pub(super) struct Contents {
     open: Vec<(Role, Vec<Value>)>,
     /// Gemini takes system text only in its instruction, so a later system
     /// message joins the leading one.
-    system: Vec<Value>,
+    system: conversation::SharedList<Value>,
 }
 
 impl Contents {
@@ -136,7 +136,7 @@ impl Contents {
                 quirks,
             },
             open: Vec::new(),
-            system: Vec::new(),
+            system: conversation::SharedList::default(),
         }
     }
 
@@ -161,7 +161,7 @@ impl Contents {
         if self.cx.thought_replay == ThoughtReplay::CurrentTurn {
             drop_finished_signatures(&mut contents);
         }
-        (contents, self.system)
+        (contents, self.system.into())
     }
 }
 
@@ -218,7 +218,7 @@ impl Contents {
             Message::System(text) => {
                 let text = text.text();
                 if !text.trim().is_empty() {
-                    self.system.push(text_part(&text));
+                    self.system.extend([text_part(&text)]);
                 }
             }
             Message::User(user) => {
@@ -538,6 +538,30 @@ pub(crate) fn body(
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_fork_shares_its_settled_instruction_atoms() {
+        let mut fold = Contents::new("gemini-2.5-pro", super::super::Quirks::GEMINI);
+        let mut out = Settled::default();
+        for (at, message) in [
+            Message::system("shared instruction"),
+            Message::user("start"),
+            Message::assistant("answer"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            fold.push(at, message, &mut out).unwrap();
+        }
+        let fork = fold.clone();
+        assert!(!fold.system.is_empty());
+        assert!(
+            std::ptr::eq(
+                fold.system.iter().next().unwrap(),
+                fork.system.iter().next().unwrap()
+            ),
+            "fork copied settled instruction atoms"
+        );
+    }
     #[test]
     fn signatures_require_canonical_padded_standard_base64() {
         for signature in ["Zg==", "Zm8=", "Zm9v"] {
