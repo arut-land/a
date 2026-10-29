@@ -1440,6 +1440,7 @@ mod identity_tests {
         let original = FileIdentity::try_from(&file).unwrap();
         assert_eq!(original, identity(&path).unwrap());
         fs::write(&fresh, "new").unwrap();
+        fs::rename(&path, dir.path().join("old")).unwrap();
         replace(&fresh, &path).unwrap();
         assert_eq!(original, FileIdentity::try_from(&file).unwrap());
         assert_ne!(original, identity(&path).unwrap());
