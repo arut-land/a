@@ -5,8 +5,6 @@
 //! each older one out with a note, its other parts as they were. Nothing is
 //! dropped from the conversation itself: only this request leaves them out.
 
-use std::borrow::Cow;
-
 use crate::error::Error;
 use crate::http::Payload;
 use crate::protocol::Encoded;
@@ -60,7 +58,8 @@ pub fn fit(
     mut encode: impl FnMut(&Request) -> Result<Encoded, Error>,
 ) -> Result<(Encoded, Payload), Error> {
     let mut remaining = request.messages.images();
-    let mut fitted = Cow::Borrowed(request);
+    let mut fitted = request.clone();
+    fitted.messages.fitting(limits);
     let mut at = 0;
     loop {
         if remaining <= limits.images {
@@ -70,7 +69,7 @@ pub fn fit(
                 return Ok((encoded, payload));
             }
         }
-        let messages = fitted.to_mut().messages.canonical_mut()?;
+        let messages = fitted.messages.canonical_mut()?;
         while images(&messages[at]) == 0 {
             at += 1;
         }

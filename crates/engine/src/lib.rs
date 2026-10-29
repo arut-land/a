@@ -798,6 +798,7 @@ impl Daemon {
         input: String,
         env: Option<Arc<Environment>>,
         intent: Json,
+        seed: Option<driver::prefix::Seed>,
     ) -> io::Result<()> {
         let admitted = driver::spawn::SpawnIntent::from_json(&intent).map_err(io::Error::other)?;
         let mut budget = admitted.request.budget;
@@ -806,6 +807,9 @@ impl Daemon {
             .saturating_sub(admitted.admitted_at.elapsed().unwrap_or_default());
         let live = self.owned_conversation(header, intent, None).await?;
         if !live.has_input() {
+            if let Some(seed) = seed {
+                live.seed_prefix(seed);
+            }
             if let Some(env) = env {
                 live.set_env(env)?;
             }

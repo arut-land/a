@@ -106,6 +106,7 @@ fn is_response(part: &Value) -> bool {
 /// What a conversation's contents read besides its messages.
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct Cx {
+    quirks: super::Quirks,
     model: SmolStr,
     thought_replay: ThoughtReplay,
 }
@@ -127,11 +128,12 @@ pub(super) struct Contents {
 }
 
 impl Contents {
-    pub(super) fn new(model: &str, thought_replay: ThoughtReplay) -> Self {
+    pub(super) fn new(model: &str, quirks: super::Quirks) -> Self {
         Self {
             cx: Cx {
                 model: model.into(),
-                thought_replay,
+                thought_replay: quirks.thought_replay,
+                quirks,
             },
             open: Vec::new(),
             system: Vec::new(),
@@ -256,7 +258,7 @@ pub(super) fn contents(
     messages: &[Message],
     model: &str,
 ) -> Result<(Vec<Value>, Vec<Value>), Error> {
-    let mut contents = Contents::new(model, ThoughtReplay::All);
+    let mut contents = Contents::new(model, super::Quirks::default());
     for (at, message) in messages.iter().enumerate() {
         contents.take(at, message)?;
     }
@@ -499,8 +501,8 @@ pub(crate) fn body(
     request: &Request,
 ) -> Result<Encoded, Error> {
     let model = target.model;
-    let contents = Contents::new(model, gemini.quirks.thought_replay);
-    let (contents, settled) = conversation::fold(&request.messages, target, contents)?;
+    let contents = Contents::new(model, gemini.quirks);
+    let (contents, settled) = conversation::fold(request, target, contents)?;
     let (tail, system) = contents.finish();
     let mut options = request.options_for(PROTOCOL);
     let declared =
@@ -510,7 +512,7 @@ pub(crate) fn body(
     let tools = (declared.is_some() || !hosted.is_empty()).then(|| History {
         key: "tools",
         head: Vec::new(),
-        settled: declared.map_or_default(|run| run.to_vec()),
+        settled: declared.map_or_default(|run| run.to_vec()).into(),
         tail: hosted,
         wrap: Some((r#"{"functionDeclarations":["#, "]}")),
     });

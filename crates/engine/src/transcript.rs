@@ -27,6 +27,9 @@ pub struct Transcript {
     /// Where the next context message goes: after the system prompt and
     /// the context before it.
     context: usize,
+    context_encoded: bool,
+    seeded_root: Option<protocol::BlobId>,
+    context_cut: Option<u64>,
     /// The model's id and the tool of each call the model made and that is
     /// not yet answered, by seq.
     calls: HashMap<CallId, (String, String)>,
@@ -36,7 +39,7 @@ pub struct Transcript {
     answered: Vec<CallId>,
     /// What is queued and not taken up, by seq: the model reads it once
     /// it is, where it is taken.
-    waiting: HashMap<Seq, Waiting>,
+    waiting: rpds::RedBlackTreeMapSync<Seq, Arc<Waiting>>,
     /// Tools awaiting their final detached or job completion.
     tools: HashMap<CallId, String>,
     /// Calls that went on in the background: the result logged for one
@@ -57,6 +60,7 @@ pub struct Transcript {
 }
 
 /// Input waiting to be taken up.
+#[derive(Clone)]
 enum Waiting {
     /// The user's, as it was given: rendered once it is known who takes it.
     Input(Segments, Mode),
@@ -400,10 +404,13 @@ impl Transcript {
         Ok(transcript)
     }
 
-    fn empty(registry: Arc<Registry>, system: &str, places: &Places) -> Self {
+    pub(crate) fn empty(registry: Arc<Registry>, system: &str, places: &Places) -> Self {
         let messages = Messages::from_iter((!system.is_empty()).then(|| Message::system(system)));
         Self {
             context: messages.len(),
+            context_encoded: false,
+            seeded_root: None,
+            context_cut: None,
             messages,
             fault: None,
             context_exchanges: None,
@@ -411,7 +418,7 @@ impl Transcript {
             model_only: false,
             calls: HashMap::new(),
             answered: Vec::new(),
-            waiting: HashMap::new(),
+            waiting: rpds::RedBlackTreeMapSync::new_sync(),
             tools: HashMap::new(),
             detached: HashSet::new(),
             jobs: HashSet::new(),
@@ -423,10 +430,83 @@ impl Transcript {
         }
     }
 
+    pub(crate) fn fork_tail(&self, registry: Arc<Registry>) -> Self {
+        Self {
+            calls: self.calls.clone(),
+            answered: self.answered.clone(),
+            waiting: self.waiting.clone(),
+            tools: self.tools.clone(),
+            detached: self.detached.clone(),
+            jobs: self.jobs.clone(),
+            streams: self.streams.clone(),
+            through: self.through,
+            ..Self::empty(registry, "", &self.places)
+        }
+    }
+
+    pub(crate) fn normalize_context(&mut self) {
+        self.retain();
+        let mut tail = Self::empty(Arc::clone(&self.registry), "", &self.places);
+        tail.messages = std::mem::take(&mut self.messages);
+        self.messages = tail.into_context();
+        self.context = self.context.min(self.messages.len());
+        self.context_cut = Some(self.through);
+    }
+
+    pub(crate) fn seeded(
+        registry: Arc<Registry>,
+        places: &Places,
+        seed: crate::driver::prefix::Seed,
+    ) -> Self {
+        let mut transcript = Self::empty(registry, "", places);
+        transcript.resident = seed.prefix.into();
+        transcript.messages = seed.tail;
+        transcript.context = transcript.messages.len();
+        transcript.seeded_root = Some(seed.root);
+        transcript
+    }
+
+    pub(crate) fn replay_seeded(
+        entries: &[Entry],
+        registry: Arc<Registry>,
+        system: &str,
+        places: &Places,
+        seed: crate::driver::prefix::Seed,
+    ) -> io::Result<Self> {
+        let mut transcript = Self::seeded(Arc::clone(&registry), places, seed);
+        if entries.iter().all(|entry| transcript.apply(entry, None)) {
+            return Ok(transcript);
+        }
+        Self::replay(
+            |each| {
+                for entry in entries {
+                    each(entry);
+                }
+                Ok(())
+            },
+            registry,
+            system,
+            places,
+        )
+    }
+
     /// Folds entry `e`. `fresh` is the message of the reply this daemon
     /// just had, which `e` stores: taken as it is rather than read again.
     pub fn apply(&mut self, e: &Entry, fresh: Option<Assistant>) -> bool {
         self.retain();
+        if let (Some(root), Body::Spawned { intent }) = (self.seeded_root, &e.body) {
+            if protocol::publication::SpawnImage::from_json(intent)
+                .ok()
+                .and_then(|spawn| spawn.image.root)
+                .is_none_or(|image| image.id != root)
+            {
+                return false;
+            }
+            self.seeded_root = None;
+            self.through = e.seq.get();
+            self.last = e.seq.get();
+            return true;
+        }
         if !self.accepts(e) {
             return false;
         }
@@ -474,18 +554,26 @@ impl Transcript {
         self.last = seq.get();
     }
 
+    fn take_waiting(&mut self, seq: Seq) -> Option<Waiting> {
+        let waiting = self.waiting.get(&seq).cloned()?;
+        self.waiting.remove_mut(&seq);
+        Some(Arc::unwrap_or_clone(waiting))
+    }
+
     fn apply_input(&mut self, seq: Seq, value: ContextValue, fresh: Option<Assistant>) {
         let message = match value {
             ContextValue::User(text) => Message::user(text),
             ContextValue::Queued(segments, mode) => {
-                self.waiting.insert(seq, Waiting::Input(segments, mode));
+                self.waiting
+                    .insert_mut(seq, Arc::new(Waiting::Input(segments, mode)));
                 return;
             }
             ContextValue::Inbox(id, text) => {
-                self.waiting.insert(seq, Waiting::Inbox(id, text));
+                self.waiting
+                    .insert_mut(seq, Arc::new(Waiting::Inbox(id, text)));
                 return;
             }
-            ContextValue::Taken(input) => match self.waiting.remove(&input) {
+            ContextValue::Taken(input) => match self.take_waiting(input) {
                 Some(waiting) if self.model_only => {
                     // As the side-thread runner reads it: what was given,
                     // untagged.
@@ -523,7 +611,7 @@ impl Transcript {
                 Some(waiting) => Message::user(waiting.text(&self.places)),
                 None => return,
             },
-            ContextValue::Into(input, call) => match self.waiting.remove(&input) {
+            ContextValue::Into(input, call) => match self.take_waiting(input) {
                 Some(waiting) => match self.join_result(call, waiting.text(&self.places)) {
                     Ok(()) => {
                         self.last = seq.get();
@@ -624,7 +712,7 @@ impl Transcript {
     fn queue(&mut self, seq: Seq, value: ContextValue) {
         let text = match value {
             ContextValue::Withdrawn(input) => {
-                self.waiting.remove(&input);
+                self.waiting.remove_mut(&input);
                 return;
             }
             ContextValue::Detached(call) => {
@@ -650,7 +738,7 @@ impl Transcript {
             }
             _ => return,
         };
-        self.waiting.insert(seq, Waiting::Own(text));
+        self.waiting.insert_mut(seq, Arc::new(Waiting::Own(text)));
     }
 
     /// What the model reads of the outcome of call `call`, which went on
@@ -759,15 +847,30 @@ impl Transcript {
     }
 
     pub(super) fn retain(&mut self) {
+        let previous = self.messages.len();
         self.resident.retain(&mut self.messages);
+        let removed = previous - self.messages.len();
+        self.context_encoded |= removed > self.context;
+        self.context = self.context.saturating_sub(removed);
     }
 
     pub(super) fn accepts(&self, entry: &Entry) -> bool {
+        if self.context_cut.is_some_and(|boundary| match entry.body {
+            Body::ToolResult { call, .. }
+            | Body::Take {
+                into: Some(call), ..
+            } => call.get() <= boundary,
+            Body::Edit { .. } => true,
+            _ => false,
+        }) {
+            return false;
+        }
         if !self.resident.has_prefix() {
             return true;
         }
         match entry.body {
-            Body::Context { .. } | Body::Spawned { .. } | Body::Edit { .. } => false,
+            Body::Context { .. } => !self.context_encoded,
+            Body::Spawned { .. } | Body::Edit { .. } => false,
             Body::ToolResult { .. } | Body::Take { into: Some(_), .. } => !self.messages.is_empty(),
             _ => true,
         }
@@ -1274,5 +1377,39 @@ mod tests {
                 .any(|part| matches!(part, llm::UserPart::Text(text) if text.text == "later"))
         );
         std::hint::black_box(prepared.origin());
+    }
+    #[test]
+    fn a_prefix_checkpoint_never_copies_unrequested_pending_input() {
+        let registry = Arc::new(Registry::default());
+        let mut transcript = Transcript::empty(Arc::clone(&registry), "", &Places::default());
+        let seq = Seq::new(1).unwrap();
+        assert!(transcript.apply(
+            &Entry::new(
+                seq,
+                Epoch(0),
+                Body::Input {
+                    segments: "pending input".repeat(400_000).into(),
+                    mode: Mode::Queue,
+                    taken: false,
+                    origin: None,
+                    force: false,
+                }
+            ),
+            None
+        ));
+        let checkpoint = transcript.fork_tail(registry);
+        let payload = |waiting: &Waiting| {
+            let Waiting::Input(segments, _) = waiting else {
+                panic!("pending input")
+            };
+            let Segment::Text(text) = &segments.0[0] else {
+                panic!("typed segment")
+            };
+            text.as_ptr()
+        };
+        assert_eq!(
+            payload(transcript.waiting.get(&seq).unwrap()),
+            payload(checkpoint.waiting.get(&seq).unwrap())
+        );
     }
 }

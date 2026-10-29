@@ -635,7 +635,7 @@ pub(super) fn body(
             .map(str::to_owned)
             .collect(),
     };
-    let (wire, settled) = conversation::fold(&request.messages, target, Wire::new(ctx))?;
+    let (wire, settled) = conversation::fold(request, target, Wire::new(ctx))?;
     // A format waits for the first tool result unless the host takes both
     // at once, so the model can still call a tool.
     let answered = wire.answered;

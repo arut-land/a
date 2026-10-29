@@ -60,6 +60,7 @@ fn foreign<'a>(reasoning: &'a Reasoning, origin: &Origin) -> Option<Thought<'a>>
 #[derive(Clone, Default)]
 pub(crate) struct Prepare {
     ids: Ids,
+    repaired: bool,
     /// Calls awaiting results, in call order: (id, name).
     pending: Vec<(SmolStr, SmolStr)>,
     /// The last tool message, held while calls wait whose error results
@@ -72,6 +73,10 @@ pub(crate) struct Prepare {
 }
 
 impl Prepare {
+    pub(crate) fn closed(&self) -> bool {
+        self.pending.is_empty() && !self.repaired
+    }
+
     /// Passes `message` on to `fold` as `target` takes it, with what it
     /// releases; what the fold settles goes to `out`.
     pub(crate) fn push(
@@ -167,6 +172,7 @@ impl Prepare {
         if self.pending.is_empty() {
             return Ok(());
         }
+        self.repaired = true;
         let results = self.pending.drain(..).map(|(id, name)| ToolResult {
             id,
             name,
@@ -264,10 +270,8 @@ struct Into<'a> {
 
 #[derive(Clone, Default)]
 struct Ids {
-    /// Sorted by the id renamed, as `taken` is sorted: sets this small
-    /// cost less code sorted than hashed.
-    renamed: Vec<(SmolStr, SmolStr)>,
-    taken: Vec<SmolStr>,
+    renamed: rpds::RedBlackTreeMapSync<SmolStr, SmolStr>,
+    taken: rpds::RedBlackTreeSetSync<SmolStr>,
 }
 
 impl Ids {
@@ -290,28 +294,20 @@ impl Ids {
         }
         let fitted = SmolStr::from(fitted);
         self.take(fitted.clone());
-        let at = self.renamed.partition_point(|(held, _)| held < id);
-        self.renamed.insert(at, (id.clone(), fitted.clone()));
+        self.renamed.insert_mut(id.clone(), fitted.clone());
         fitted
     }
 
     fn renamed(&self, id: &str) -> Option<SmolStr> {
-        let at = self
-            .renamed
-            .binary_search_by(|(held, _)| held.as_str().cmp(id));
-        at.ok().map(|at| self.renamed[at].1.clone())
+        self.renamed.get(id).cloned()
     }
 
     fn taken(&self, id: &str) -> bool {
-        self.taken
-            .binary_search_by(|held| held.as_str().cmp(id))
-            .is_ok()
+        self.taken.contains(id)
     }
 
     fn take(&mut self, id: SmolStr) {
-        if let Err(at) = self.taken.binary_search(&id) {
-            self.taken.insert(at, id);
-        }
+        self.taken.insert_mut(id);
     }
 }
 

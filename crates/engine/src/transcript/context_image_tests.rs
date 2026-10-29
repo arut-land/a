@@ -443,12 +443,11 @@ fn provider_state_and_publication_identity_survive_normalization() {
     );
 }
 
-#[test]
-fn incremental_graph_cuts_preserve_provider_bytes_across_segment_edits() {
+fn recorded_provider_cases() -> [(llm::Provider, &'static str); 4] {
     use llm::protocols::{chat, gemini, messages, responses};
 
     let url = "http://127.0.0.1:9";
-    let cases = [
+    [
         (
             llm::Provider::new(
                 "deepseek",
@@ -485,8 +484,12 @@ fn incremental_graph_cuts_preserve_provider_bytes_across_segment_edits() {
             ),
             "gemini/history_survival_matrix/streaming.yaml",
         ),
-    ];
-    for (provider, cassette) in cases {
+    ]
+}
+
+#[test]
+fn incremental_graph_cuts_preserve_provider_bytes_across_segment_edits() {
+    for (provider, cassette) in recorded_provider_cases() {
         let response = recorded_response(&provider, cassette);
         let entries = [
             entry(
@@ -1030,4 +1033,110 @@ fn resident_kib() -> u64 {
         .trim()
         .parse::<u64>()
         .unwrap()
+}
+
+#[test]
+fn forked_provider_bytes_need_no_projection_of_their_settled_ancestry() {
+    for (provider, cassette) in recorded_provider_cases() {
+        let response = recorded_response(&provider, cassette);
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(blob_files::Files::open(dir.path().join("blobs"), dir.path()).unwrap());
+        let places = Places::new(
+            store.clone(),
+            Arc::new(blob_files::CacheDir::new(
+                dir.path().join("tree"),
+                store.clone(),
+            )),
+        );
+        let registry = Arc::new(Registry::default());
+        let source = [taken_text(1, "settled input"), response_entry(2, &response)];
+        let cut = crate::context::append(
+            protocol::publication::ContextImage::default(),
+            source.clone(),
+            &*store,
+        )
+        .unwrap();
+        let local = taken_text(3, "owner private tail");
+        let image = crate::context::append(cut, [local.clone()], &*store).unwrap();
+        let child = [
+            entry(
+                1,
+                Body::Spawned {
+                    intent: spawn_image(image.clone()),
+                },
+            ),
+            taken_text(2, "child private input"),
+        ];
+        let expected = provider_bytes(
+            &provider,
+            Transcript::placed(&child, Arc::clone(&registry), "system", &places)
+                .unwrap()
+                .into_messages(),
+        );
+        let canonical = Transcript::placed(&source, Arc::clone(&registry), "system", &places)
+            .unwrap()
+            .into_context();
+        let request = llm::Request {
+            model: "recorded".into(),
+            messages: llm::Conversation::retained(llm::Resident::default(), canonical, || {
+                Err(llm::Error::new(llm::Kind::Other, "unrequested ancestor"))
+            }),
+            generation: llm::Generation {
+                max_output_tokens: std::num::NonZeroU32::new(64),
+                ..llm::Generation::default()
+            },
+            ..llm::Request::default()
+        };
+        provider.request(&request.model, &request).unwrap();
+        let prefix = request
+            .messages
+            .prefix()
+            .expect("recorded completed prefix");
+        let tail = Transcript::placed(&[local], Arc::clone(&registry), "", &places)
+            .unwrap()
+            .into_context();
+        let root = image.root.as_ref().unwrap().id;
+        std::fs::remove_dir_all(dir.path().join("blobs")).unwrap();
+        assert!(
+            crate::context::expand(&image, &places).is_err(),
+            "the ordinary path must need the removed nodes"
+        );
+        let transcript = Transcript::replay_seeded(
+            &child,
+            registry,
+            "system",
+            &places,
+            crate::driver::prefix::Seed { root, prefix, tail },
+        )
+        .unwrap();
+        let mut request = request;
+        request.messages = transcript
+            .request_before(3, || {
+                Err(llm::Error::new(llm::Kind::Other, "unrequested ancestor"))
+            })
+            .unwrap();
+        assert_eq!(
+            provider
+                .request(&request.model, &request)
+                .unwrap()
+                .body()
+                .to_vec(),
+            expected,
+            "{cassette}"
+        );
+    }
+}
+
+fn taken_text(seq: u64, text: &str) -> Entry {
+    entry(
+        seq,
+        Body::Input {
+            segments: text.into(),
+            mode: Mode::Queue,
+            taken: true,
+            origin: None,
+            force: false,
+        },
+    )
 }

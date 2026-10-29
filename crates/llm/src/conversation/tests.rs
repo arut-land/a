@@ -685,7 +685,16 @@ fn canonical_exports_cannot_cache_encoded_bytes_in_the_resident_tail() {
                 model: &canonical.model,
             };
             let encoded = provider.protocol.encode(&target, &canonical).unwrap();
-            Arc::downgrade(&encoded.history.as_ref().unwrap().settled[0])
+            Arc::downgrade(
+                encoded
+                    .history
+                    .as_ref()
+                    .unwrap()
+                    .settled
+                    .iter()
+                    .next()
+                    .unwrap(),
+            )
         };
         drop(request);
         assert!(
@@ -694,5 +703,322 @@ fn canonical_exports_cannot_cache_encoded_bytes_in_the_resident_tail() {
             provider.protocol.key()
         );
         assert_eq!(tail.len(), 3);
+    }
+}
+
+#[test]
+fn a_fork_reuses_settled_chunks_without_refolding_its_parent() {
+    for provider in providers() {
+        let canonical = Messages::from(vec![
+            Message::system("terse"),
+            Message::user("begin"),
+            Message::assistant("settled answer"),
+            Message::user("next"),
+        ]);
+        let stored = StoredMessages::new(&canonical);
+        let mut tail = canonical.clone();
+        let mut resident = Resident::default();
+        let reads = Arc::new(AtomicU64::new(0));
+        let request = stored.request(&resident, &tail, &reads);
+        provider.request(&request.model, &request).unwrap();
+        folded();
+        let prefix = request.messages.prefix().unwrap();
+        let root = Arc::clone(prefix.0.0.settled.0.first().unwrap());
+        let references = Arc::strong_count(&root);
+        drop(request);
+        resident.retain(&mut tail);
+        assert!(tail.is_empty());
+        let branch = Messages::from(vec![
+            Message::assistant("private answer"),
+            Message::user("private prompt"),
+        ]);
+        let whole: Messages = canonical.iter().chain(branch.iter()).cloned().collect();
+        let expected = body(&provider, &whole);
+        folded();
+        stored.write(&whole);
+        let child = Resident::from(prefix.clone());
+        let request = stored.request(&child, &branch, &reads);
+        let actual = provider
+            .request(&request.model, &request)
+            .unwrap()
+            .body()
+            .to_vec();
+        assert_eq!(
+            folded(),
+            branch.len(),
+            "{} refolded ancestry",
+            provider.protocol.key()
+        );
+        assert_eq!(reads.load(Ordering::Relaxed), 0);
+        assert_eq!(actual, expected);
+        let held = child
+            .encoding
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .0
+            .settled
+            .clone();
+        assert!(
+            held.iter().any(|bytes| Arc::ptr_eq(bytes, &root)),
+            "branch replaced its prefix bytes"
+        );
+        assert_eq!(
+            Arc::strong_count(&root),
+            references,
+            "branch copied settled fragment references"
+        );
+    }
+}
+
+#[test]
+fn a_frozen_encoding_never_observes_later_parent_appends() {
+    for provider in providers() {
+        let canonical = Messages::from(vec![
+            Message::system("terse"),
+            Message::user("begin"),
+            Message::assistant("old answer"),
+        ]);
+        let stored = StoredMessages::new(&canonical);
+        let mut tail = canonical.clone();
+        let mut resident = Resident::default();
+        let reads = Arc::new(AtomicU64::new(0));
+        let request = stored.request(&resident, &tail, &reads);
+        provider.request(&request.model, &request).unwrap();
+        let prefix = request.messages.prefix().unwrap();
+        drop(request);
+        resident.retain(&mut tail);
+        tail.push(Message::user("later parent input"));
+        let parent: Messages = canonical.iter().chain(tail.iter()).cloned().collect();
+        stored.write(&parent);
+        let request = stored.request(&resident, &tail, &reads);
+        provider.request(&request.model, &request).unwrap();
+        let private = Messages::from(vec![Message::user("child input")]);
+        let expected: Messages = canonical.iter().chain(private.iter()).cloned().collect();
+        let child = Resident::from(prefix);
+        let request = stored.request(&child, &private, &reads);
+        assert_eq!(
+            provider
+                .request(&request.model, &request)
+                .unwrap()
+                .body()
+                .to_vec(),
+            body(&provider, &expected)
+        );
+        assert_eq!(reads.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[test]
+fn different_instruction_generations_never_reuse_a_prefix() {
+    for provider in providers() {
+        let canonical = Messages::from(vec![
+            Message::system("terse"),
+            Message::user("begin"),
+            Message::assistant("answer"),
+        ]);
+        let stored = StoredMessages::new(&canonical);
+        let resident = Resident::default();
+        let reads = Arc::new(AtomicU64::new(0));
+        let mut request = stored.request(&resident, &canonical, &reads);
+        request.messages = request
+            .messages
+            .with_scope(crate::Json::encode(&"generation one").unwrap());
+        provider.request(&request.model, &request).unwrap();
+        let child = Resident::from(request.messages.prefix().unwrap());
+        let mut request = stored.request(&child, &Messages::default(), &reads);
+        request.messages = request
+            .messages
+            .with_scope(crate::Json::encode(&"generation two").unwrap());
+        assert_eq!(
+            provider
+                .request(&request.model, &request)
+                .unwrap()
+                .body()
+                .to_vec(),
+            body(&provider, &canonical)
+        );
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[test]
+fn changed_wire_quirks_never_reuse_a_prefix() {
+    for provider in providers() {
+        let canonical = Messages::from(vec![Message::user("begin"), Message::assistant("answer")]);
+        let stored = StoredMessages::new(&canonical);
+        let reads = Arc::new(AtomicU64::new(0));
+        let request = stored.request(&Resident::default(), &canonical, &reads);
+        provider.request(&request.model, &request).unwrap();
+        let child = Resident::from(request.messages.prefix().unwrap());
+        let url = "https://example.test";
+        let changed = match provider.protocol.key() {
+            crate::ProtocolKey::OpenaiChat => Provider::new(
+                "openai",
+                url,
+                Auth::None,
+                chat::Chat::new(chat::Quirks {
+                    path: "/changed",
+                    ..chat::Quirks::OPENAI
+                }),
+            ),
+            crate::ProtocolKey::OpenaiResponses => Provider::new(
+                "openai",
+                url,
+                Auth::None,
+                responses::Responses::new(responses::Quirks {
+                    path: "/changed",
+                    ..responses::Quirks::OPENAI
+                }),
+            ),
+            crate::ProtocolKey::AnthropicMessages => Provider::new(
+                "anthropic",
+                url,
+                Auth::None,
+                messages::Messages::new(messages::Quirks {
+                    strict_tool_schemas: false,
+                    ..messages::Quirks::ANTHROPIC
+                }),
+            ),
+            crate::ProtocolKey::GoogleGemini => Provider::new(
+                "gemini",
+                url,
+                Auth::None,
+                gemini::Gemini::new(gemini::Quirks {
+                    models_path: "/changed",
+                    ..gemini::Quirks::GEMINI
+                }),
+            ),
+        };
+        let request = stored.request(&child, &Messages::default(), &reads);
+        assert_eq!(
+            changed
+                .request(&request.model, &request)
+                .unwrap()
+                .body()
+                .to_vec(),
+            body(&changed, &canonical),
+        );
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            1,
+            "{}",
+            provider.protocol.key()
+        );
+    }
+}
+
+#[test]
+fn releasing_a_deep_prefix_never_recurses_through_its_ancestry() {
+    let mut chunks = Fragments::default();
+    let byte: Shared = vec![b'0'].into();
+    for _ in 0..100_000 {
+        chunks.extend([Arc::clone(&byte)]);
+    }
+    assert_eq!(Arc::strong_count(&byte), 100_001);
+    drop(chunks);
+    assert_eq!(Arc::strong_count(&byte), 1);
+}
+
+#[test]
+fn an_uncompiled_tail_never_claims_a_new_prefix_frontier() {
+    let provider = &providers()[0];
+    let canonical = Messages::from(vec![Message::user("first")]);
+    let stored = StoredMessages::new(&canonical);
+    let resident = Resident::default();
+    let reads = Arc::new(AtomicU64::new(0));
+    let request = stored.request(&resident, &canonical, &reads);
+    provider.request(&request.model, &request).unwrap();
+    assert!(request.messages.prefix().is_some());
+    let mut tail = canonical.clone();
+    tail.push(Message::assistant("not yet compiled"));
+    assert!(
+        stored
+            .request(&resident, &tail, &reads)
+            .messages
+            .prefix()
+            .is_none()
+    );
+}
+
+#[test]
+fn changed_offers_and_fitting_never_reuse_a_prefix() {
+    for provider in providers() {
+        let canonical = Messages::from(vec![Message::user("begin"), Message::assistant("answer")]);
+        let stored = StoredMessages::new(&canonical);
+        let resident = Resident::default();
+        let reads = Arc::new(AtomicU64::new(0));
+        let request = stored.request(&resident, &canonical, &reads);
+        provider.request(&request.model, &request).unwrap();
+        let prefix = request.messages.prefix().unwrap();
+        let child = Resident::from(prefix.clone());
+        let mut request = stored.request(&child, &Messages::default(), &reads);
+        request.tools = vec![crate::Tool {
+            name: "added".into(),
+            description: "new generation".into(),
+            schema: json!({"type":"object"}),
+            strict: None,
+        }]
+        .into();
+        provider.request(&request.model, &request).unwrap();
+        assert_eq!(reads.swap(0, Ordering::Relaxed), 1);
+        let child = Resident::from(prefix);
+        let request = stored.request(&child, &Messages::default(), &reads);
+        let limits = crate::fit::Limits {
+            bytes: 1_000_000,
+            images: 2,
+        };
+        let target = Target {
+            provider: &provider,
+            model: &request.model,
+        };
+        crate::fit::fit(&request, limits, |request| {
+            provider.protocol.encode(&target, request)
+        })
+        .unwrap();
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[test]
+fn a_repaired_owner_history_never_claims_a_context_prefix() {
+    for provider in providers() {
+        let pending = round(&provider, "claude-sonnet-4-5", 0)[0].clone();
+        let canonical = Messages::from(vec![
+            Message::user("begin"),
+            pending,
+            Message::user("after interruption"),
+        ]);
+        let stored = StoredMessages::new(&canonical);
+        let request = stored.request(
+            &Resident::default(),
+            &canonical,
+            &Arc::new(AtomicU64::new(0)),
+        );
+        provider.request(&request.model, &request).unwrap();
+        assert!(
+            request.messages.prefix().is_none(),
+            "a repaired owner prefix differs from context-only semantics"
+        );
+    }
+}
+
+#[test]
+fn reclaiming_a_parent_preserves_only_the_childs_prefix_lease() {
+    for provider in providers() {
+        let canonical = Messages::from(vec![Message::user("begin"), Message::assistant("settled")]);
+        let stored = StoredMessages::new(&canonical);
+        let resident = Resident::default();
+        let request = stored.request(&resident, &canonical, &Arc::new(AtomicU64::new(0)));
+        provider.request(&request.model, &request).unwrap();
+        let prefix = request.messages.prefix().unwrap();
+        let bytes = Arc::downgrade(prefix.0.0.settled.0.first().unwrap());
+        let child = Resident::from(prefix);
+        drop(request);
+        drop(resident);
+        assert!(bytes.upgrade().is_some());
+        drop(child);
+        assert!(bytes.upgrade().is_none());
     }
 }

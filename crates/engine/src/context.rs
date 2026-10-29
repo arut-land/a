@@ -345,8 +345,11 @@ fn suffix_start(nodes: &[ContextNode], exchanges: u16) -> Option<protocol::Seq> 
         })
         .collect();
     let start = *boundaries.get(boundaries.len().checked_sub(usize::from(exchanges) + 1)?)?;
+    let requested = boundaries[boundaries.len() - usize::from(exchanges)];
     for ContextInput(seq, value) in nodes.iter().flat_map(|node| &node.inputs) {
-        if *seq < start || edits.at(*seq).is_some() {
+        // The extra leading exchange protects tool-group boundaries; its own
+        // dependencies cannot extend the requested suffix indefinitely.
+        if *seq < requested || edits.at(*seq).is_some() {
             continue;
         }
         let dependency = match value {
@@ -605,6 +608,100 @@ mod tests {
                 expand(&branch, places).is_err(),
                 "the full projection still needs the removed ancestor"
             );
+        });
+    }
+
+    #[test]
+    fn a_bounded_side_never_follows_dependencies_of_its_unrequested_leading_exchange() {
+        TEST_STORE.with(|(_, store, places)| {
+            let old = append(ContextImage::default(), [user(1, "old")], &**store).unwrap();
+            let mut cut = old.clone();
+            let sender = SessionId::new();
+            for turn in 0..16 {
+                let seq = 10 + turn * 10;
+                let mut entries = Vec::new();
+                if turn > 0 {
+                    entries.push(entry(
+                        seq,
+                        Body::Enqueue {
+                            envelope: protocol::Envelope::new(
+                                protocol::EnvelopeId {
+                                    sender,
+                                    call: CallId::new(seq - 7).unwrap(),
+                                    purpose: "job".into(),
+                                },
+                                sender,
+                                protocol::Carried::Job("finished".into()),
+                                Vec::new(),
+                            )
+                            .unwrap(),
+                        },
+                    ));
+                }
+                entries.push(user(seq + 1, &format!("input {turn}")));
+                if turn > 0 {
+                    entries.push(entry(
+                        seq + 2,
+                        Body::Take {
+                            input: protocol::Seq::new(seq).unwrap(),
+                            into: None,
+                        },
+                    ));
+                }
+                entries.extend([
+                    entry(
+                        seq + 3,
+                        Body::ToolCall {
+                            tool: "bash".into(),
+                            input: Json::null(),
+                            id: Some(format!("job{turn}")),
+                            invoke: None,
+                            card: None,
+                            by: protocol::Audience::Model,
+                        },
+                    ),
+                    entry(
+                        seq + 4,
+                        Body::ToolResult {
+                            call: CallId::new(seq + 3).unwrap(),
+                            outcome: protocol::Outcome::Done {
+                                output: Json::null().into(),
+                            },
+                            card: None,
+                            held: Vec::new(),
+                        },
+                    ),
+                    entry(
+                        seq + 5,
+                        Body::Assistant {
+                            text: "answer".into(),
+                        },
+                    ),
+                ]);
+                cut = append(cut, entries, &**store).unwrap();
+            }
+            let registry = Arc::new(ext::host::Registry::default());
+            let policy = llm::ContextPolicy {
+                exchanges: 2,
+                bytes: 100_000,
+            };
+            let current = llm::Messages::from_iter([llm::Message::user("mandatory")]);
+            let full = crate::transcript::Transcript::cut(&cut, registry.clone(), "", places, None)
+                .unwrap()
+                .into_messages();
+            let expected = policy.assemble(&full, &[], &current).unwrap();
+            std::fs::remove_file(store.materialize(&old.root.unwrap().id).unwrap()).unwrap();
+            let recent = crate::transcript::Transcript::cut(
+                &cut,
+                registry,
+                "",
+                places,
+                Some(policy.exchanges),
+            )
+            .unwrap()
+            .into_messages();
+            assert_eq!(policy.assemble(&recent, &[], &current).unwrap(), expected);
+            assert!(expand(&cut, places).is_err());
         });
     }
 

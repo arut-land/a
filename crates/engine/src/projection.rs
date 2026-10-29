@@ -43,6 +43,11 @@ impl super::Shared {
 
 #[derive(Default)]
 pub(super) struct Projection {
+    pub(super) admissions: super::spawn::Admissions,
+    pub(super) active: Option<super::prefix::Active>,
+    pub(super) forks: Option<super::prefix::Projection>,
+    pub(super) seeds: std::collections::BTreeMap<protocol::BlobId, Vec<super::prefix::Seed>>,
+    pub(super) compiler: Option<(std::sync::Weak<ext::host::Registry>, super::Json)>,
     pub(super) transcript: Option<Transcript>,
     pub(super) invocations: Invocations,
     /// The message of the reply model call `.0` just had, until its
@@ -54,6 +59,29 @@ pub(super) struct Projection {
     /// the first time one is asked for: no attach folds the whole log.
     pub(super) view: Option<SessionView>,
     pub(super) published_activity: Option<(u64, Activity)>,
+}
+
+impl Projection {
+    pub(super) fn release_model(&mut self) {
+        self.transcript = None;
+        self.active = None;
+        self.forks = None;
+        self.seeds.clear();
+        self.compiler = None;
+    }
+
+    pub(super) fn compiler_scope(&mut self, registry: &Arc<ext::host::Registry>) -> super::Json {
+        if let Some((held, scope)) = &self.compiler
+            && held
+                .upgrade()
+                .is_some_and(|held| Arc::ptr_eq(&held, registry))
+        {
+            return scope.clone();
+        }
+        let scope = super::prefix::scope(registry);
+        self.compiler = Some((Arc::downgrade(registry), scope.clone()));
+        scope
+    }
 }
 
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -537,6 +565,7 @@ impl Actor {
         let model_only = self.live.session.model_only();
         let places = self.live.session.blobs.places();
         let kept = self.projection.transcript.take();
+        let seed = lock(&self.live.session.incoming_prefix).take();
         let (transcript, messages) = rt::try_unblock_with(
             &*self.live.session.shared.rt,
             Cpu,
@@ -567,49 +596,43 @@ impl Actor {
                 });
                 let transcript = if let Some(transcript) = advanced {
                     transcript
-                } else {
-                    Transcript::replay(
-                        |each| {
-                            for batch in frames.batches_after(0) {
-                                for entry in batch? {
-                                    each(&entry);
-                                }
-                            }
-                            for entry in &pending {
-                                each(entry);
-                            }
-                            Ok(())
-                        },
+                } else if let Some(seed) = seed
+                    .filter(|seed| seed.prefix.scope() == Some(&super::prefix::scope(&registry)))
+                {
+                    let entries: Vec<_> = frames
+                        .batches_after(0)
+                        .collect::<io::Result<Vec<_>>>()?
+                        .into_iter()
+                        .flatten()
+                        .chain(pending.iter().cloned())
+                        .collect();
+                    Transcript::replay_seeded(
+                        &entries,
                         Arc::clone(&registry),
                         system,
                         &places,
+                        seed,
+                    )?
+                } else {
+                    replay_frames(
+                        &frames,
+                        &pending,
+                        Arc::clone(&registry),
+                        system,
+                        &places,
+                        None,
                     )?
                 };
                 if let Some(messages) = transcript.request_before(call.get(), move || restore()) {
                     return io::Result::Ok((transcript, messages));
                 }
-                let messages = Transcript::replay(
-                    |each| {
-                        let mut before = |entry: &Entry| {
-                            if entry.seq < call.0
-                                || matches!(entry.body, Body::Context { .. } | Body::Edit { .. })
-                            {
-                                each(entry);
-                            }
-                        };
-                        for batch in frames.batches_after(0) {
-                            for entry in batch? {
-                                before(&entry);
-                            }
-                        }
-                        for entry in &pending {
-                            before(entry);
-                        }
-                        Ok(())
-                    },
+                let messages = replay_frames(
+                    &frames,
+                    &pending,
                     Arc::clone(&registry),
                     system,
                     &places,
+                    Some(call),
                 )?
                 .into_messages();
                 io::Result::Ok((transcript, messages.into()))
@@ -619,6 +642,40 @@ impl Actor {
         self.projection.transcript = Some(transcript);
         Ok(messages)
     }
+}
+
+fn replay_frames(
+    frames: &super::FrameLog,
+    pending: &[Entry],
+    registry: Arc<ext::host::Registry>,
+    system: &str,
+    places: &ext::blob::Places,
+    before: Option<CallId>,
+) -> io::Result<Transcript> {
+    Transcript::replay(
+        |each| {
+            let mut visit = |entry: &Entry| {
+                if before.is_none_or(|call| {
+                    entry.seq < call.0
+                        || matches!(entry.body, Body::Context { .. } | Body::Edit { .. })
+                }) {
+                    each(entry);
+                }
+            };
+            for batch in frames.batches_after(0) {
+                for entry in batch? {
+                    visit(&entry);
+                }
+            }
+            for entry in pending {
+                visit(entry);
+            }
+            Ok(())
+        },
+        registry,
+        system,
+        places,
+    )
 }
 
 #[derive(Clone, Copy)]

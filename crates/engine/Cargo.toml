@@ -9,6 +9,7 @@ publish.workspace = true
 events = []
 
 [dependencies]
+rpds = "1.2.1"
 blob-files.workspace = true
 transport.workspace = true
 ext-logging.workspace = true

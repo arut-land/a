@@ -65,9 +65,10 @@ pub(crate) fn body(
         && !options.contains_key("conversation");
     let cx = Cx {
         stateless,
+        quirks: responses.quirks,
         instructions: responses.quirks.instructions,
     };
-    let (input, settled) = conversation::fold(&request.messages, target, Input::new(cx))?;
+    let (input, settled) = conversation::fold(request, target, Input::new(cx))?;
     let (instructions, tail) = input.finish()?;
     let strict = responses.quirks.strict_tools;
     let typed = (!request.tools.is_empty()).then(|| {
@@ -246,6 +247,7 @@ fn result_output(output: &Output) -> Result<ResultOutput<'_>, Error> {
 /// What a Responses conversation's items read besides its messages.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Cx {
+    quirks: super::Quirks,
     /// A stateless request resolves no stored item, so reasoning without
     /// its ciphertext is left out, and the part after it is rebuilt with no
     /// item id, as another model's turn is.
@@ -260,7 +262,7 @@ pub(crate) struct Cx {
 pub(crate) struct Input {
     cx: Cx,
     /// The call ids the request sends as custom calls, which are rare.
-    custom: Vec<SmolStr>,
+    custom: rpds::RedBlackTreeSetSync<SmolStr>,
     /// The leading system messages, while nothing else came, where they
     /// go to `instructions` if they lead.
     open: Vec<Value>,
@@ -276,7 +278,7 @@ impl Input {
     fn new(cx: Cx) -> Self {
         Self {
             cx,
-            custom: Vec::new(),
+            custom: rpds::RedBlackTreeSetSync::new_sync(),
             open: Vec::new(),
             lifted: Vec::new(),
             settled: 0,
@@ -447,9 +449,9 @@ impl Fold for Input {
                 continue;
             }
             if let AssistantPart::ToolCall(call) = part {
-                self.custom.retain(|custom| *custom != call.id);
+                self.custom.remove_mut(&call.id);
                 if kind == Some(ItemType::CustomToolCall) {
-                    self.custom.push(call.id.clone());
+                    self.custom.insert_mut(call.id.clone());
                 }
             }
             let kept = match sent {

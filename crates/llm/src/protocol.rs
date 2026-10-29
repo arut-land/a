@@ -231,6 +231,23 @@ impl Provider {
         self
     }
 
+    /// Compiles a closed frontier without materializing a request payload or sending it.
+    pub fn prefix(&self, request: &Request) -> Result<Option<crate::Prefix>, Error> {
+        let mut request = request.clone();
+        request.messages.fitting(crate::fit::Limits::of_protocol(
+            self.protocol.key(),
+            &request.model,
+        ));
+        self.protocol.encode(
+            &Target {
+                provider: self,
+                model: &request.model,
+            },
+            &request,
+        )?;
+        Ok(request.messages.prefix())
+    }
+
     /// The HTTP request `request` becomes, prepared and encoded for
     /// `model`.
     pub fn request(&self, model: &str, request: &Request) -> Result<http::Request<Payload>, Error> {

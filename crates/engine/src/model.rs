@@ -111,6 +111,10 @@ impl Model {
         }
     }
 
+    pub(crate) fn prefix(&self, request: &Request) -> Option<llm::Prefix> {
+        self.provider.prefix(request).ok().flatten()
+    }
+
     pub fn prepare(&self, request: &Request) -> llm::Prepared {
         llm::prepare_request(&self.provider, request)
     }

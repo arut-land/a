@@ -12,6 +12,7 @@ tls-native = ["transport/tls-native"]
 tls-rustls = ["transport/tls-rustls"]
 
 [dependencies]
+rpds = "1.2.1"
 sys = { workspace = true, optional = true }
 # Bytes a caller holds go as base64 only as a request is written; the
 # shipped tree has it already, through ureq.

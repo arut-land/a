@@ -62,6 +62,7 @@ mod services;
 use services::{CallPorts, SessionLayers, Viewed, bind};
 
 mod inbox;
+pub(crate) mod prefix;
 mod side;
 pub(crate) mod spawn;
 
@@ -432,6 +433,7 @@ struct Session {
     context_cuts: Mutex<crate::context::Cuts>,
     presentation: Mutex<crate::context::Presentation>,
     child_owners: Mutex<ChildOwners>,
+    incoming_prefix: Mutex<Option<prefix::Seed>>,
     input_registries: Mutex<std::collections::HashMap<protocol::EnvelopeId, Arc<Registry>>>,
     fence: AtomicU64,
     id: SessionId,
@@ -1757,7 +1759,8 @@ impl Actor {
             Msg::Reclaim => {
                 if !self.live.idle_for().is_zero() && self.live.summary().activity == Activity::Idle
                 {
-                    self.projection.transcript = None;
+                    self.projection.release_model();
+                    lock(&self.live.session.incoming_prefix).take();
                     self.projection.snapshot = None;
                     self.projection.view = None;
                 }
@@ -2576,7 +2579,8 @@ impl Actor {
             pending.ended.wait().await;
         }
         self.admissions.clear();
-        self.projection.transcript = None;
+        self.projection.release_model();
+        lock(&self.live.session.incoming_prefix).take();
         self.replies = Replies::default();
         self.delivery_queue.clear();
         self.transport_active = false;
@@ -2709,13 +2713,10 @@ impl Actor {
 
     fn resume_tool(&mut self, call: CallId, tool: String, input: Json, value: Json) {
         let refusal = self
-            .core
-            .ledger()
-            .links()
-            .iter()
-            .rev()
-            .filter_map(|l| spawn::SpawnIntent::from_json(&l.intent).ok())
-            .find(|i| i.call == call)
+            .projection
+            .admissions
+            .last(self.core.ledger().links(), call)
+            .and_then(|link| spawn::SpawnIntent::from_json(&link.intent).ok())
             .and_then(|i| i.refusal);
         let value = refusal.map_or(value, |r| {
             Json::encode(&Result::<Outcome, _>::Err(r)).unwrap()
@@ -2764,6 +2765,11 @@ impl Actor {
             .find(|l| l.seq == link)
             .map(|l| l.intent.clone())
             .expect("committed spawn intent");
+        let seed = spawn::SpawnIntent::from_json(&intent)
+            .ok()
+            .and_then(|intent| intent.image.root)
+            .and_then(|root| self.projection.seeds.get_mut(&root.id))
+            .and_then(Vec::pop);
         let env = lock(&self.live.session.env).clone();
         if let Some(daemon) = shared.daemon.upgrade() {
             let parent = self.live.id;
@@ -2776,7 +2782,7 @@ impl Actor {
                 } else {
                     match &refusal {
                         Some(refusal) => Err(io::Error::other(format!("{refusal:?}"))),
-                        None => daemon.start_child(header, input, env, intent).await,
+                        None => daemon.start_child(header, input, env, intent, seed).await,
                     }
                 };
                 if cancel.is_set() {
@@ -2889,11 +2895,21 @@ impl Actor {
                                     Some((by, response)) => PreparedStep::Answered(by, response),
                                     None => PreparedStep::Request(preparing.prepare(&request)),
                                 };
-                                (decided, prepared)
+                                let prefix = request.messages.prefix();
+                                (decided, prepared, prefix)
                             },
                         )
                         .await
-                        .map(|(decided, prepared)| {
+                        .map(|(decided, prepared, prefix)| {
+                            if let (Some(prefix), Some(transcript)) =
+                                (prefix, &self.projection.transcript)
+                            {
+                                self.projection.active = Some(prefix::Active {
+                                    through: call.get() - 1,
+                                    prefix,
+                                    tail: transcript.fork_tail(Arc::clone(&self.registry)),
+                                });
+                            }
                             decisions = decided;
                             match prepared {
                                 PreparedStep::Answered(by, response) => {
@@ -3035,7 +3051,12 @@ impl Actor {
     /// The request for model call `call`: the system prompt, the
     /// transcript before it, and the tools.
     async fn request(&mut self, call: CallId, model: &Model) -> Result<llm::Request, String> {
-        let messages = self.conversation(call).await.map_err(|e| e.to_string())?;
+        let scope = self.projection.compiler_scope(&self.registry);
+        let messages = self
+            .conversation(call)
+            .await
+            .map_err(|e| e.to_string())?
+            .with_scope(scope);
         let mut request = model.request(messages, self.registry.specs().clone());
         if let Some(spawn) = lock(&self.live.session.spawn).as_ref() {
             request.generation.max_output_tokens = Some(spawn.request.budget.max_tokens);
@@ -3180,6 +3201,10 @@ impl Live {
 }
 
 impl Live {
+    pub(crate) fn seed_prefix(&self, seed: prefix::Seed) {
+        self.session.seed_prefix(seed);
+    }
+
     fn delta(&self, call: CallId, attempt: u16, text: &str, fence: u64) {
         if self.session.fence.load(Ordering::SeqCst) != fence {
             return;
@@ -3250,6 +3275,7 @@ impl Session {
             presentation: Mutex::default(),
             child_owners: Mutex::default(),
             input_registries: Mutex::default(),
+            incoming_prefix: Mutex::default(),
             fence: AtomicU64::new(0),
             id: header.id,
             workspace: Arc::from(header.workspace.as_path()),
@@ -3270,6 +3296,10 @@ impl Session {
             changed: rt::Notify::new(),
             shared: Arc::clone(shared),
         })
+    }
+
+    pub(crate) fn seed_prefix(&self, seed: prefix::Seed) {
+        *lock(&self.incoming_prefix) = Some(seed);
     }
 
     fn emit(&self, fence: u64, completion: Completion) {

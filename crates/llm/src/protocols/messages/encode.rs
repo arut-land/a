@@ -80,7 +80,7 @@ pub(super) fn body(
     }
     let has_tools = !typed.is_empty() || !tools.is_empty();
     let mid = takes_mid_conversation_system(model);
-    let (turns, settled) = conversation::fold(&request.messages, target, Turns::new(mid))?;
+    let (turns, settled) = conversation::fold(request, target, Turns::new(mid, quirks))?;
     let Ended {
         mut system,
         mut messages,
@@ -398,7 +398,7 @@ fn place(messages: &[Message], mid: bool, mut follows: Option<bool>) -> Result<P
 #[derive(Clone)]
 pub(super) struct Turns {
     /// Whether the model takes mid-conversation system messages.
-    mid: bool,
+    cx: (bool, Quirks),
     /// The top-level system blocks.
     system: Vec<Value>,
     follows: Option<bool>,
@@ -422,9 +422,9 @@ pub(super) struct Ended {
 }
 
 impl Turns {
-    pub(super) fn new(mid: bool) -> Self {
+    pub(super) fn new(mid: bool, quirks: Quirks) -> Self {
         Self {
-            mid,
+            cx: (mid, quirks),
             system: Vec::new(),
             follows: None,
             open: Vec::new(),
@@ -435,7 +435,7 @@ impl Turns {
 
     /// The turns open, placed for this request.
     pub(super) fn finish(mut self) -> Result<Ended, Error> {
-        let placed = place(&self.open, self.mid, self.follows)?;
+        let placed = place(&self.open, self.cx.0, self.follows)?;
         self.system.extend(placed.system);
         let messages = placed.sent.into_iter().map(|sent| {
             let content = sent
@@ -456,10 +456,10 @@ impl Turns {
 }
 
 impl Fold for Turns {
-    type Cx = bool;
+    type Cx = (bool, Quirks);
 
-    fn cx(&self) -> &bool {
-        &self.mid
+    fn cx(&self) -> &Self::Cx {
+        &self.cx
     }
 
     fn push(&mut self, _: usize, message: &Message, out: &mut Settled) -> Result<(), Error> {
@@ -467,7 +467,7 @@ impl Fold for Turns {
         if !matches!(message, Message::Assistant(_)) {
             return Ok(());
         }
-        let placed = place(&self.open, self.mid, self.follows)?;
+        let placed = place(&self.open, self.cx.0, self.follows)?;
         // A turn that sends nothing leaves the last message the one
         // before, which takes the request's breakpoint.
         let last = placed.sent.last();

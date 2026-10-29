@@ -7,6 +7,11 @@ use crate::store::Header;
 use ext::{DepthBudget, SpawnRefusal};
 use std::io;
 
+#[cfg(test)]
+thread_local! {
+    static SPAWN_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Clone)]
 pub(crate) struct SpawnIntent {
     pub awaited: bool,
@@ -48,6 +53,8 @@ impl SpawnIntent {
     }
 
     pub(crate) fn from_json(json: &Json) -> Result<Self, serde_json::Error> {
+        #[cfg(test)]
+        SPAWN_READS.with(|reads| reads.set(reads.get() + 1));
         let image = protocol::publication::SpawnImage::from_json(json)?;
         let (
             awaited,
@@ -80,6 +87,55 @@ impl SpawnIntent {
 pub(super) enum SpawnReply {
     Awaited(oneshot::Sender<Json>),
     Detached(oneshot::Sender<Result<ext::ConversationHandle, SpawnRefusal>>),
+}
+
+#[derive(Default)]
+pub(super) struct Admissions {
+    through: usize,
+    calls: std::collections::BTreeMap<CallId, Vec<Admission>>,
+}
+
+struct Admission {
+    link: usize,
+    owner: String,
+    purpose: String,
+}
+
+impl Admissions {
+    fn advance(&mut self, links: &[protocol::ledger::Link]) {
+        for (at, link) in links.iter().enumerate().skip(self.through) {
+            if let Ok(intent) = SpawnIntent::from_json(&link.intent) {
+                self.calls.entry(intent.call).or_default().push(Admission {
+                    link: at,
+                    owner: intent.request.owner().into(),
+                    purpose: intent.request.purpose,
+                });
+            }
+        }
+        self.through = links.len();
+    }
+
+    pub(super) fn find<'a>(
+        &mut self,
+        links: &'a [protocol::ledger::Link],
+        call: CallId,
+        request: &ext::Spawn,
+    ) -> Option<&'a protocol::ledger::Link> {
+        self.advance(links);
+        let admission = self.calls.get(&call)?.iter().find(|admission| {
+            admission.owner == request.owner() && admission.purpose == request.purpose
+        })?;
+        Some(&links[admission.link])
+    }
+
+    pub(super) fn last<'a>(
+        &mut self,
+        links: &'a [protocol::ledger::Link],
+        call: CallId,
+    ) -> Option<&'a protocol::ledger::Link> {
+        self.advance(links);
+        Some(&links[self.calls.get(&call)?.last()?.link])
+    }
 }
 
 impl Actor {
@@ -181,18 +237,14 @@ impl Actor {
             wait: awaited,
         })
     }
-    fn recorded_spawn(&self, call: CallId, request: &ext::Spawn) -> Option<protocol::ledger::Link> {
-        self.core
-            .ledger()
-            .links()
-            .iter()
-            .find(|link| {
-                SpawnIntent::from_json(&link.intent).is_ok_and(|i| {
-                    i.call == call
-                        && i.request.owner() == request.owner()
-                        && i.request.purpose == request.purpose
-                })
-            })
+    fn recorded_spawn(
+        &mut self,
+        call: CallId,
+        request: &ext::Spawn,
+    ) -> Option<protocol::ledger::Link> {
+        self.projection
+            .admissions
+            .find(self.core.ledger().links(), call, request)
             .cloned()
     }
 
@@ -266,7 +318,7 @@ impl Actor {
             .map(|(name, _)| name.to_string())
             .collect();
         let mut states = child.states();
-        let session = &self.live.session;
+        let session = Arc::clone(&self.live.session);
         if inherit_settings
             && let Err(error) = states.inherit_settings(&lock(&session.state_view()))
         {
@@ -315,6 +367,22 @@ impl Actor {
                     Err(error) => refusal = Some(SpawnRefusal::Unavailable(error.to_string())),
                 }
             }
+        }
+        if refusal.is_none()
+            && matches!(request.context, ext::Context::Owner)
+            && request.runner.agent().is_some()
+            && let Ok(model) =
+                session
+                    .shared
+                    .models
+                    .model(&session.workspace, env.as_deref(), &model)
+            && let Ok(Some(seed)) = self.fork_seed(&image, call, Arc::new(child), &model).await
+        {
+            self.projection
+                .seeds
+                .entry(seed.root)
+                .or_default()
+                .push(seed);
         }
         SpawnIntent {
             awaited,

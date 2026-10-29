@@ -138,7 +138,11 @@ impl<'de> Deserialize<'de> for Messages {
 
 /// A canonical conversation, or a retained encoding with a log-backed source.
 #[derive(Clone)]
-pub struct Conversation(Source);
+pub struct Conversation {
+    source: Source,
+    scope: Option<crate::Json>,
+    fitting: Option<crate::fit::Limits>,
+}
 
 #[derive(Clone)]
 enum Source {
@@ -160,7 +164,47 @@ pub struct Resident {
     images: usize,
 }
 
+/// A frozen compiler checkpoint into shared settled fragments.
+#[derive(Clone)]
+pub struct Prefix(Arc<Encoding>);
+
+impl Prefix {
+    pub fn scope(&self) -> Option<&crate::Json> {
+        self.0.0.compiler.scope.as_ref()
+    }
+}
+
+impl fmt::Debug for Prefix {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Prefix")
+            .field("messages", &self.0.0.len)
+            .finish()
+    }
+}
+
+impl From<Prefix> for Resident {
+    fn from(prefix: Prefix) -> Self {
+        let (kept, _) = &*prefix.0;
+        Self {
+            encoding: Arc::new(Mutex::new(Some((*prefix.0).clone()))),
+            offset: kept.len,
+            mark: kept.mark,
+            images: kept.images,
+        }
+    }
+}
+
 impl Resident {
+    pub fn prefix(&self) -> Option<Prefix> {
+        let encoding = self.encoding.lock().unwrap_or_else(PoisonError::into_inner);
+        let encoding = encoding.as_ref()?;
+        encoding
+            .0
+            .pass
+            .closed()
+            .then(|| Prefix(Arc::new(encoding.clone())))
+    }
+
     /// Relinquishes canonical messages covered by the encoded continuation.
     /// Protocol folds retain their unsettled tail; canonical rewrites reload the log.
     pub fn retain(&mut self, tail: &mut Messages) {
@@ -210,17 +254,52 @@ impl Conversation {
     ) -> Self {
         // Canonical exports own their caches; they cannot attach bytes to this decoded tail.
         tail.1 = None;
-        Self(Source::Retained {
-            resident,
-            extra: Arc::default(),
-            tail,
-            restore: Arc::new(restore),
-        })
+        Self {
+            source: Source::Retained {
+                resident,
+                extra: Arc::default(),
+                tail,
+                restore: Arc::new(restore),
+            },
+            scope: None,
+            fitting: None,
+        }
+    }
+
+    /// Names the immutable instruction/offer generation and projection semantics.
+    #[must_use]
+    pub fn with_scope(mut self, scope: crate::Json) -> Self {
+        self.scope = Some(scope);
+        self
+    }
+
+    pub(crate) fn fitting(&mut self, limits: crate::fit::Limits) {
+        self.fitting = Some(limits);
+    }
+
+    /// Freezes a closed encoded frontier; later parent appends cannot change it.
+    pub fn prefix(&self) -> Option<Prefix> {
+        match &self.source {
+            Source::Retained { resident, tail, .. } => {
+                let prefix = resident.prefix()?;
+                let kept = &prefix.0.0;
+                let stop = resident.offset + tail.len();
+                (kept.len == stop
+                    && kept.compiler.scope == self.scope
+                    && if tail.is_empty() {
+                        kept.mark == resident.mark
+                    } else {
+                        tail.holds(tail.len(), kept.mark)
+                    })
+                .then_some(prefix)
+            }
+            Source::Canonical(_) => None,
+        }
     }
 
     /// Loads canonical history only for consumers that need it.
     pub fn canonical(&self) -> Result<Cow<'_, Messages>, Error> {
-        match &self.0 {
+        match &self.source {
             Source::Canonical(messages) => Ok(Cow::Borrowed(messages)),
             Source::Retained {
                 resident,
@@ -243,10 +322,10 @@ impl Conversation {
 
     /// Reconstructs a canonical value before a request-specific edit.
     pub fn canonical_mut(&mut self) -> Result<&mut Messages, Error> {
-        if matches!(self.0, Source::Retained { .. }) {
-            self.0 = Source::Canonical(self.canonical()?.into_owned());
+        if matches!(self.source, Source::Retained { .. }) {
+            self.source = Source::Canonical(self.canonical()?.into_owned());
         }
-        let Source::Canonical(messages) = &mut self.0 else {
+        let Source::Canonical(messages) = &mut self.source else {
             unreachable!("canonical conversation")
         };
         Ok(messages)
@@ -254,14 +333,14 @@ impl Conversation {
 
     /// Appends request-local instructions without reconstructing the prefix.
     pub fn push(&mut self, message: Message) {
-        match &mut self.0 {
+        match &mut self.source {
             Source::Canonical(messages) => messages.push(message),
             Source::Retained { extra, .. } => Arc::make_mut(extra).push(message),
         }
     }
 
     pub fn images(&self) -> usize {
-        match &self.0 {
+        match &self.source {
             Source::Canonical(messages) => messages.iter().map(images).sum(),
             Source::Retained {
                 resident,
@@ -281,7 +360,11 @@ impl Default for Conversation {
 
 impl From<Messages> for Conversation {
     fn from(messages: Messages) -> Self {
-        Self(Source::Canonical(messages))
+        Self {
+            source: Source::Canonical(messages),
+            scope: None,
+            fitting: None,
+        }
     }
 }
 
@@ -299,8 +382,13 @@ impl FromIterator<Message> for Conversation {
 
 impl fmt::Debug for Conversation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.0 {
-            Source::Canonical(messages) => messages.fmt(f),
+        match &self.source {
+            Source::Canonical(messages) => f
+                .debug_struct("Conversation")
+                .field("messages", messages)
+                .field("scope", &self.scope)
+                .field("fitting", &self.fitting)
+                .finish(),
             Source::Retained {
                 resident,
                 tail,
@@ -308,6 +396,8 @@ impl fmt::Debug for Conversation {
                 ..
             } => f
                 .debug_struct("Retained")
+                .field("scope", &self.scope)
+                .field("fitting", &self.fitting)
                 .field("prefix", &resident.offset)
                 .field("tail", tail)
                 .field("extra", extra)
@@ -318,7 +408,7 @@ impl fmt::Debug for Conversation {
 
 impl PartialEq for Conversation {
     fn eq(&self, other: &Self) -> bool {
-        match (&self.0, &other.0) {
+        match (&self.source, &other.source) {
             (Source::Canonical(a), Source::Canonical(b)) => a == b,
             (
                 Source::Retained {
@@ -623,9 +713,9 @@ fn exchanges(messages: &[Message]) -> impl DoubleEndedIterator<Item = &[Message]
 }
 
 /// A protocol's encoding of a conversation, a prepared message at a time.
-pub(crate) trait Fold: Clone + Send + 'static {
+pub(crate) trait Fold: Clone + Send + Sync + 'static {
     /// Encodings are reusable only with the same request context.
-    type Cx: PartialEq + Send + 'static;
+    type Cx: PartialEq + Send + Sync + 'static;
 
     fn cx(&self) -> &Self::Cx;
 
@@ -645,17 +735,46 @@ impl<F: Fold> Step for F {
     }
 }
 
-struct Kept {
+#[derive(Clone, PartialEq)]
+struct Compiler {
     provider: SmolStr,
     model: SmolStr,
+    protocol: crate::ProtocolKey,
+    scope: Option<crate::Json>,
+    offers: crate::Tools,
+    options: Arc<crate::Options>,
+    body: Option<Arc<serde_json::Map<String, Value>>>,
+    fitting: crate::fit::Limits,
+}
+
+impl Compiler {
+    fn of(request: &crate::Request, target: &Target<'_>) -> Self {
+        Self {
+            provider: target.provider.id.clone(),
+            model: target.model.into(),
+            protocol: target.provider.protocol.key(),
+            scope: request.messages.scope.clone(),
+            offers: request.tools.clone(),
+            options: Arc::new(request.options.clone()),
+            body: request.body.clone().map(Arc::new),
+            fitting: request.messages.fitting.unwrap_or_else(|| {
+                crate::fit::Limits::of_protocol(target.provider.protocol.key(), target.model)
+            }),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Kept {
+    compiler: Compiler,
     len: usize,
     mark: u64,
     images: usize,
     pass: Prepare,
-    settled: Vec<Shared>,
+    settled: Fragments,
 }
 
-type Encoding = (Kept, Box<dyn Any + Send>);
+type Encoding = (Kept, Arc<dyn Any + Send + Sync>);
 
 #[cfg(test)]
 thread_local! {
@@ -666,16 +785,13 @@ thread_local! {
 impl Kept {
     fn take(
         messages: &Messages,
-        target: &Target<'_>,
-        fits: &dyn Fn(&(dyn Any + Send)) -> bool,
-    ) -> (Self, Option<Box<dyn Any + Send>>) {
+        compiler: Compiler,
+        fits: &dyn Fn(&(dyn Any + Send + Sync)) -> bool,
+    ) -> (Self, Option<Arc<dyn Any + Send + Sync>>) {
         if let Some(encodings) = &messages.1 {
             let mut kept = encodings.lock().unwrap_or_else(PoisonError::into_inner);
             let at = kept.iter().position(|(kept, fold)| {
-                kept.provider == target.provider.id
-                    && kept.model == target.model
-                    && fits(&**fold)
-                    && messages.holds(kept.len, kept.mark)
+                kept.compiler == compiler && fits(&**fold) && messages.holds(kept.len, kept.mark)
             });
             if let Some(at) = at {
                 let (kept, fold) = kept.remove(at);
@@ -683,13 +799,12 @@ impl Kept {
             }
         }
         let new = Self {
-            provider: target.provider.id.clone(),
-            model: target.model.into(),
+            compiler,
             len: 0,
             mark: 0,
             images: 0,
             pass: Prepare::default(),
-            settled: Vec::new(),
+            settled: Fragments::default(),
         };
         (new, None)
     }
@@ -710,7 +825,11 @@ impl Kept {
         Ok(())
     }
 
-    fn keep(mut self, messages: &Messages, fold: Box<dyn Any + Send>) -> (Prepare, Vec<Shared>) {
+    fn keep(
+        mut self,
+        messages: &Messages,
+        fold: Arc<dyn Any + Send + Sync>,
+    ) -> (Prepare, Fragments) {
         let copy = (self.pass.clone(), self.settled.clone());
         if let Some(&mark) = messages.0.marks.last()
             && let Some(encodings) = &messages.1
@@ -743,18 +862,19 @@ impl Settled {
 }
 
 pub(crate) fn fold<F: Fold>(
-    conversation: &Conversation,
+    request: &crate::Request,
     target: &Target<'_>,
     initial: F,
-) -> Result<(F, Vec<Shared>), Error> {
-    match &conversation.0 {
-        Source::Canonical(messages) => fold_messages(messages, target, initial),
+) -> Result<(F, Fragments), Error> {
+    let compiler = Compiler::of(request, target);
+    match &request.messages.source {
+        Source::Canonical(messages) => fold_messages(messages, target, initial, compiler),
         Source::Retained {
             resident,
             tail,
             extra,
             restore,
-        } => fold_retained(resident, tail, extra, restore, target, initial),
+        } => fold_retained(resident, tail, extra, restore, target, initial, compiler),
     }
 }
 
@@ -762,18 +882,18 @@ fn fold_messages<F: Fold>(
     messages: &Messages,
     target: &Target<'_>,
     fold: F,
-) -> Result<(F, Vec<Shared>), Error> {
-    let fits = |kept: &(dyn Any + Send)| {
+    compiler: Compiler,
+) -> Result<(F, Fragments), Error> {
+    let fits = |kept: &(dyn Any + Send + Sync)| {
         kept.downcast_ref::<F>()
             .is_some_and(|kept| kept.cx() == fold.cx())
     };
-    let (mut kept, found) = Kept::take(messages, target, &fits);
-    let mut state = match found.map(<Box<dyn Any + Send>>::downcast::<F>) {
-        Some(Ok(found)) => *found,
-        _ => fold,
-    };
+    let (mut kept, found) = Kept::take(messages, compiler, &fits);
+    let mut state = found
+        .and_then(|found| found.downcast_ref::<F>().cloned())
+        .unwrap_or(fold);
     kept.grow(messages, target, &mut state)?;
-    let (mut pass, mut settled) = kept.keep(messages, Box::new(state.clone()));
+    let (mut pass, mut settled) = kept.keep(messages, Arc::new(state.clone()));
     let mut bytes = Settled::default();
     pass.finish(&mut state, &mut bytes)?;
     settled.extend(bytes.shared());
@@ -798,7 +918,8 @@ fn fold_retained<F: Fold>(
     restore: &Arc<dyn Fn() -> Result<Messages, Error> + Send + Sync>,
     target: &Target<'_>,
     initial: F,
-) -> Result<(F, Vec<Shared>), Error> {
+    compiler: Compiler,
+) -> Result<(F, Fragments), Error> {
     let stop = resident.offset + tail.len();
     let found = resident
         .encoding
@@ -806,8 +927,7 @@ fn fold_retained<F: Fold>(
         .unwrap_or_else(PoisonError::into_inner)
         .take();
     let found = found.filter(|(kept, fold)| {
-        kept.provider == target.provider.id
-            && kept.model == target.model
+        kept.compiler == compiler
             && kept.len >= resident.offset
             && kept.len <= stop
             && (if kept.len == resident.offset {
@@ -824,7 +944,7 @@ fn fold_retained<F: Fold>(
         let at = kept.len - resident.offset;
         (
             kept,
-            *fold.downcast::<F>().expect("matched fold"),
+            fold.downcast_ref::<F>().expect("matched fold").clone(),
             &tail[at..],
         )
     } else {
@@ -835,13 +955,12 @@ fn fold_retained<F: Fold>(
         };
         (
             Kept {
-                provider: target.provider.id.clone(),
-                model: target.model.into(),
+                compiler,
                 len: 0,
                 mark: 0,
                 images: 0,
                 pass: Prepare::default(),
-                settled: Vec::new(),
+                settled: Fragments::default(),
             },
             initial,
             &canonical[..],
@@ -867,7 +986,7 @@ fn fold_retained<F: Fold>(
     *resident
         .encoding
         .lock()
-        .unwrap_or_else(PoisonError::into_inner) = Some((kept, Box::new(state.clone())));
+        .unwrap_or_else(PoisonError::into_inner) = Some((kept, Arc::new(state.clone())));
     let mut bytes = Settled::default();
     for message in extra {
         #[cfg(test)]
@@ -879,13 +998,49 @@ fn fold_retained<F: Fold>(
     Ok((state, settled))
 }
 
+/// Immutable settled runs; a branch shares the existing chunk tree.
+#[derive(Clone, Default)]
+pub struct Fragments(rpds::VectorSync<Shared>);
+
+impl Fragments {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &Shared> {
+        self.0.iter()
+    }
+}
+
+impl Extend<Shared> for Fragments {
+    fn extend<T: IntoIterator<Item = Shared>>(&mut self, runs: T) {
+        for bytes in runs {
+            self.0.push_back_mut(bytes);
+        }
+    }
+}
+
+impl From<Vec<Shared>> for Fragments {
+    fn from(runs: Vec<Shared>) -> Self {
+        let mut fragments = Self::default();
+        fragments.extend(runs);
+        fragments
+    }
+}
+
+impl fmt::Debug for Fragments {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
 /// Request-specific items surround shared, previously settled JSON.
 #[derive(Debug)]
 pub struct History {
     pub key: &'static str,
     pub head: Vec<Value>,
     /// Runs of items, separated by commas; none is empty.
-    pub settled: Vec<Shared>,
+    pub settled: Fragments,
     pub tail: Vec<Value>,
     /// Text around the settled runs, when they are one element of the
     /// array rather than its elements (Gemini's `functionDeclarations`).
@@ -893,11 +1048,11 @@ pub struct History {
 }
 
 impl History {
-    pub(crate) fn new(key: &'static str, settled: Vec<Shared>, tail: Vec<Value>) -> Self {
+    pub(crate) fn new(key: &'static str, settled: impl Into<Fragments>, tail: Vec<Value>) -> Self {
         Self {
             key,
             head: Vec::new(),
-            settled,
+            settled: settled.into(),
             tail,
             wrap: None,
         }
@@ -916,7 +1071,7 @@ impl History {
             out.text(open);
             first = true;
         }
-        for bytes in &self.settled {
+        for bytes in self.settled.iter() {
             out.comma(&mut first);
             out.shared(Arc::clone(bytes));
         }
