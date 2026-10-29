@@ -6,6 +6,7 @@ pub const OAUTH_CLIENT_ID: &str = "https://arut.land/.well-known/oauth-client/a.
 
 mod config;
 mod discovery;
+mod elicitation;
 mod headers;
 mod identity;
 mod incoming;
@@ -191,7 +192,7 @@ impl Mcp {
                 }),
             }
         };
-        rt::or(work, async {
+        let result = rt::or(work, async {
             rt::or(
                 async {
                     cx.cancel.wait().await;
@@ -204,7 +205,13 @@ impl Mcp {
             )
             .await
         })
-        .await
+        .await?;
+        if result["resultType"] == "input_required" && method != "tools/call" {
+            return Err(Failure::Protocol(
+                "input_required is not allowed on this method".into(),
+            ));
+        }
+        Ok(result)
     }
 
     fn is_http(&self, name: &ServerName) -> bool {
@@ -609,18 +616,7 @@ impl Extension for Mcp {
         r.text(Text::generation("mcp-index", 30, index))
             .tool(List(self.clone()))
             .tool(Schema(self.clone()))
-            .tool(Call(self.clone()))
-            .tool(oauth::Authorize)
-            .on::<ext::point::Permission>(|_, call| {
-                if call.tool == <oauth::Authorize as Tool>::NAME {
-                    protocol::Permission::Ask(protocol::ApprovalReason::OperatorRule {
-                        tool: call.tool.into(),
-                        input: None,
-                    })
-                } else {
-                    protocol::Permission::Allow
-                }
-            });
+            .question_tool(Call(self.clone()));
     }
 }
 
@@ -663,7 +659,6 @@ pub enum Failure {
     Cancelled,
     Protocol(String),
     Remote { code: i64, message: String },
-    InputRequired,
     Limit,
 }
 
@@ -780,42 +775,65 @@ impl Tool for Schema {
 }
 
 struct Call(Mcp);
-impl Tool for Call {
+impl ext::QuestionTool for Call {
     type In = CallInput;
     type Out = ResultFact;
+    type State = elicitation::Continuation;
     const NAME: &'static str = "mcp_call";
     const DESCRIPTION: &'static str =
         "Call an MCP tool with arguments from its schema. External effects are never replayed.";
-    async fn call(&self, input: &CallInput, cx: &Cx) -> Result<ResultFact, String> {
-        let args = &input.arguments;
-        if !args.is_object() {
-            return Ok(ResultFact::Failed(Failure::Protocol(
-                "arguments must be an object".into(),
+    async fn start(
+        &self,
+        input: &CallInput,
+        cx: &Cx,
+    ) -> Result<ext::QuestionStep<ResultFact, Self::State>, String> {
+        if !input.arguments.is_object() {
+            return Ok(ext::QuestionStep::Done(ResultFact::Failed(
+                Failure::Protocol("arguments must be an object".into()),
             )));
         }
-        let result = async {
-            let headers = if self.0.is_http(&input.server) {
-                let tools = self.0.tools(&input.server, cx).await?;
-                let tool = tools
-                    .iter()
-                    .find(|t| t.name == input.tool)
-                    .ok_or_else(|| Failure::Protocol("unknown or invalid HTTP tool".into()))?;
-                headers::parameters(&tool.definition["inputSchema"], args)?
-            } else {
-                http::HeaderMap::new()
+        let headers = if self.0.is_http(&input.server) {
+            let tools = match self.0.tools(&input.server, cx).await {
+                Ok(tools) => tools,
+                Err(e) => return Ok(ext::QuestionStep::Done(ResultFact::Failed(e))),
             };
-            self.0
-                .request_headers(
-                    &input.server,
-                    "tools/call",
-                    json!({"name":input.tool,"arguments":args}),
-                    headers,
-                    cx,
-                )
-                .await
-        }
-        .await;
-        Ok(result.into())
+            let Some(tool) = tools.iter().find(|t| t.name == input.tool) else {
+                return Ok(ext::QuestionStep::Done(ResultFact::Failed(
+                    Failure::Protocol("unknown or invalid HTTP tool".into()),
+                )));
+            };
+            match headers::parameters(&tool.definition["inputSchema"], &input.arguments) {
+                Ok(headers) => headers,
+                Err(e) => return Ok(ext::QuestionStep::Done(ResultFact::Failed(e))),
+            }
+        } else {
+            http::HeaderMap::new()
+        };
+        let headers = headers
+            .iter()
+            .map(|(k, v)| {
+                v.to_str()
+                    .map(|v| (k.to_string(), v.to_owned()))
+                    .map_err(|e| e.to_string())
+            })
+            .collect::<Result<_, _>>()?;
+        self.0
+            .round(
+                input,
+                json!({"name":input.tool,"arguments":input.arguments}),
+                headers,
+                cx,
+            )
+            .await
+    }
+    async fn answer(
+        &self,
+        input: &CallInput,
+        state: Self::State,
+        answer: protocol::QuestionAnswer,
+        cx: &Cx,
+    ) -> Result<ext::QuestionStep<ResultFact, Self::State>, String> {
+        self.0.continue_call(input, state, answer, cx).await
     }
     fn present(input: &CallInput) -> Option<Card> {
         Some(card(&input.server, &input.tool))

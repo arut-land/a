@@ -118,3 +118,12 @@ patch. Neither changes what the page shows.
 `/fork [seq]` copies the current conversation at a rest point and switches to it.
 Files stay as they are; this does not rewind or copy the workspace. The fork
 keeps its recorded cwd and environment. See [fork semantics](fork.md).
+
+## User questions
+
+Typed server forms render string/number inputs, boolean and choice selectors,
+multiple selection, defaults and optional-field inclusion. Submit, Decline and
+Cancel send JSON in a POST body; the daemon validates the exact question
+sequence. Invalid fields remain editable. URL questions show the complete
+address and an explicit browser link with no opener or referrer. Opening a
+link does not submit consent or completion.

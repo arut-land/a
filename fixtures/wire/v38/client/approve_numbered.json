@@ -1,1 +1,1 @@
-{"t":"approve","call":3,"approved":false,"client_seq":2}
+{"t":"answer","call":3,"answer":{"question":4,"responses":{"confirm":"decline"}},"client_seq":2}

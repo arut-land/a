@@ -307,14 +307,19 @@ impl Once {
                         tool,
                         item.present().title,
                         approval_message(&view.present(item), &id),
+                        if item.present().question.is_some() {
+                            "an answer"
+                        } else {
+                            "approval"
+                        },
                     ))
                 }
                 _ => None,
             });
             match approval {
-                Some((tool, title, explanation)) => {
+                Some((tool, title, explanation, waiting)) => {
                     errln!(
-                        "a: {tool} ({title}) waits for approval in session {id}.\n{explanation}"
+                        "a: {tool} ({title}) waits for {waiting} in session {id}.\n{explanation}"
                     );
                 }
                 None => errln!("a: the turn waits for an answer in session {id}: {answer}"),
@@ -331,6 +336,12 @@ impl Once {
 }
 
 fn approval_message(p: &protocol::view::Presented<'_>, id: &str) -> String {
+    if let Some(question) = p.question {
+        return format!(
+            "{}\nThe question stays open. Answer it with `a attach {id}` or in `a web`.",
+            client::sanitize(&client::question_text(question))
+        );
+    }
     client::approval_parts(p).into_iter().map(|part| match part {
         client::ApprovalPart::Controls { .. } => format!("The session keeps the question open: answer it with `a attach {id}` or in `a web`, or run with `--mode auto` (A_MODE=auto) to let calls through unasked"),
         part => part.text().unwrap_or_default().to_owned(),

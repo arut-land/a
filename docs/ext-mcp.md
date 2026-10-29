@@ -172,3 +172,42 @@ uses `mcp` in its JSON configuration, with `type: local` command arrays
 or `type: remote` URLs. We keep our existing extension table layout and
 explicit argv lists instead of introducing another automatic project
 configuration source.
+
+## Elicitation
+
+`mcp_call` supports MCP 2026-07-28 MRTR form and URL elicitation. Each
+`input_required` response becomes one durable question containing every keyed
+input request, plus its opaque `requestState`. A round without requested inputs
+becomes an explicit Continue step, including an empty input map without
+`requestState`. Only the latest state and answers are sent in a new request,
+with the original tool arguments and frozen mirrored headers. IDs include a daemon boot UUID and monotonic sequence, so restart cannot reuse an
+earlier request ID. No original effect is restarted to resume a question.
+
+The form boundary decodes the restricted schema: string formats/length,
+number/integer bounds, boolean, single/multiple enums and titled options,
+required properties and defaults. Optional absent, empty and false values
+remain distinct. No general JSON Schema evaluator or additional runtime is
+linked. A saved continuation hashes its exact configured server, transport,
+scope, credential registration, declared environment and working directory.
+Unrelated inherited environment changes do not invalidate it. Changed bindings fail before
+contacting the server. Answers and continuation state are ordinary log facts.
+
+Human wait does not retain an exchange timer. Each resumed network exchange
+uses the existing timeout. Decline and Cancel for server prompts are delivered
+as MRTR answers; declining or cancelling a state-only Continue step ends locally
+without inventing an input response key. A batch supports a separate response
+for every prompt;
+Interrupt stops the operation without another application request. Parked
+questions survive restart; answered unsafe requests without a committed
+result become Interrupted rather than being retried.
+
+OAuth authorization uses a service-owned question port. Its card remains
+answerable after the presenting tool is interrupted, and the shared renewal
+publishes one result to its waiters. The callback serves the browser while the
+card awaits Continue; code exchange requires acceptance. Decline or dropping
+the authorization flow discards the code and closes the listener. OAuth's live
+callback listener cannot be restored, so restart cancels that card rather than reviving an unusable URL.
+
+The shared OAuth card has no human-wait deadline. Ordinary HTTP callers keep
+their existing per-request deadlines and cancellation; a renewal and its card
+can outlive those waiters, completing credentials for remaining or later calls.

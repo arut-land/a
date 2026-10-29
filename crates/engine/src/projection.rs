@@ -192,11 +192,13 @@ impl super::Waiter {
                 outcome: outcome.clone(),
                 card: card.clone(),
                 held: held.clone(),
+                parked: None,
             }),
             (Self::Tool(reply), Body::Interrupt { .. }) => reply.send(super::Called {
                 outcome: interrupted().into(),
                 card: None,
                 held: Vec::new(),
+                parked: None,
             }),
             (
                 Self::Model(reply),

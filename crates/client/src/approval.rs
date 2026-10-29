@@ -25,6 +25,9 @@ impl ApprovalPart {
 
 /// A model summary can only follow complete arguments in a pending review.
 pub fn approval_parts(p: &Presented<'_>) -> Vec<ApprovalPart> {
+    if p.question.is_some() {
+        return Vec::new();
+    }
     let Buttons::Approve(call) = p.buttons else {
         return Vec::new();
     };

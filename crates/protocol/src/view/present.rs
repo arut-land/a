@@ -124,6 +124,8 @@ pub struct Presented<'a> {
     pub buttons: Buttons,
     pub reason: Option<&'a ApprovalReason>,
     pub description: Option<&'a str>,
+    pub question: Option<&'a crate::Question>,
+    pub question_seq: Option<crate::Seq>,
     pub input: Option<(&'a str, &'a Json)>,
 }
 
@@ -140,6 +142,8 @@ fn plain<'a>(kind: Kind, title: Cow<'a, str>, body: Shown<'a>) -> Presented<'a> 
         reason: None,
         description: None,
         input: None,
+        question: None,
+        question_seq: None,
     }
 }
 
@@ -263,7 +267,7 @@ fn replied<'a>(
 fn standing<'a>(
     p: &mut Presented<'a>,
     call: CallId,
-    phase: &Phase,
+    phase: &'a Phase,
     outcome: Option<&'a ToolOutcome>,
     card: Option<&'a Card>,
 ) {
@@ -273,7 +277,11 @@ fn standing<'a>(
                 p.buttons = Buttons::Approve(call);
                 (Glyph::Ask, "waiting for approval")
             }
-            Phase::Waiting(WaitOn::Dialog { .. }) => (Glyph::Ask, "waiting for input"),
+            Phase::Waiting(WaitOn::Question { request }) => {
+                p.question = Some(&request.question);
+                p.buttons = Buttons::Approve(call);
+                (Glyph::Ask, "waiting for input")
+            }
             Phase::Waiting(WaitOn::Client { .. }) => (Glyph::Ask, "waiting for a client"),
             Phase::Settled(_) => (Glyph::Denied, "not approved"),
             Phase::Gating { .. } | Phase::Running | Phase::Waiting(WaitOn::Child { .. }) => {

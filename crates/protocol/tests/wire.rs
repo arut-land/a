@@ -190,12 +190,60 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
         sample("input_segments", ClientMsg::input(segments())),
         sample("list", ClientMsg::List),
         sample("detach", ClientMsg::Detach),
-        sample("approve", ClientMsg::approve(CallId::new(3).unwrap(), true)),
+        sample(
+            "answer_form",
+            ClientMsg::answer(
+                CallId::new(3).unwrap(),
+                protocol::QuestionAnswer {
+                    question: Seq::new(4).unwrap(),
+                    responses: BTreeMap::from([(
+                        "form".into(),
+                        protocol::Response::Submit(BTreeMap::from([(
+                            "enabled".into(),
+                            protocol::Json::encode(&false).unwrap(),
+                        )])),
+                    )]),
+                },
+            ),
+        ),
+        sample(
+            "answer_continue",
+            ClientMsg::answer(
+                CallId::new(3).unwrap(),
+                protocol::QuestionAnswer {
+                    question: Seq::new(4).unwrap(),
+                    responses: BTreeMap::from([(
+                        "continue".into(),
+                        protocol::Response::Continue(protocol::ContinueAnswer::Cancel),
+                    )]),
+                },
+            ),
+        ),
+        sample(
+            "answer_cancel",
+            ClientMsg::answer(
+                CallId::new(3).unwrap(),
+                protocol::QuestionAnswer::confirm(Seq::new(4).unwrap(), protocol::Response::Cancel),
+            ),
+        ),
+        sample(
+            "approve",
+            ClientMsg::answer(
+                CallId::new(3).unwrap(),
+                protocol::QuestionAnswer::confirm(
+                    Seq::new(4).unwrap(),
+                    protocol::Response::accept(),
+                ),
+            ),
+        ),
         sample(
             "approve_numbered",
-            ClientMsg::Approve {
+            ClientMsg::Answer {
                 call: CallId::new(3).unwrap(),
-                approved: false,
+                answer: protocol::QuestionAnswer::confirm(
+                    Seq::new(4).unwrap(),
+                    protocol::Response::Decline,
+                ),
                 client_seq: Some(2),
             },
         ),
@@ -562,13 +610,34 @@ fn input_samples() -> Vec<Sample<DaemonMsg>> {
             ),
         ),
         sample(
+            "entry_question",
+            entry(
+                12,
+                Body::Question {
+                    question: protocol::Question {
+                        source: "fixture".into(),
+                        prompts: BTreeMap::from([(
+                            "url".into(),
+                            protocol::Prompt::Url {
+                                message: "Continue in your browser".into(),
+                                url: "https://example.com/consent".into(),
+                            },
+                        )]),
+                    },
+                },
+            ),
+        ),
+        sample(
             "entry_wait_dialog",
             entry(
                 13,
                 Body::Wait {
                     call: call(2),
-                    on: WaitOn::Dialog {
-                        ui: protocol::Json::encode(&json!({ "title": "pick a file" })).unwrap(),
+                    on: WaitOn::Question {
+                        request: Box::new(protocol::QuestionWait {
+                            question: protocol::Question::confirm("pick a file".into()),
+                            checkpoint: Some(protocol::Json::null()),
+                        }),
                     },
                 },
             ),
@@ -579,7 +648,11 @@ fn input_samples() -> Vec<Sample<DaemonMsg>> {
                 14,
                 Body::Answer {
                     call: call(2),
-                    value: protocol::Json::encode(&true).unwrap(),
+                    value: protocol::Json::encode(&protocol::QuestionAnswer::confirm(
+                        Seq::new(3).unwrap(),
+                        protocol::Response::accept(),
+                    ))
+                    .unwrap(),
                     origin: None,
                 },
             ),
@@ -590,7 +663,11 @@ fn input_samples() -> Vec<Sample<DaemonMsg>> {
                 14,
                 Body::Answer {
                     call: call(2),
-                    value: protocol::Json::encode(&false).unwrap(),
+                    value: protocol::Json::encode(&protocol::QuestionAnswer::confirm(
+                        Seq::new(3).unwrap(),
+                        protocol::Response::Decline,
+                    ))
+                    .unwrap(),
                     origin: Some(author),
                 },
             ),

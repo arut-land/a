@@ -87,6 +87,8 @@ pub use settings::{Configured, Empty, Table};
 pub use shape::{Output, Partials, Streamed, stream};
 pub use shared::WorkspaceShared;
 pub use state::{Checkpoint, DynFold, Fold, Image, PreparedPublication, Publication, States};
+mod question;
+pub use question::{Parked, QuestionStep, QuestionTool};
 pub use tool::{
     Args, Callable, Called, Concurrency, Cx, Detach, DynTool, MutationError, MutationResult,
     Parsed, Replay, Resumable, SpawnSpec, Tool,

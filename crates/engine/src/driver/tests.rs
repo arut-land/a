@@ -30,6 +30,7 @@ mod invocation;
 mod later;
 mod log;
 mod parsed;
+mod questions;
 mod retry;
 mod scenarios;
 mod side;
@@ -453,7 +454,18 @@ impl Live {
     fn answer(&self, call: u64, approved: bool) -> Result<(), String> {
         let answer = Request::Answer {
             call: CallId::new(call).unwrap(),
-            value: Json::encode(&approved).unwrap(),
+            value: Json::encode(&protocol::QuestionAnswer::confirm(
+                Ledger::of(&log_of(self))
+                    .call(CallId::new(call).unwrap())
+                    .and_then(|c| c.question_seq)
+                    .unwrap_or_else(|| Seq::new(1).unwrap()),
+                if approved {
+                    protocol::Response::accept()
+                } else {
+                    protocol::Response::Decline
+                },
+            ))
+            .unwrap(),
         };
         rt::block_on(self.request(answer, None))
     }
@@ -1342,6 +1354,11 @@ fn an_interrupt_in_the_burst_that_approves_a_call_stops_it() {
     let [call] = inbox(&log_of(&session))[..] else {
         panic!("not asked");
     };
+    let question = Ledger::of(&log_of(&session))
+        .call(CallId::new(call).unwrap())
+        .unwrap()
+        .question_seq
+        .unwrap();
     // The actor waits in a commit while the answer and the interrupt
     // queue behind it.
     let held = lock(&probe.held);
@@ -1358,7 +1375,11 @@ fn an_interrupt_in_the_burst_that_approves_a_call_stops_it() {
     }
     let approve = Request::Answer {
         call: CallId::new(call).unwrap(),
-        value: Json::encode(&true).unwrap(),
+        value: Json::encode(&protocol::QuestionAnswer::confirm(
+            question,
+            protocol::Response::accept(),
+        ))
+        .unwrap(),
     };
     let asked = [
         queued,
@@ -1442,7 +1463,7 @@ fn an_ask_waits_in_the_inbox_through_a_stop_and_runs_once_approved() {
                     outcome: Outcome::Done { output: protocol::Payload::Inline(output) },
                     card: Some(card), ..
                 },
-            ] if [call, ran, done].iter().all(|c| c.get() == 2) && value.raw() == "true"
+            ] if [call, ran, done].iter().all(|c| c.get() == 2) && value.parse::<protocol::QuestionAnswer>().is_ok_and(|a| a.accepted())
                 && output.parse::<Value>().unwrap()["output"] == "approved\n" && card.note == "exit 0"
         ),
         "{log:#?}"

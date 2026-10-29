@@ -1,3 +1,5 @@
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::sync::Mutex;
@@ -879,4 +881,237 @@ fn erased_errors_obey_the_points_declared_failure_rule() {
     let cx = point_cx(&view);
     assert!(set.input(&cx, "hi".into()).unwrap_err().contains("broken"));
     assert!(set.on_stop(&cx).is_none());
+}
+
+struct Counting;
+
+thread_local! {
+    static ALLOCATIONS: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+fn allocated() {
+    let _ = ALLOCATIONS.try_with(|count| {
+        if let Some(n) = count.get() {
+            count.set(Some(n + 1));
+        }
+    });
+}
+
+// Only this test binary counts; production keeps its allocator.
+#[allow(unsafe_code)]
+// SAFETY: every operation forwards the caller's arguments to System.
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        allocated();
+        // SAFETY: the caller upholds System.alloc's contract.
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        allocated();
+        // SAFETY: the caller upholds System.alloc_zeroed's contract.
+        unsafe { System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+        allocated();
+        // SAFETY: the caller upholds System.realloc's contract.
+        unsafe { System.realloc(ptr, layout, size) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: the caller upholds System.dealloc's contract.
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static COUNTING: Counting = Counting;
+
+#[test]
+fn a_dispatch_without_locals_allocates_nothing() {
+    let set = hooks(vec![one("native", |r| {
+        r.on::<SessionEnd>(|_, ()| ())
+            .on::<Approve>(|_, _| Answer::Now(None));
+    })]);
+    let view = Counted::default();
+    let cx = point_cx(&view);
+    let input = Json::encode(&()).unwrap();
+    ALLOCATIONS.set(Some(0));
+    set.run::<SessionEnd>(&cx, (), &mut (), &mut |_, (), ()| {});
+    assert!(matches!(
+        set.approve_from(&cx, "tool", &input, 0),
+        Asked::None
+    ));
+    let allocations = ALLOCATIONS.replace(None).unwrap();
+    assert_eq!(allocations, 0);
+}
+
+#[test]
+#[ignore = "release dispatch measurement; A_DISPATCH_WORKLOAD=empty|native|nested|local|explicit"]
+fn bench_dispatch() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    let workload = std::env::var("A_DISPATCH_WORKLOAD").unwrap();
+    let nested = hooks(vec![one("inner", |r| {
+        r.on::<SessionEnd>(|_, ()| black_box(()));
+    })]);
+    let set = hooks(vec![one("native", |r| match workload.as_str() {
+        "empty" => (),
+        "nested" => {
+            r.on::<SessionEnd>(move |cx, ()| {
+                nested.run::<SessionEnd>(cx, (), &mut (), &mut |_, (), ()| {});
+            });
+        }
+        "local" | "explicit" => {
+            r.on::<SessionEnd>(|_, ()| {
+                black_box(dispatch_local(0, || Arc::new(1_usize)));
+            });
+        }
+        "native" => {
+            r.on::<SessionEnd>(|_, ()| black_box(()));
+        }
+        _ => panic!("unknown workload"),
+    })]);
+    let view = Counted::default();
+    let cx = point_cx(&view);
+    let context = InvocationContext::default();
+    let run = || {
+        black_box(&set).run::<SessionEnd>(black_box(&cx), (), &mut (), &mut |_, (), ()| {});
+    };
+    if workload == "explicit" {
+        context.scope(run);
+    } else {
+        run();
+    }
+    let counted = std::env::var_os("A_DISPATCH_COUNT").is_some();
+    if counted {
+        ALLOCATIONS.set(Some(0));
+    }
+    let events = if workload == "local" {
+        262_144
+    } else {
+        1_048_576
+    };
+    let start = Instant::now();
+    for _ in 0..events {
+        if workload == "explicit" {
+            context.scope(run);
+        } else {
+            run();
+        }
+    }
+    let elapsed = start.elapsed();
+    let allocations = ALLOCATIONS.replace(None);
+    eprintln!(
+        "dispatch {workload}: {} ns/event; {allocations:?} allocations; {events} events",
+        elapsed.as_secs_f64() * 1e9 / f64::from(events)
+    );
+}
+
+#[test]
+fn nested_dispatches_share_locals_first_created_by_the_inner_handler() {
+    let inner = hooks(vec![one("inner", |r| {
+        r.on::<SessionEnd>(|_, ()| {
+            dispatch_local(0, || Arc::new(AtomicUsize::new(0))).fetch_add(1, Ordering::SeqCst);
+        });
+    })]);
+    let held = Arc::new(Mutex::new(None));
+    let outer = hooks(vec![one("outer", |r| {
+        let held = Arc::clone(&held);
+        r.on::<SessionEnd>(move |cx, ()| {
+            inner.run::<SessionEnd>(cx, (), &mut (), &mut |_, (), ()| {});
+            let local = dispatch_local::<AtomicUsize>(0, || panic!("inner local was lost"));
+            assert_eq!(local.load(Ordering::SeqCst), 1);
+            *held.lock().unwrap() = Some(Arc::downgrade(&local));
+        });
+    })]);
+    let view = Counted::default();
+    for _ in 0..2 {
+        outer.run::<SessionEnd>(&point_cx(&view), (), &mut (), &mut |_, (), ()| {});
+        assert!(held.lock().unwrap().as_ref().unwrap().upgrade().is_none());
+    }
+}
+
+#[test]
+fn local_initializers_can_reenter_the_same_dispatch() {
+    let _dispatch = Dispatch::enter();
+    let local = dispatch_local(0, || {
+        let _nested = Dispatch::enter();
+        dispatch_local(1, || Arc::new(17_usize))
+    });
+    assert!(Arc::ptr_eq(
+        &local,
+        &dispatch_local::<usize>(1, || panic!("nested local was lost"))
+    ));
+    assert!(Arc::ptr_eq(
+        &local,
+        &dispatch_local::<usize>(0, || panic!("outer local was lost"))
+    ));
+}
+
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "panic restoration needs the LLVM backend or a release build"
+)]
+fn unwinding_restores_unused_active_and_explicit_invocation_scopes() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    let explicit = InvocationContext::default();
+    let explicit_local = explicit.local(0, || Arc::new(7_usize));
+    {
+        let _outer = Dispatch::enter();
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                explicit.scope(|| {
+                    let _nested = Dispatch::enter();
+                    assert!(Arc::ptr_eq(
+                        &explicit_local,
+                        &dispatch_local::<usize>(0, || panic!("explicit local was lost"))
+                    ));
+                    panic!("unwind explicit scope");
+                });
+            }))
+            .is_err()
+        );
+        // Restoring an unused active scope must preserve its lazy ownership.
+        assert!(DISPATCH.with_borrow(|state| matches!(state, DispatchState::Active(None))));
+        let local = dispatch_local(0, || Arc::new(11_usize));
+        explicit.scope(|| {
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| {
+                    InvocationContext::default().scope(|| panic!("unwind nested scope"));
+                }))
+                .is_err()
+            );
+            assert!(Arc::ptr_eq(
+                &explicit_local,
+                &dispatch_local::<usize>(0, || panic!("explicit local was lost"))
+            ));
+        });
+        assert!(Arc::ptr_eq(
+            &local,
+            &dispatch_local::<usize>(0, || panic!("outer local was lost"))
+        ));
+    }
+    assert!(
+        catch_unwind(|| {
+            let _outer = Dispatch::enter();
+            dispatch_local(0, || Arc::new(13_usize));
+            panic!("unwind outer dispatch");
+        })
+        .is_err()
+    );
+    assert!(DISPATCH.with_borrow(|state| matches!(state, DispatchState::Outside)));
+    let outside = dispatch_local(0, || Arc::new(19_usize));
+    assert!(!Arc::ptr_eq(
+        &outside,
+        &dispatch_local(0, || Arc::new(19_usize))
+    ));
+    assert!(Arc::ptr_eq(
+        &explicit_local,
+        &explicit.local::<usize>(0, || panic!("owned local was lost"))
+    ));
 }

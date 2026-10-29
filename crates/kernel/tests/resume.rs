@@ -191,7 +191,11 @@ fn a_wait_survives_a_restart_and_runs_once_answered() {
     assert_plan(&fx, (vec![], vec![IDLE]));
     let answered = Body::Answer {
         call: id(2),
-        value: Json::encode(&true).unwrap(),
+        value: Json::encode(&protocol::QuestionAnswer::confirm(
+            Seq::new(3).unwrap(),
+            protocol::Response::accept(),
+        ))
+        .unwrap(),
         origin: None,
     };
     s.table(vec![(

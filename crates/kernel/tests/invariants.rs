@@ -358,7 +358,12 @@ fn states() -> Vec<(&'static str, Session)> {
     state("waiting approval", asking, vec![user("$ x")]);
     let dialog = Event::Waits {
         call: id(2),
-        on: WaitOn::Dialog { ui: Json::null() },
+        on: WaitOn::Question {
+            request: Box::new(protocol::QuestionWait {
+                question: protocol::Question::confirm("pick".into()),
+                checkpoint: Some(Json::null()),
+            }),
+        },
     };
     state("waiting dialog", Reg::echo(), vec![user("$ x"), dialog]);
     let spawn = Event::Spawn {
@@ -933,6 +938,9 @@ fn every_external_effect_has_an_explicit_admission() {
                     "{name}"
                 );
                 if matches!(
+                    &guarded.work,
+                    Work::RunTool { tool, .. } if matches!(tool.as_str(), "bash" | "jobs" | "ask")
+                ) || matches!(
                     guarded.work,
                     Work::StartChild { .. } | Work::Deliver { .. } | Work::Reply { .. }
                 ) {
@@ -940,5 +948,400 @@ fn every_external_effect_has_an_explicit_admission() {
                 }
             }
         }
+    }
+}
+
+mod schedules;
+
+mod schedule_checks {
+    use super::common::{Reg, Session, done, interrupt, tool_done, user};
+    use super::schedules::trace::{self, Checked, Decision, Failure, Result, Trace, require};
+    use kernel::{Core, Event, Load, Note, Requirement, StepPlan, Turn, Work};
+    use protocol::{Body, CallId};
+
+    struct Run {
+        session: Session,
+        pending: Option<CallId>,
+        recovered: bool,
+    }
+
+    impl Run {
+        fn new(registry: std::sync::Arc<dyn kernel::Binding>) -> Self {
+            Self {
+                session: Session::new(registry),
+                pending: None,
+                recovered: false,
+            }
+        }
+
+        fn plan(&mut self, plan: &StepPlan) -> Checked<()> {
+            for guarded in &plan.admitted {
+                let Work::RunTool { call, tool, .. } = &guarded.work else {
+                    return Err(Failure::Invariant(format!(
+                        "unbound external work: {:?}",
+                        guarded.work
+                    )));
+                };
+                require(tool == "sleep", "unexpected tool")?;
+                require(
+                    guarded.admission.requirement == Requirement::Ordered,
+                    "safe work must wait for ordering",
+                )?;
+                require(
+                    guarded.admission.through >= call.get(),
+                    "admission must cover intent",
+                )?;
+                require(self.pending.replace(*call).is_none(), "duplicate start")?;
+            }
+            require(
+                plan.immediate
+                    .iter()
+                    .all(|w| matches!(w, Work::Cancel { .. } | Work::MarkBusy(_))),
+                "unbound immediate work",
+            )
+        }
+
+        fn apply(&mut self, step: Decision) -> Checked<StepPlan> {
+            let event = match step {
+                Decision::Input if self.session.log.is_empty() => user("sleep 1"),
+                Decision::Progress if self.pending.is_some() => Event::Note {
+                    call: self.pending.unwrap(),
+                    note: Note::Progress("ordered".into()),
+                },
+                Decision::Cancel => interrupt(),
+                Decision::Complete | Decision::RecoveredComplete => {
+                    if (step == Decision::RecoveredComplete) != self.recovered {
+                        return Err(Failure::Invalid(
+                            "completion belongs to another generation".into(),
+                        ));
+                    }
+                    let call = self
+                        .pending
+                        .take()
+                        .ok_or_else(|| Failure::Invalid("completion without a start".into()))?;
+                    tool_done(call.get(), done(serde_json::json!("finished")))
+                }
+                Decision::Crash { cut } if cut <= self.session.log.len() => {
+                    let log = self.session.log[..cut].to_vec();
+                    let (session, plan) = Session::resume(Reg::echo().arc(), log, &Load::default());
+                    self.session = session;
+                    self.pending = None;
+                    self.recovered = true;
+                    return Ok(plan);
+                }
+                // Core exposes admission, while the native runner owns journal delivery.
+                Decision::Flush { .. } => return Ok(StepPlan::default()),
+                _ => return Err(Failure::Invalid(format!("unbound decision: {step:?}"))),
+            };
+            Ok(self.session.step(event))
+        }
+
+        fn replay(trace: &Trace) -> Checked<Self> {
+            Self::replay_with(trace, Reg::echo().arc())
+        }
+
+        fn replay_with(
+            trace: &Trace,
+            registry: std::sync::Arc<dyn kernel::Binding>,
+        ) -> Checked<Self> {
+            eprintln!(
+                "replay: A_SCHEDULE_TRACE='{trace}' cargo test -p kernel --test invariants every_held_epoch -- --nocapture"
+            );
+            let groups = trace.groups().map_err(Failure::Invalid)?;
+            let mut run = Self::new(registry);
+            for group in groups {
+                let plans = group
+                    .iter()
+                    .map(|step| run.apply(*step))
+                    .collect::<Checked<Vec<_>>>()?;
+                // The driver carries a merged burst only after stepping all its events.
+                for plan in plans {
+                    run.plan(&plan)?;
+                }
+            }
+            Ok(run)
+        }
+
+        fn settled(&self) -> Checked<()> {
+            require(self.pending.is_none(), "trace left owned work")?;
+            require(
+                *self.session.core.turn() == Turn::Idle && self.session.core.at_rest(),
+                "kernel is not at rest",
+            )?;
+            let inputs = self
+                .session
+                .log
+                .iter()
+                .filter(|e| matches!(e.body, Body::Input { .. }))
+                .count();
+            let intents = self
+                .session
+                .log
+                .iter()
+                .filter(|e| matches!(e.body, Body::ToolCall { .. }))
+                .count();
+            require(intents == inputs, "each retained input must own one call")?;
+            let mut calls = std::collections::BTreeSet::new();
+            for e in &self.session.log {
+                if let Body::ToolResult {
+                    call, ref outcome, ..
+                } = e.body
+                {
+                    require(calls.insert(call), "call settled twice")?;
+                    require(
+                        *outcome == done(serde_json::json!("finished")).into(),
+                        "scripted outcome changed",
+                    )?;
+                }
+            }
+            require(calls.len() == inputs, "every retained input must settle")?;
+            let mut folded = Core::new(Reg::echo().arc());
+            for e in &self.session.log {
+                folded.load(e);
+            }
+            require(
+                serde_json::to_value(folded.ledger()).unwrap()
+                    == serde_json::to_value(self.session.core.ledger()).unwrap(),
+                "live and reloaded folds differ",
+            )?;
+            let (resumed, plan) =
+                Core::resume(Reg::echo().arc(), &self.session.log, &Load::default());
+            require(
+                plan.appends.is_empty() && plan.admitted.is_empty() && resumed.at_rest(),
+                "reloading a settled trace produced work",
+            )
+        }
+    }
+
+    fn check(trace: &Trace) -> Checked<()> {
+        trace.validate().map_err(Failure::Invalid)?;
+        let run = Run::replay(trace)?;
+        if run.pending.is_some() {
+            return Err(Failure::Invalid(
+                "script exhausted before recovery completion".into(),
+            ));
+        }
+        if !trace.0.iter().any(|s| matches!(s, Decision::Crash { .. })) {
+            let cancel = trace.0.iter().position(|s| *s == Decision::Cancel);
+            let complete = trace
+                .0
+                .iter()
+                .position(|s| *s == Decision::Complete)
+                .unwrap();
+            require(
+                run.session
+                    .log
+                    .iter()
+                    .filter(|e| matches!(e.body, Body::Interrupt { .. }))
+                    .count()
+                    == usize::from(cancel.is_some_and(|cancel| cancel < complete)),
+                "cancellation must follow the chosen delivery order",
+            )?;
+        }
+        run.settled()
+    }
+
+    fn checked(trace: &Trace) {
+        if let Err(error) = check(trace) {
+            failed(trace, &error);
+        }
+    }
+
+    fn failed(trace: &Trace, error: &Failure) -> ! {
+        let minimal = trace::shrink(trace.clone(), |candidate| {
+            matches!(check(candidate), Err(Failure::Invariant(_)))
+        });
+        panic!(
+            "{error}\nreplay with A_SCHEDULE_TRACE='{minimal}' cargo test -p kernel --test invariants every_held_epoch -- --nocapture\noriginal: {trace}"
+        );
+    }
+
+    #[test]
+    fn every_held_epoch_trace_settles_once_and_reloads_the_same_fold() {
+        if let Ok(text) = std::env::var("A_SCHEDULE_TRACE") {
+            checked(&text.parse().unwrap());
+            return;
+        }
+        let mut count = 0;
+        for result in [Result::Success, Result::Failure] {
+            for trace in trace::held_epochs(result) {
+                checked(&trace);
+                let run = Run::replay(&trace).unwrap();
+                // An earlier failure certifies none of the new turn's suffix.
+                let last = if result == Result::Failure {
+                    0
+                } else {
+                    run.session.log.len()
+                };
+                for cut in 0..=last {
+                    let mut crashed = trace.clone();
+                    crashed.0.push(Decision::Crash { cut });
+                    let recovered =
+                        Run::replay(&crashed).unwrap_or_else(|error| failed(&crashed, &error));
+                    if recovered.pending.is_some() {
+                        crashed
+                            .0
+                            .extend([Decision::RecoveredComplete, Decision::Batch]);
+                    }
+                    checked(&crashed);
+                    count += 1;
+                }
+            }
+        }
+        eprintln!("checked {count} crash traces");
+    }
+
+    #[test]
+    fn shrinking_keeps_source_order_and_an_exact_replay() {
+        let traces = trace::held_epochs(Result::Failure);
+        assert_eq!(traces.len(), 18);
+        let mut orders = std::collections::BTreeSet::new();
+        for trace in traces {
+            let unbatched = Trace(
+                trace
+                    .0
+                    .iter()
+                    .copied()
+                    .filter(|s| *s != Decision::Batch)
+                    .collect(),
+            );
+            orders.insert(unbatched.to_string());
+            assert!(
+                trace
+                    .0
+                    .iter()
+                    .position(|s| matches!(s, Decision::Flush { epoch: 1, .. }))
+                    < trace
+                        .0
+                        .iter()
+                        .position(|s| matches!(s, Decision::Flush { epoch: 0, .. }))
+            );
+            let original = trace.clone();
+            assert_eq!(trace.to_string().parse::<Trace>().unwrap(), trace);
+            trace.validate().unwrap();
+            let small = trace::shrink(trace, |t| {
+                t.validate().is_ok()
+                    && Run::replay(t).is_ok_and(|r| {
+                        r.session
+                            .log
+                            .iter()
+                            .any(|e| matches!(e.body, Body::Interrupt { .. }))
+                    })
+            });
+            let mut source_order = original.0.iter();
+            for survivor in &small.0 {
+                assert!(source_order.any(|step| step == survivor));
+            }
+            if small.0.iter().position(|s| *s == Decision::Cancel)
+                < small.0.iter().position(|s| *s == Decision::Complete)
+            {
+                for i in 0..small.0.len() {
+                    let mut candidate = small.clone();
+                    candidate.0.remove(i);
+                    assert!(
+                        !(candidate.validate().is_ok()
+                            && Run::replay(&candidate).is_ok_and(|r| r
+                                .session
+                                .log
+                                .iter()
+                                .any(|e| matches!(e.body, Body::Interrupt { .. }))))
+                    );
+                }
+                checked(&small);
+            }
+        }
+        assert_eq!(orders.len(), 12);
+        let crash: Trace = "crash:9".parse().unwrap();
+        let small = trace::shrink(
+            crash,
+            |t| matches!(t.0.as_slice(), [Decision::Crash { cut }] if *cut >= 2),
+        );
+        assert_eq!(small.to_string(), "crash:2");
+        assert!("flush:0:maybe".parse::<Trace>().is_err());
+        assert!("clock".parse::<Trace>().is_err());
+    }
+
+    #[test]
+    fn an_unbound_effect_never_gets_an_implicit_completion() {
+        let mut session = Session::new(Reg::modeled().arc());
+        let plan = session.step(user("hello"));
+        assert!(matches!(
+            Run::new(Reg::echo().arc()).plan(&plan),
+            Err(Failure::Invariant(_))
+        ));
+        let incomplete: Trace = "input batch batch flush:1:ok flush:0:ok".parse().unwrap();
+        assert!(matches!(check(&incomplete), Err(Failure::Invalid(_))));
+        for text in [
+            "input batch batch progress batch cancel complete batch flush:1:ok batch flush:0:ok batch",
+            "input batch progress batch cancel complete flush:1:ok batch flush:0:ok batch",
+            "input batch progress batch cancel complete batch flush:1:ok batch flush:0:ok",
+        ] {
+            assert!(text.parse::<Trace>().unwrap().validate().is_err(), "{text}");
+        }
+        let merged: Trace =
+            "input batch progress batch cancel complete batch flush:1:ok batch flush:0:ok batch"
+                .parse()
+                .unwrap();
+        assert!(
+            merged
+                .groups()
+                .unwrap()
+                .contains(&[Decision::Cancel, Decision::Complete].as_slice())
+        );
+    }
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the dev backend cannot unwind product frames, so inspect the real panic in a child"
+    )]
+    fn a_product_panic_prints_the_exact_candidate_before_entering_core() {
+        const CHILD: &str = "SCHEDULE_PANIC_CHILD";
+        let text =
+            "input batch progress batch cancel complete batch flush:1:ok batch flush:0:ok batch";
+        if std::env::var_os(CHILD).is_some() {
+            let _ = Run::replay_with(
+                &text.parse().unwrap(),
+                Reg::echo().policy(super::common::Policy::Panic).arc(),
+            );
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "schedule_checks::a_product_panic_prints_the_exact_candidate_before_entering_core",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let replay = stderr
+            .find(&format!("A_SCHEDULE_TRACE='{text}'"))
+            .expect("missing exact replay trace");
+        let panic = stderr
+            .find("the gate broke")
+            .expect("the real Core must reach the panicking gate");
+        assert!(replay < panic, "{stderr}");
+    }
+}
+
+#[test]
+fn user_questions_request_durable_publication_under_either_durability_setting() {
+    for barriers in [kernel::Barriers::Step, kernel::Barriers::Effects] {
+        let mut session = Session::with_barriers(Reg::modeled().arc(), barriers);
+        session.step(user("question"));
+        session.step(prepared(2));
+        session.step(model_done(2, &[("bash", json!({"command":"true"}))]));
+        let plan = session.step(Event::Waits {
+            call: id(4),
+            on: WaitOn::Question {
+                request: Box::new(protocol::QuestionWait {
+                    question: protocol::Question::confirm("Continue?".into()),
+                    checkpoint: Some(Json::null()),
+                }),
+            },
+        });
+        assert!(plan.commit.unwrap().publish);
     }
 }

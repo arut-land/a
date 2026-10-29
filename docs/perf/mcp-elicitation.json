@@ -1,0 +1,145 @@
+{
+  "date": "2026-10-29",
+  "hardware": "Apple M3",
+  "os": "macOS 27.0.1 arm64",
+  "rust": "rustc 1.101.0-nightly (5d8fec066 2026-10-16)",
+  "build_jobs": 2,
+  "target": "one external CARGO_TARGET_DIR",
+  "profile": {
+    "opt_level": "z",
+    "lto": "fat",
+    "codegen_units": 1,
+    "stdlib": "build-std=std,panic_unwind; panic-unwind,optimize_for_size"
+  },
+  "references": {
+    "before": "f343ff37",
+    "before_prompt_flush": "bd101801",
+    "after": "mcp-elicit with immediate pending-question publication and valid empty input maps"
+  },
+  "method": {
+    "idle": "10 pairs, alternating AB/BA; fresh isolated A_HOME; 2 s settle then 3 s RSS/ps CPU window; specific daemon stop after every sample",
+    "latency": "10 batch pairs per workload, alternating AB/BA; 32 cycles per batch, first 2 discarded; 300 retained samples per variant; all binaries built before timing; no own builds during samples",
+    "confirmation": "send a confirmation answer to receiving its durable Answer entry; real bash true completes between cycles, outside the timer",
+    "elicitation": "tool input to final result, five-field form then URL question, automatic test answers; human time and browser navigation excluded",
+    "quartiles": "Python statistics.quantiles(n=4, method=inclusive); no outliers removed",
+    "environment": "provider variables unset; echo agent and deterministic MCP stdio fixture; shared M3"
+  },
+  "binaries": {
+    "mcp-before": {
+      "bytes": 7023504,
+      "sha256": "c25b039dfbbc9ecc2e7b73cf0436fd450f4f385e9b68b6615bc0d8b8d356723d"
+    },
+    "mcp-after": {
+      "bytes": 7206176,
+      "sha256": "d313b9e6b7dde3fa837d230417a7ad697c77c455337c1a84c531598c03942366"
+    },
+    "mcp-before-fixtures": {
+      "bytes": 7073280,
+      "sha256": "8bc7b35b2ee1e40da2acbf38d7405472dade6daf20cc07e63d380c11bb9a95dd"
+    },
+    "mcp-before-bench": {
+      "bytes": 1593264,
+      "sha256": "fdc0a26dad323f2e1ad8dd0eb9f84da92d44f36a1bdc5d1a68579e14f4fe8450"
+    },
+    "mcp-before-prompt-flush-fixtures": {
+      "bytes": 7222960,
+      "sha256": "ecddf97f81d049b8eca6e5c2c45ded7035deaf2443128c1b22424ce6dd4c5c0b"
+    },
+    "mcp-before-prompt-flush-bench": {
+      "bytes": 1659888,
+      "sha256": "2ab289b85cd83fe9581e6430414decfdfc2dddddddc7ba32a74320647e192504"
+    },
+    "mcp-after-fixtures": {
+      "bytes": 7222976,
+      "sha256": "01db5b1da9f9d26d1a52e3dad7bce6b36ba600abae2dee3e9b5d1722548a844b"
+    },
+    "mcp-after-bench": {
+      "bytes": 1659888,
+      "sha256": "2ab289b85cd83fe9581e6430414decfdfc2dddddddc7ba32a74320647e192504"
+    }
+  },
+  "idle": {
+    "before": {
+      "rss_kib": {
+        "n": 10,
+        "median": 9800.0,
+        "min": 9728,
+        "max": 9872,
+        "q1": 9776.0,
+        "q3": 9808.0,
+        "iqr": 32.0
+      },
+      "cpu_seconds": {
+        "n": 10,
+        "median": 0.0,
+        "min": 0.0,
+        "max": 0.0,
+        "q1": 0.0,
+        "q3": 0.0,
+        "iqr": 0.0
+      }
+    },
+    "after": {
+      "rss_kib": {
+        "n": 10,
+        "median": 9864.0,
+        "min": 9824,
+        "max": 9984,
+        "q1": 9844.0,
+        "q3": 9900.0,
+        "iqr": 56.0
+      },
+      "cpu_seconds": {
+        "n": 10,
+        "median": 0.0,
+        "min": 0.0,
+        "max": 0.0,
+        "q1": 0.0,
+        "q3": 0.0,
+        "iqr": 0.0
+      }
+    }
+  },
+  "latency_us": {
+    "confirmation": {
+      "before": {
+        "n": 300,
+        "median": 3080.5,
+        "min": 1472,
+        "max": 24686,
+        "q1": 2987.75,
+        "q3": 4957.25,
+        "iqr": 1969.5
+      },
+      "after": {
+        "n": 300,
+        "median": 3939.5,
+        "min": 1432,
+        "max": 17667,
+        "q1": 3001.0,
+        "q3": 7992.5,
+        "iqr": 4991.5
+      }
+    },
+    "elicitation": {
+      "before_prompt_flush": {
+        "n": 300,
+        "median": 109993.5,
+        "min": 86975,
+        "max": 683272,
+        "q1": 107006.75,
+        "q3": 196266.25,
+        "iqr": 89259.5
+      },
+      "after": {
+        "n": 300,
+        "median": 22043.5,
+        "min": 13175,
+        "max": 310126,
+        "q1": 20056.0,
+        "q3": 73522.25,
+        "iqr": 53466.25
+      }
+    }
+  }
+}

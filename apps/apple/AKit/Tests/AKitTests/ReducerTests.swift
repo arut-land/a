@@ -418,3 +418,21 @@ private func inputFrame(seq: UInt64, text: String) throws -> String {
     #expect(store.items == items)
     expectInStep(store, reducer, "large stream patch")
 }
+
+@Test func typedQuestionsRetainDefaultsAndDisappearWhenAnswered() throws {
+    let reducer = Reducer()
+    let vector = Vector.all.first { $0.name == "typed form submitted" }!
+    var seen = false
+    for message in vector.messages {
+        _ = try reducer.fold(message: message)
+        if let question = reducer.snapshot().items.first?.presentation.question {
+            seen = true
+            #expect(question.source == "fixture")
+            #expect(question.prompts.first?.fields.first?.kind == .boolean)
+            #expect(question.prompts.first?.fields.first?.initial == "false")
+            #expect(question.prompts.first?.fields.first?.required == true)
+        }
+    }
+    #expect(seen)
+    #expect(reducer.snapshot().items.first?.presentation.question == nil)
+}

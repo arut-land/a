@@ -514,3 +514,185 @@ fn concurrent_sessions_share_one_startup_and_receive_only_their_responses_and_pr
     );
     assert_eq!(effects.lines().filter(|l| *l == "discover").count(), 1);
 }
+
+fn pending_question(
+    conn: &mut crate::common::Conn,
+) -> (protocol::CallId, protocol::Seq, protocol::Question) {
+    let entries = conn.until(|e| {
+        matches!(
+            e.body,
+            Body::Wait {
+                on: protocol::WaitOn::Question { .. },
+                ..
+            }
+        )
+    });
+    let entry = entries.last().unwrap();
+    let Body::Wait {
+        call,
+        on: protocol::WaitOn::Question { request },
+    } = &entry.body
+    else {
+        unreachable!()
+    };
+    (*call, entry.seq, request.question.clone())
+}
+
+fn respond(
+    conn: &mut crate::common::Conn,
+    call: protocol::CallId,
+    id: protocol::Seq,
+    question: &protocol::Question,
+) {
+    let responses = question
+        .prompts
+        .iter()
+        .map(|(key, prompt)| {
+            let response = if let protocol::Prompt::Form { fields, .. } = prompt {
+                let values = fields
+                    .iter()
+                    .map(|field| {
+                        let value = match field.name.as_str() {
+                            "name" => json!("Ada"),
+                            "age" => json!(37),
+                            "opt" => json!(false),
+                            "color" => json!("red"),
+                            "tags" => json!(["one"]),
+                            _ => panic!("unknown fixture field"),
+                        };
+                        (field.name.clone(), protocol::Json::encode(&value).unwrap())
+                    })
+                    .collect();
+                protocol::Response::Submit(values)
+            } else {
+                protocol::Response::accept()
+            };
+            (key.clone(), response)
+        })
+        .collect();
+    let answer = protocol::QuestionAnswer {
+        question: id,
+        responses,
+    };
+    question.validate(&answer).unwrap();
+    conn.send(&ClientMsg::answer(call, answer));
+}
+
+#[test]
+fn a_durable_mcp_question_resumes_after_daemon_restart_without_repeating_its_original_request() {
+    let env = configured("mcp-question-restart");
+    env.start();
+    let mut conn = env.connect();
+    let (session, _) = conn.attach(Target::New, &env.ws);
+    call(&mut conn, "ask");
+    let (call, first, question) = pending_question(&mut conn);
+    env.run(&["daemon", "stop"]);
+    env.start();
+    let mut conn = env.connect();
+    let (_, replay) = conn.attach(Target::Id(session), &env.ws);
+    assert!(
+        replay
+            .iter()
+            .any(|e| e.seq == first && matches!(e.body, Body::Wait { .. }))
+    );
+    respond(&mut conn, call, first, &question);
+    let (same, second, question) = pending_question(&mut conn);
+    assert_eq!(same, call);
+    assert_ne!(second, first);
+    respond(&mut conn, call, second, &question);
+    let result = conn.until(|e| matches!(e.body,Body::ToolResult {call:of,..} if of == call));
+    assert!(result.iter().any(|e| matches!(
+        e.body,
+        Body::ToolResult {
+            outcome: Outcome::Done { .. },
+            ..
+        }
+    )));
+    let rounds = fs::read_to_string(env.root.join("effects.rounds")).unwrap();
+    let rounds: Vec<serde_json::Value> = rounds
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rounds.len(), 3);
+    assert_ne!(rounds[0]["id"], rounds[1]["id"]);
+    assert!(rounds[2]["params"].get("requestState").is_none());
+}
+
+#[test]
+#[ignore = "release question latency measurement, run alone"]
+fn question_round_trip_latency() {
+    let env = configured("mcp-question-latency");
+    env.start();
+    let mut conn = env.connect();
+    conn.attach(Target::New, &env.ws);
+    let mut samples = Vec::new();
+    for sample in 0..32 {
+        let start = std::time::Instant::now();
+        call(&mut conn, "ask");
+        let (call, first, question) = pending_question(&mut conn);
+        respond(&mut conn, call, first, &question);
+        let (_, second, question) = pending_question(&mut conn);
+        respond(&mut conn, call, second, &question);
+        conn.until(|e| matches!(e.body,Body::ToolResult {call:of,..} if of == call));
+        if sample >= 2 {
+            samples.push(start.elapsed().as_micros());
+        }
+    }
+    eprintln!(
+        "question_round_trip_us={}",
+        serde_json::to_string(&samples).unwrap()
+    );
+}
+
+#[test]
+#[ignore = "release confirmation latency measurement, run alone"]
+fn confirmation_round_trip_latency() {
+    let env = Env::new("question-confirmation-latency");
+    env.ext("policy", "ask = [\"bash\"]");
+    env.start();
+    let mut conn = env.connect();
+    conn.attach(Target::New, &env.ws);
+    let mut samples = Vec::new();
+    for sample in 0..32 {
+        conn.input("$ true");
+        let entries = conn.until(|e| {
+            matches!(
+                e.body,
+                Body::Decision {
+                    d: Verdict::Permission {
+                        permission: Permission::Ask(_)
+                    },
+                    ..
+                }
+            )
+        });
+        let (call, question) = entries
+            .iter()
+            .find_map(|e| match e.body {
+                Body::Decision {
+                    call: Some(call),
+                    d:
+                        Verdict::Permission {
+                            permission: Permission::Ask(_),
+                        },
+                    ..
+                } => Some((call, e.seq)),
+                _ => None,
+            })
+            .unwrap();
+        let start = std::time::Instant::now();
+        conn.send(&ClientMsg::answer(
+            call,
+            protocol::QuestionAnswer::confirm(question, protocol::Response::accept()),
+        ));
+        conn.until(|e| matches!(e.body,Body::Answer {call:of,..} if of==call));
+        if sample >= 2 {
+            samples.push(start.elapsed().as_micros());
+        }
+        conn.until(|e| matches!(e.body,Body::ToolResult {call:of,..} if of==call));
+    }
+    eprintln!(
+        "confirmation_round_trip_us={}",
+        serde_json::to_string(&samples).unwrap()
+    );
+}

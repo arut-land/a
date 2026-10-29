@@ -1,1 +1,1 @@
-{"t":"entry","seq":14,"epoch":0,"kind":"answer","call":2,"value":true}
+{"t":"entry","seq":14,"epoch":0,"kind":"answer","call":2,"value":{"question":3,"responses":{"confirm":{"accept":{}}}}}

@@ -1,1 +1,1 @@
-{"t":"entry","seq":13,"epoch":0,"kind":"wait","call":2,"on":"dialog","ui":{"title":"pick a file"}}
+{"t":"entry","seq":13,"epoch":0,"kind":"wait","call":2,"on":"question","question":{"source":"authorization","prompts":{"confirm":{"confirm":{"message":"pick a file"}}}},"checkpoint":null}

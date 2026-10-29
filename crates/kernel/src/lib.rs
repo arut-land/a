@@ -106,6 +106,10 @@ impl Barriers {
 /// What happened, as the driver tells the kernel.
 #[derive(Debug)]
 pub enum Event {
+    Question {
+        question: protocol::Question,
+        ticket: Ticket,
+    },
     Invoke {
         existing: Option<CallId>,
         parent: CallId,
@@ -333,6 +337,14 @@ pub struct Admission {
 /// What the driver is to do.
 #[derive(Debug, PartialEq)]
 pub enum Work {
+    QuestionOpened {
+        ticket: Ticket,
+        question: CallId,
+    },
+    QuestionAnswered {
+        question: CallId,
+        answer: protocol::QuestionAnswer,
+    },
     Invocation {
         ticket: Ticket,
         result: Result<CallId, String>,
@@ -359,7 +371,9 @@ pub enum Work {
     },
     /// Send the request prepared for model call `call`, its decisions
     /// logged, streaming under it.
-    Send { call: CallId },
+    Send {
+        call: CallId,
+    },
     /// Run tool call `call` on `input`.
     RunTool {
         call: CallId,
@@ -380,9 +394,20 @@ pub enum Work {
         input: Json,
         value: Json,
     },
+    /// Continues from a committed question checkpoint, never from the original start.
+    Continue {
+        call: CallId,
+        tool: String,
+        input: Json,
+        checkpoint: Json,
+        answer: protocol::QuestionAnswer,
+    },
     /// Await the gate's answer for call `call`; it comes back as
     /// [`Event::Gated`]. Dropped by a [`Work::Cancel`] of the call.
-    Await { call: CallId, answer: Later<Gated> },
+    Await {
+        call: CallId,
+        answer: Later<Gated>,
+    },
     /// Await how to recover model call `call`, which a `request_error`
     /// handler answers later; it comes back as [`Event::Recovered`].
     /// Dropped by a [`Work::Cancel`] of the call.
@@ -391,13 +416,20 @@ pub enum Work {
         answer: Later<Option<(Name, Recover)>>,
     },
     /// Wake the session with [`Event::Woke`] after `after`.
-    Sleep { call: CallId, after: Duration },
+    Sleep {
+        call: CallId,
+        after: Duration,
+    },
     /// Stop what runs, or sleeps, for call `call`; it reports as it ends.
-    Cancel { call: CallId },
+    Cancel {
+        call: CallId,
+    },
     /// Stop waiting on running call `call`: its tool may hand its work to
     /// the background, and one that is [`Detach::Background`] goes on
     /// there, reported as [`Event::Detached`].
-    Detach { call: CallId },
+    Detach {
+        call: CallId,
+    },
     /// Start child session `child` on `input`, owned by link `link`,
     /// unless it runs already.
     StartChild {
@@ -406,16 +438,25 @@ pub enum Work {
         input: String,
     },
     /// Interrupt child session `child`'s turn.
-    Interrupt { child: SessionId },
+    Interrupt {
+        child: SessionId,
+    },
     /// Hand this child session's result to its owner.
-    Report { outcome: protocol::ToolOutcome },
+    Report {
+        outcome: protocol::ToolOutcome,
+    },
     /// Copy stream `stream`, which a restart cut off, nothing owning what
     /// writes it any more, into a blob, leaving it as it is
     /// ([`Event::StreamEnded`]): a blob named by its bytes, so copying
     /// again after another restart makes the same one.
-    EndStream { stream: OutputStream, cut: CutOff },
+    EndStream {
+        stream: OutputStream,
+        cut: CutOff,
+    },
     /// Remove stream `stream`: what it held is logged, or was not wanted.
-    DiscardStream { stream: OutputStream },
+    DiscardStream {
+        stream: OutputStream,
+    },
     /// Whether the session has work in flight, which a restart recovers.
     MarkBusy(bool),
     Deliver {
@@ -444,6 +485,7 @@ impl Work {
             | Self::RunTool { call, .. }
             | Self::Adopt { call, .. }
             | Self::Resume { call, .. }
+            | Self::Continue { call, .. }
             | Self::Await { call, .. }
             | Self::Recover { call, .. }
             | Self::Sleep { call, .. } => Some(call),

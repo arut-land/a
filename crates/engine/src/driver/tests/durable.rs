@@ -1551,6 +1551,7 @@ fn interrupt_revokes_bookkeeping_but_settles_the_completed_effect_once() {
         Completion::Tool {
             call: h.call,
             called: Called {
+                parked: None,
                 outcome: outcome.clone(),
                 card: None,
                 held: Vec::new(),

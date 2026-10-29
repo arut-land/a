@@ -5,6 +5,8 @@
 //! session's link, view and intents ([`SessionClient`]) and the one slash
 //! command table ([`COMMANDS`]); a [`Driver`] owns transport on the supplied runtime.
 
+mod question;
+pub use question::{QuestionDraft, question_text};
 mod approval;
 mod command;
 mod daemons;

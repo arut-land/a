@@ -53,7 +53,11 @@ fn answered_questions_discard_late_annotations() {
                 Epoch(0),
                 Body::Answer {
                     call: CallId::new(1).unwrap(),
-                    value: Json::encode(&true).unwrap(),
+                    value: Json::encode(&protocol::QuestionAnswer::confirm(
+                        Seq::new(3).unwrap(),
+                        protocol::Response::accept(),
+                    ))
+                    .unwrap(),
                     origin: None,
                 },
             )));
@@ -904,7 +908,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                     3,
                     Body::Answer {
                         call: call(1),
-                        value: Json::encode(&true).unwrap(),
+                        value: Json::encode(&protocol::QuestionAnswer::confirm(Seq::new(3).unwrap(), protocol::Response::accept())).unwrap(),
                         origin: None,
                     },
                 ),
@@ -1196,6 +1200,114 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
             .collect();
         scenarios.push((name, messages));
     }
+    for (label, action) in [
+        (
+            "typed form submitted",
+            protocol::Response::Submit(std::collections::BTreeMap::from([(
+                "enabled".into(),
+                Json::encode(&false).unwrap(),
+            )])),
+        ),
+        ("typed form declined", protocol::Response::Decline),
+        ("typed form cancelled", protocol::Response::Cancel),
+    ] {
+        let question = protocol::Question {
+            source: "fixture".into(),
+            prompts: std::collections::BTreeMap::from([(
+                "settings".into(),
+                protocol::Prompt::Form {
+                    message: "Choose settings".into(),
+                    fields: vec![protocol::Field {
+                        name: "enabled".into(),
+                        title: Some("Enabled".into()),
+                        description: None,
+                        required: true,
+                        default: Some(Json::encode(&false).unwrap()),
+                        kind: protocol::FieldKind::Boolean,
+                    }],
+                },
+            )]),
+        };
+        scenarios.push((
+            label,
+            vec![
+                attached(),
+                entry(
+                    1,
+                    Body::ToolCall {
+                        invoke: None,
+                        tool: "remote".into(),
+                        input: Json::null(),
+                        id: None,
+                        card: None,
+                        by: Audience::Model,
+                    },
+                ),
+                entry(
+                    2,
+                    Body::Wait {
+                        call: call(1),
+                        on: protocol::WaitOn::Question {
+                            request: Box::new(protocol::QuestionWait {
+                                question,
+                                checkpoint: Some(Json::encode("opaque state").unwrap()),
+                            }),
+                        },
+                    },
+                ),
+                msg(DaemonMsg::Synced { seq: 2 }),
+                entry(
+                    3,
+                    Body::Answer {
+                        call: call(1),
+                        value: Json::encode(&protocol::QuestionAnswer {
+                            question: Seq::new(2).unwrap(),
+                            responses: std::collections::BTreeMap::from([(
+                                "settings".into(),
+                                action,
+                            )]),
+                        })
+                        .unwrap(),
+                        origin: None,
+                    },
+                ),
+            ],
+        ));
+    }
+    let question = protocol::Question {
+        source: "credential owner".into(),
+        prompts: std::collections::BTreeMap::from([(
+            "url".into(),
+            protocol::Prompt::Url {
+                message: "Continue in your browser".into(),
+                url: "https://example.com/consent".into(),
+            },
+        )]),
+    };
+    scenarios.push((
+        "independent URL question survives turn interruption",
+        vec![
+            attached(),
+            entry(1, Body::Question { question }),
+            entry(2, Body::INTERRUPT),
+            msg(DaemonMsg::Synced { seq: 2 }),
+            entry(
+                3,
+                Body::Answer {
+                    call: call(1),
+                    value: Json::encode(&protocol::QuestionAnswer {
+                        question: Seq::new(1).unwrap(),
+                        responses: std::collections::BTreeMap::from([(
+                            "url".into(),
+                            protocol::Response::accept(),
+                        )]),
+                    })
+                    .unwrap(),
+                    origin: None,
+                },
+            ),
+        ],
+    ));
     scenarios
 }
 
@@ -1366,12 +1478,20 @@ fn answered_and_cancelled_questions_stop_presenting_existing_descriptions() {
     for terminal in [
         Body::Answer {
             call: CallId::new(1).unwrap(),
-            value: Json::encode(&true).unwrap(),
+            value: Json::encode(&protocol::QuestionAnswer::confirm(
+                Seq::new(3).unwrap(),
+                protocol::Response::accept(),
+            ))
+            .unwrap(),
             origin: None,
         },
         Body::Answer {
             call: CallId::new(1).unwrap(),
-            value: Json::encode(&false).unwrap(),
+            value: Json::encode(&protocol::QuestionAnswer::confirm(
+                Seq::new(3).unwrap(),
+                protocol::Response::Decline,
+            ))
+            .unwrap(),
             origin: None,
         },
         Body::ToolResult {
@@ -1435,7 +1555,7 @@ fn view_snapshots_contain_no_execution_authority() {
                     .keys()
                     .map(String::as_str)
                     .collect::<Vec<_>>(),
-                ["phase", "progress"]
+                ["independent", "phase", "progress", "question_seq"]
             );
         }
         assert!(snapshot.get("ledger").is_none());

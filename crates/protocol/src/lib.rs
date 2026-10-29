@@ -11,8 +11,14 @@ use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+mod question;
+pub use question::{
+    Choice, ContinueAnswer, Field, FieldKind, Prompt, Question, QuestionAnswer, QuestionWait,
+    Response, Selection,
+};
+
 /// The exact protocol this build speaks.
-pub const PROTO: u32 = 39;
+pub const PROTO: u32 = 40;
 
 /// Ordinary payloads leave 4 KiB per reserved control slot for cancellation.
 #[derive(Clone, Copy)]
@@ -455,6 +461,7 @@ kinds! {
         /// Call `call` waits on `on`: until it is answered it is in the
         /// session's inbox, delivered to every client. Logged only for a wait
         /// no decision implies (an `ask` permission implies an approval).
+        Question "question" { question: Question } = Durable;
         Wait "wait" { call: CallId, #[serde(flatten)] on: WaitOn } = Durable, read decode::wait_entry;
         /// The answer to call `call`'s wait, from outside the session (a user's
         /// approval is `true` or `false`). The first one wins.
@@ -531,6 +538,7 @@ impl Body {
             | Self::Detached { .. }
             | Self::ToolResult { .. }
             | Self::Decision { .. }
+            | Self::Question { .. }
             | Self::Wait { .. }
             | Self::Link { .. }
             | Self::Outbox { .. }
@@ -749,7 +757,7 @@ kinds! {
         /// A user's approval.
         Approval "approval";
         /// A user's input in a dialog the call shows.
-        Dialog "dialog" { ui: Json };
+        Question "question" { #[serde(flatten)] request: Box<QuestionWait> }, read decode::question_wait;
         /// A client that runs tool `tool`, of which none is attached.
         Client "client" { tool: String };
         /// The child session linked at `link`.
@@ -1713,7 +1721,7 @@ kinds! {
         Settings "settings" { change: Option<SettingsChange> = default };
         /// Answers the approval tool call `call` waits for. The first answer
         /// logged wins.
-        Approve "approve" { call: CallId, approved: bool, client_seq: Option<u64> = default };
+        Answer "answer" { call: CallId, answer: QuestionAnswer, client_seq: Option<u64> = default };
         /// Stops the attached session's turn: its running model or tool call
         /// and, bottom-up, the turns of the sessions it started.
         Interrupt "interrupt" { client_seq: Option<u64> = default };
@@ -1748,7 +1756,7 @@ impl ClientMsg {
         if matches!(
             self,
             Self::Input { .. }
-                | Self::Approve { .. }
+                | Self::Answer { .. }
                 | Self::Interrupt { .. }
                 | Self::Withdraw { .. }
         ) {
@@ -1795,10 +1803,10 @@ impl ClientMsg {
         }
     }
 
-    pub const fn approve(call: CallId, approved: bool) -> Self {
-        Self::Approve {
+    pub fn answer(call: CallId, answer: QuestionAnswer) -> Self {
+        Self::Answer {
             call,
-            approved,
+            answer,
             client_seq: None,
         }
     }
@@ -1807,7 +1815,7 @@ impl ClientMsg {
     pub const fn client_seq(&self) -> Option<u64> {
         match self {
             Self::Input { client_seq, .. }
-            | Self::Approve { client_seq, .. }
+            | Self::Answer { client_seq, .. }
             | Self::Withdraw { client_seq, .. }
             | Self::Interrupt { client_seq } => *client_seq,
             _ => None,
@@ -1819,7 +1827,7 @@ impl ClientMsg {
     pub const fn client_seq_mut(&mut self) -> Option<&mut Option<u64>> {
         match self {
             Self::Input { client_seq, .. }
-            | Self::Approve { client_seq, .. }
+            | Self::Answer { client_seq, .. }
             | Self::Withdraw { client_seq, .. }
             | Self::Interrupt { client_seq } => Some(client_seq),
             Self::Hello { .. }
@@ -2594,7 +2602,10 @@ mod tests {
         for mut msg in [
             ClientMsg::input("x"),
             ClientMsg::INTERRUPT,
-            ClientMsg::approve(CallId::new(1).unwrap(), true),
+            ClientMsg::answer(
+                CallId::new(1).unwrap(),
+                QuestionAnswer::confirm(Seq::new(1).unwrap(), Response::accept()),
+            ),
         ] {
             let bytes = msg.retained_bytes();
             for seq in [0, 1, 10, u64::MAX] {
@@ -2969,7 +2980,11 @@ mod tests {
             },
             Body::Answer {
                 call: CallId::new(4).unwrap(),
-                value: Json::encode(&true).unwrap(),
+                value: Json::encode(&QuestionAnswer::confirm(
+                    Seq::new(3).unwrap(),
+                    Response::accept(),
+                ))
+                .unwrap(),
                 origin: Some(author),
             },
             Body::Interrupt {
@@ -3007,7 +3022,9 @@ mod tests {
                     r#"{head}"decision","by":"hook","call":4,"d":"post_tool","original":{{"status":"failed","error":"e"}}}}"#
                 ),
                 format!(r#"{head}"wait","call":4,"on":"child","link":3}}"#),
-                format!(r#"{head}"answer","call":4,"value":true,{who}}}"#),
+                format!(
+                    r#"{head}"answer","call":4,"value":{{"question":3,"responses":{{"confirm":{{"accept":{{}}}}}}}},{who}}}"#
+                ),
                 format!(r#"{head}"interrupt",{who}}}"#),
                 format!(r#"{head}"edit","target":2,"upto":4}}"#),
             ]
