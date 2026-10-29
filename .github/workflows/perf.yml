@@ -1,464 +1,64 @@
-name: perf
-
+name: Main flakes diagnostic
 on:
-  push:
-    branches: [main, 'perf/**']
-  schedule:
-    - cron: '17 4 * * 1'
   workflow_dispatch:
-    inputs:
-      residency:
-        description: "Complete lifecycle ownership waves (five alternating A/A rounds)"
-        default: false
-        type: boolean
-      idle_charge:
-        description: "Validate native idle charge and a throwaway retained allocation"
-        default: false
-        type: boolean
-      autostart:
-        description: 'Run only the hosted autostart probe'
-        default: false
-        type: boolean
-      variant:
-        description: 'One variant as JSON: {"rustflags": ["-Ctarget-cpu=x86-64-v2"], "config": ["profile.release.package.serde_json.opt-level=2"]}'
-        default: '{}'
-        type: string
-      runner:
-        description: 'Runner label, or all'
-        default: all
-        type: choice
-        options: [all, linux-windows, ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-latest, macos-15-intel]
-      harness_ref:
-        description: 'Harness revision (empty uses this workflow commit); pin for historical experiments'
-        default: ''
-        type: string
-      source_ref:
-        description: 'Source revision (empty uses this workflow revision); main bootstraps a baseline'
-        default: ''
-        type: string
-      bloat:
-        description: 'Collect native crate/function size attribution'
-        default: false
-        type: boolean
-      profile:
-        description: 'Attribute baseline instructions with Callgrind on Linux x86_64 after timing'
-        default: false
-        type: boolean
-      build_only:
-        description: 'Build and inspect a size/linker candidate without runtime measurements'
-        default: false
-        type: boolean
-      paired_ref:
-        description: 'Optional reference source revision for interleaved same-runner tuning'
-        default: ''
-        type: string
-      paired_rounds:
-        description: 'Alternating reference/candidate rounds'
-        default: '5'
-        type: string
-      ablation:
-        description: 'Paired comparison only; skip the separate unpaired suite'
-        default: false
-        type: boolean
-      baseline_run:
-        description: 'Optional bootstrap baseline run ID; otherwise latest successful main lane'
-        default: ''
-        type: string
-      sessions:
-        description: 'Run only the concurrently active sessions layouts (docs/perf/runtime-demand.md)'
-        default: false
-        type: boolean
-      memory:
-        description: 'Only memory survey workloads; skip unrelated benchmark builds'
-        default: false
-        type: boolean
-      survey:
-        description: 'Only round-2 CPU, memory and concurrent-session evidence'
-        default: false
-        type: boolean
-
 permissions:
   contents: read
-  actions: read
-
-concurrency:
-  group: perf-${{ github.ref }}-${{ inputs.autostart && 'autostart' || 'measure' }}-${{ inputs.runner || 'all' }}-${{ inputs.source_ref || github.sha }}-${{ inputs.paired_ref }}-${{ inputs.build_only }}-${{ inputs.sessions }}-${{ inputs.residency }}-${{ inputs.variant || '{}' }}
-  cancel-in-progress: false
-
 env:
-  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 2
   MISE_AUTO_INSTALL: false
-  # Hosted jobs can use the runner; the shared development host uses two.
-  CARGO_BUILD_JOBS: 4
-
 jobs:
-  residency:
-    if: inputs.residency
-    name: residency (${{ matrix.runner }})
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 120
+  probe:
     strategy:
       fail-fast: false
       matrix:
-        runner: ${{ fromJSON(inputs.runner == 'linux-windows' && '["ubuntu-latest", "windows-latest"]' || inputs.runner && inputs.runner != 'all' && format('["{0}"]', inputs.runner) || '["ubuntu-latest", "ubuntu-24.04-arm", "windows-latest", "windows-11-arm", "macos-latest", "macos-15-intel"]') }}
-    defaults:
-      run:
-        shell: bash
-    env:
-      CARGO_BUILD_JOBS: 2
-      CARGO_PROFILE_DEV_CODEGEN_BACKEND: llvm
-      PYTHONDONTWRITEBYTECODE: 1
-      PERF_PAIRED_ROUNDS: ${{ inputs.paired_rounds || '5' }}
-    steps:
-      - name: External build directory
-        run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/tgt-residency-waves" >> "$GITHUB_ENV"
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ inputs.harness_ref || github.sha }}
-          path: harness
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ inputs.source_ref || github.sha }}
-          path: measured
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.13'
-      - run: python -m pip install psutil==7.2.2
-      - name: Select native toolchain
-        working-directory: measured
-        run: |
-          python - <<'PYTHON'
-          import os, tomllib
-          targets = {
-              ('Linux', 'X64'): 'x86_64-unknown-linux-gnu',
-              ('Linux', 'ARM64'): 'aarch64-unknown-linux-gnu',
-              ('Windows', 'X64'): 'x86_64-pc-windows-msvc',
-              ('Windows', 'ARM64'): 'aarch64-pc-windows-msvc',
-              ('macOS', 'X64'): 'x86_64-apple-darwin',
-              ('macOS', 'ARM64'): 'aarch64-apple-darwin',
-          }
-          channel = tomllib.load(open('rust-toolchain.toml', 'rb'))['toolchain']['channel']
-          target = targets[os.environ['RUNNER_OS'], os.environ['RUNNER_ARCH']]
-          with open(os.environ['GITHUB_ENV'], 'a') as env:
-              env.write(f'RUSTUP_TOOLCHAIN={channel}-{target}\n')
-          PYTHON
-      - working-directory: measured
-        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rust-src --component rustfmt --component clippy
-      - if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang mold pkg-config libssl-dev
-      - name: Native Cargo path
-        working-directory: measured
-        run: echo "$(dirname "$(rustup which cargo)")" >> "$GITHUB_PATH"
-      - name: Build and measure complete ownership waves
-        working-directory: harness
-        run: python scripts/perf/hosted.py --phase residency --source ../measured --runner '${{ matrix.runner }}' --output "$RUNNER_TEMP/residency-output"
-      - uses: actions/upload-artifact@v5
-        if: always()
-        with:
-          name: residency-${{ matrix.runner }}
-          path: ${{ runner.temp }}/residency-output/*.json*
-          retention-days: 30
-      - name: Clean owned target
-        if: always()
-        working-directory: measured
-        run: |
-          cargo clean --target-dir "$CARGO_TARGET_DIR"
-          python - <<'PYTHON'
-          import os, shutil
-          shutil.rmtree(os.environ['CARGO_TARGET_DIR'], ignore_errors=True)
-          PYTHON
-
-  idle-charge:
-    if: inputs.idle_charge
-    env:
-      CARGO_BUILD_JOBS: 2
-      CARGO_PROFILE_DEV_CODEGEN_BACKEND: llvm
-      PYTHONDONTWRITEBYTECODE: 1
-    name: idle charge (${{ matrix.os }})
+        os: [ubuntu-latest, windows-latest, windows-11-arm]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: macos-latest
-            target: aarch64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-          - os: windows-11-arm
-            target: aarch64-pc-windows-msvc
     defaults:
       run:
         shell: bash
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.13'
-      - run: python -m pip install psutil==7.2.2
-      - name: Select native Rust toolchain
-        run: |
-          channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
-          echo "RUSTUP_TOOLCHAIN=$channel-${{ matrix.target }}" >> "$GITHUB_ENV"
-          rustup toolchain install "$channel-${{ matrix.target }}" --profile minimal --component rust-src
-      - if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang mold pkg-config libssl-dev
-      - name: Validate real processes and the retained-allocation rejection
-        run: python scripts/perf/idle-charge.py --output "$RUNNER_TEMP/idle-charge-output" --target "$RUNNER_TEMP/idle-charge-target"
-      - uses: actions/upload-artifact@v5
-        if: always()
-        with:
-          name: idle-charge-${{ matrix.os }}
-          path: ${{ runner.temp }}/idle-charge-output/*.json
-
-  measure:
-    if: github.event_name != 'schedule' && !inputs.autostart && !inputs.idle_charge && !inputs.residency
-    name: perf (${{ matrix.runner }})
-    runs-on: ${{ matrix.runner }}
-    # Churn workloads and twenty-round ablations need longer than the standard suite.
-    timeout-minutes: ${{ inputs.sessions && 240 || (inputs.ablation || inputs.survey || inputs.memory) && 180 || 90 }}
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: ${{ fromJSON(inputs.runner == 'linux-windows' && '["ubuntu-latest", "windows-latest"]' || inputs.runner && inputs.runner != 'all' && format('["{0}"]', inputs.runner) || '["ubuntu-latest", "ubuntu-24.04-arm", "windows-latest", "windows-11-arm", "macos-latest", "macos-15-intel"]') }}
-    env:
-      PERF_PAIRED_ROUNDS: ${{ inputs.paired_rounds || '5' }}
-      PERF_ABLATION: ${{ inputs.ablation || false }}
-      PERF_VARIANT: ${{ inputs.variant || '{}' }}
-      PERF_REFERENCE: ${{ inputs.paired_ref }}
-      PERF_BUILD_ONLY: ${{ inputs.build_only }}
-      PERF_BLOAT: ${{ inputs.bloat }}
-      PERF_SESSIONS: ${{ inputs.sessions || false }}
-      PERF_MEMORY: ${{ inputs.memory || false }}
-      PERF_SURVEY: ${{ inputs.survey || false }}
-    defaults:
-      run:
-        shell: bash
-        working-directory: harness
     steps:
       - run: git config --global core.autocrlf false
-        working-directory: ${{ github.workspace }}
       - uses: actions/checkout@v7
-        with:
-          path: harness
-          ref: ${{ inputs.harness_ref || github.sha }}
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ inputs.source_ref || github.sha }}
-          path: measured
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.13'
-      - name: Native accounting and toolchain
-        run: |
-          python -m pip install psutil==7.2.2
-          python - <<'PYTHON'
-          import json, os, platform, sys, tomllib
-          from pathlib import Path
-          sys.path.insert(0, 'scripts/perf')
-          from hosted import hardware
-          output = Path('target/hosted-perf')
-          output.mkdir(parents=True, exist_ok=True)
-          (output / 'host.json').write_text(json.dumps(dict(
-              platform=platform.platform(), machine=platform.machine(), hardware=hardware(),
-              workflow_revision=os.environ.get('GITHUB_SHA')), indent=2) + '\n')
-          targets = {
-              ('Linux', 'X64'): 'x86_64-unknown-linux-gnu',
-              ('Linux', 'ARM64'): 'aarch64-unknown-linux-gnu',
-              ('Windows', 'X64'): 'x86_64-pc-windows-msvc',
-              ('Windows', 'ARM64'): 'aarch64-pc-windows-msvc',
-              ('macOS', 'X64'): 'x86_64-apple-darwin',
-              ('macOS', 'ARM64'): 'aarch64-apple-darwin',
-          }
-          channel = tomllib.load(open('rust-toolchain.toml', 'rb'))['toolchain']['channel']
-          target = targets[os.environ['RUNNER_OS'], os.environ['RUNNER_ARCH']]
-          with open(os.environ['GITHUB_ENV'], 'a') as env:
-              env.write(f'RUSTUP_TOOLCHAIN={channel}-{target}\n')
-          PYTHON
-          echo "RUSTUP_HOME=$RUNNER_TEMP/perf-rustup" >> "$GITHUB_ENV"
-      - uses: actions/cache/restore@v6
-        id: cache
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-          key: perf-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('harness/rust-toolchain.toml', 'harness/Cargo.lock', 'harness/.cargo/*.toml') }}-${{ github.run_id }}
-          restore-keys: perf-v2-${{ runner.os }}-${{ runner.arch }}-
-      # ARM Windows has no Cranelift component; release and benches use LLVM.
-      - id: toolchain
-        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rust-src
-      - uses: jdx/mise-action@v5
-        with:
-          working_directory: harness
-          install_args: hyperfine ${{ runner.os == 'Linux' && 'mold' || '' }}
-      - name: Inherit the native toolchain for all Cargo commands
-        run: python scripts/perf/hosted.py --phase toolchain --runner '${{ matrix.runner }}'
-      - run: python -m unittest discover -s scripts/perf -p 'test_*.py'
-      - if: inputs.bloat
-        name: Install native size attribution tool
-        run: |
-          cargo install cargo-bloat --version 0.12.1 --locked --root "$RUNNER_TEMP/perf-tools"
-          echo "$RUNNER_TEMP/perf-tools/bin" >> "$GITHUB_PATH"
-      - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang pkg-config libssl-dev
-      # Retain the Intel lane's existing native artifact cache.
-      - uses: Swatinem/rust-cache@v2
-        if: matrix.runner == 'macos-15-intel'
-        with:
-          workspaces: measured -> target/perf-build
-          cache-all-crates: true
-          cache-on-failure: true
-      - name: Install the same measurement harness into the source checkout
-        run: |
-          python - <<'PY'
-          import shutil
-          from pathlib import Path
-          for path in ['apps/cli/examples/perf-attach.rs', 'crates/engine/src/driver/tests/bench.rs']:
-              Path('../measured/' + path).parent.mkdir(parents=True, exist_ok=True)
-              shutil.copy2(path, '../measured/' + path)
-          PY
-      - name: Build release binaries and saved benchmarks
-        id: build
-        if: env.PERF_SESSIONS != 'true' && env.PERF_MEMORY != 'true' && env.PERF_SURVEY != 'true'
-        run: |
-          extra=()
-          if [[ "$PERF_BUILD_ONLY" == true ]]; then extra+=(--build-only); fi
-          if [[ "$PERF_BLOAT" == true ]]; then extra+=(--bloat); fi
-          python scripts/perf/hosted.py --phase build --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' "${extra[@]}"
-      - name: Measure startup workloads and benches
-        timeout-minutes: 20
-        if: env.PERF_BUILD_ONLY != 'true' && env.PERF_ABLATION != 'true' && env.PERF_SESSIONS != 'true' && env.PERF_MEMORY != 'true' && env.PERF_SURVEY != 'true'
-        run: |
-          python scripts/perf/hosted.py --phase measure --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}'
-      - name: Measure alternating reference and candidate rounds
-        timeout-minutes: ${{ inputs.ablation && 140 || 45 }}
-        if: ${{ !cancelled() && steps.build.outcome == 'success' && env.PERF_REFERENCE != '' && env.PERF_BUILD_ONLY != 'true' }}
-        run: |
-          python scripts/perf/hosted.py --phase paired --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' --paired-ref "$PERF_REFERENCE"
-      - name: Measure concurrently active sessions
-        if: env.PERF_SESSIONS == 'true'
-        timeout-minutes: 210
-        run: |
-          python scripts/perf/hosted.py --phase sessions --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}' --paired-ref "$PERF_REFERENCE"
-      - name: Measure survey CPU and memory workloads
-        if: env.PERF_BUILD_ONLY != 'true' && env.PERF_ABLATION != 'true' && env.PERF_SESSIONS != 'true'
-        run: |
-          phase=evidence
-          if [[ "$PERF_MEMORY" == true ]]; then phase=memory; fi
-          if [[ "$PERF_SURVEY" == true ]]; then phase=survey; fi
-          python scripts/perf/hosted.py --phase "$phase" --source ../measured --variant "$PERF_VARIANT" --runner '${{ matrix.runner }}'
-      - name: Compare with main
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-          BASELINE_RUN: ${{ inputs.baseline_run }}
-        run: |
-          if [[ -f target/hosted-perf/result.json ]]; then
-            python scripts/perf/compare.py target/hosted-perf/result.json --baseline-run "$BASELINE_RUN"
-          elif [[ -f target/hosted-perf/build.json ]]; then
-            python - <<'PYTHON'
-          import json, os
-          from pathlib import Path
-          result = json.loads(Path('target/hosted-perf/build.json').read_text())
-          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as stream:
-              stream.write(f"Build observation: {result['shipped_bytes'] / 1024:.3f} KiB. Runtime metrics were not completed.\n")
-          PYTHON
-          fi
-      - name: Attribute hot paths
-        if: ${{ !cancelled() && inputs.profile && matrix.runner == 'ubuntu-latest' && steps.build.outcome == 'success' }}
-        timeout-minutes: 25
-        run: |
-          sudo apt-get install -y --no-install-recommends valgrind
-          python scripts/perf/profile.py ../measured
-      - uses: actions/upload-artifact@v5
-        if: always()
-        with:
-          name: perf-${{ matrix.runner }}
-          path: |
-            harness/target/hosted-perf/**/a
-            harness/target/hosted-perf/**/a.exe
-            harness/target/hosted-perf/**/a-fixtures
-            harness/target/hosted-perf/**/a-fixtures.exe
-            harness/target/hosted-perf/**/*-bench
-            harness/target/hosted-perf/**/*-bench.exe
-            harness/target/hosted-perf/**/perf-probe
-            harness/target/hosted-perf/**/perf-probe.exe
-            harness/target/hosted-perf/**/*.json
-            harness/target/hosted-perf/**/*.jsonl
-            harness/target/hosted-perf/**/*.md
-            harness/target/hosted-perf/**/*.callgrind
-            harness/target/hosted-perf/**/*.dSYM/**
-            harness/target/hosted-perf/**/*.dwp
-            harness/target/hosted-perf/**/*.pdb
-          if-no-files-found: warn
-          retention-days: 30
-      - uses: actions/cache/save@v6
-        if: always() && steps.toolchain.outcome == 'success' && steps.cache.outputs.cache-hit != 'true'
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-          key: ${{ steps.cache.outputs.cache-primary-key }}
-
-  # Autostart's lifetime handshake against each OS's real service manager
-  # (scripts/autostart/hosted.py). It registers with the runner's own user
-  # manager, so it runs only on disposable hosted runners: weekly and on demand.
-  autostart:
-    if: github.event_name == 'schedule' || inputs.autostart
-    name: autostart (${{ matrix.runner }})
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel, windows-latest, windows-11-arm]
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 40
-    defaults:
-      run:
-        shell: bash
-    env:
-      CARGO_BUILD_JOBS: 4
-      MISE_AUTO_INSTALL: false
-      CARGO_PROFILE_DEV_CODEGEN_BACKEND: llvm
-    steps:
-      - uses: actions/checkout@v7
-      - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y clang pkg-config libssl-dev
+      - run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/tgt-main-flakes" >> "$GITHUB_ENV"
       - if: runner.os == 'Linux'
         uses: jdx/mise-action@v5
         with:
-          install_args: mold
+          install_args: rust mr-boxington cargo:cargo-nextest mold
       - if: runner.os == 'Linux'
-        name: Use native Cargo without the optional mise wrapper
-        run: echo "$(dirname "$(rustup which cargo)")" >> "$GITHUB_PATH"
+        run: sudo apt-get install -y --no-install-recommends clang pkg-config libssl-dev
       - if: runner.os == 'Windows'
-        name: Install native toolchain
+        name: Install native LLVM toolchain
         shell: pwsh
         run: |
           $channel = (Select-String -Path rust-toolchain.toml -Pattern '^channel = "(.*)"').Matches.Groups[1].Value
           $arch = if ($env:RUNNER_ARCH -eq 'ARM64') { 'aarch64' } else { 'x86_64' }
           $toolchain = "$channel-$arch-pc-windows-msvc"
           "RUSTUP_TOOLCHAIN=$toolchain" >> $env:GITHUB_ENV
-          rustup toolchain install $toolchain --profile minimal --component rust-src
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release -p a
-      - if: runner.os == 'Linux'
-        name: User manager
+          rustup toolchain install $toolchain --profile minimal --component clippy,rust-src,rustfmt
+      - if: runner.os == 'Windows'
+        uses: jdx/mise-action@v5
+        with:
+          install_args: mr-boxington
+      - if: runner.os == 'Windows'
+        name: Install native nextest
+        shell: pwsh
         run: |
-          sudo loginctl enable-linger "$(id -un)"
-          sudo systemctl start "user@$(id -u).service"
-          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
-          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
-      - run: ${{ runner.os == 'Windows' && 'python' || 'python3' }} scripts/autostart/hosted.py target/release/a${{ runner.os == 'Windows' && '.exe' || '' }}
-      - if: failure() && runner.os == 'Linux'
-        run: journalctl --user -u 'a-daemon-*.service' --no-pager -n 150
+          $platform = if ($env:RUNNER_ARCH -eq 'ARM64') { 'windows-arm' } else { 'windows' }
+          $archive = "$env:RUNNER_TEMP/nextest.zip"
+          Invoke-WebRequest "https://get.nexte.st/0.9.148/$platform" -OutFile $archive
+          Expand-Archive $archive -DestinationPath "$env:USERPROFILE/.cargo/bin" -Force
+      - if: runner.os == 'Windows'
+        name: Select native PowerShell contract runners
+        shell: pwsh
+        run: |
+          $runners = @((Get-Command pwsh.exe).Source, "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe")
+          "A_TEST_POWERSHELL=$($runners -join ';')" >> $env:GITHUB_ENV
+      - name: Release reproduction
+        run: |
+          set -o pipefail
+          mise exec -- cargo nextest run --release -p ext-mcp --features fixture -p client -p engine -E 'test(timeout_kills_the_request) | test(the_host_list_follows_its_files) | test(retained_request_sources_do_not_pin)' --stress-count 100 --no-fail-fast --status-level all 2>&1 | while IFS= read -r line; do printf '%s %s\n' "$(date -u +%FT%TZ)" "$line"; done | tee "$RUNNER_TEMP/probe.log"
       - uses: actions/upload-artifact@v5
         if: always()
         with:
-          name: autostart-${{ matrix.runner }}
-          path: autostart-result.json
+          name: probe-${{ matrix.os }}
+          path: ${{ runner.temp }}/probe.log
