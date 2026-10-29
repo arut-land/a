@@ -89,12 +89,7 @@ fn the_host_list_follows_its_files() {
     let until = |names: &[&str]| {
         let deadline = Instant::now() + Duration::from_secs(20);
         while seen.lock().unwrap().last().is_none_or(|last| last != names) {
-            assert!(
-                Instant::now() < deadline,
-                "{:?}, phases {:?}",
-                seen.lock().unwrap(),
-                Sources::watch_diagnostics()
-            );
+            assert!(Instant::now() < deadline, "{:?}", seen.lock().unwrap());
             std::thread::sleep(Duration::from_millis(20));
         }
     };

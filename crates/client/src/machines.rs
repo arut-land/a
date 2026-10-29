@@ -20,8 +20,6 @@ use sys::Home;
 
 use crate::Host;
 
-static DIAGNOSTICS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
-
 /// A machine a client can reach by name.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Machine {
@@ -154,10 +152,8 @@ impl Sources {
 
     /// Resolves routes concurrently on the supplied runtime's Storage pool.
     pub async fn resolve_async(&self, rt: &Rt) -> io::Result<Vec<Known>> {
-        DIAGNOSTICS[0].fetch_add(1, Ordering::Relaxed);
         let sources = self.clone();
         let machines = rt::unblock(&**rt, move || sources.machines()).await?;
-        DIAGNOSTICS[1].fetch_add(1, Ordering::Relaxed);
         let resolving: Vec<_> = machines
             .iter()
             .map(|machine| {
@@ -218,12 +214,7 @@ impl Sources {
         }
     }
 
-    pub fn watch_diagnostics() -> [u64; 6] {
-        std::array::from_fn(|i| DIAGNOSTICS[i].load(Ordering::Relaxed))
-    }
-
     fn route(&self, host: &Host) -> Option<Route> {
-        DIAGNOSTICS[2].fetch_add(1, Ordering::Relaxed);
         let mut ssh =
             Command::new(std::env::var_os("A_SSH").unwrap_or_else(|| OsString::from("ssh")));
         ssh.arg("-G");
@@ -236,7 +227,6 @@ impl Sources {
             .stderr(Stdio::null())
             .output()
             .ok()?;
-        DIAGNOSTICS[3].fetch_add(1, Ordering::Relaxed);
         output.status.success().then_some(())?;
         let text = String::from_utf8_lossy(&output.stdout);
         let value = |key: &str| {
@@ -281,7 +271,6 @@ struct Watched {
 impl Watched {
     fn changed(self: &Arc<Self>) {
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
-        DIAGNOSTICS[4].fetch_add(1, Ordering::Relaxed);
         let watched = Arc::downgrade(self);
         self.rt.spawn(Box::pin(async move {
             let Some(shared) = watched.upgrade() else {
@@ -289,7 +278,6 @@ impl Watched {
             };
             let found = shared.sources.resolve_async(&shared.rt).await;
             if shared.generation.load(Ordering::Acquire) == generation {
-                DIAGNOSTICS[5].fetch_add(1, Ordering::Relaxed);
                 (shared.sink)(found);
             }
         }));
