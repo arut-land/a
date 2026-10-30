@@ -70,6 +70,16 @@ impl ReplyStream {
             return None;
         }
         let position = view.history.as_ref()?;
+        if let Some((key, _, _)) = &self.open
+            && position.start > 0
+            && view.items.first().is_some_and(|item| item.key() > *key)
+        {
+            // A newer tail cannot reconcile the reply still being emitted.
+            return Some(crate::HistoryDemand {
+                anchor: crate::HistoryAnchor::Before(position.start),
+                ..Default::default()
+            });
+        }
         if let Some(fragment) = &position.fragment
             && fragment.key.get() > self.settled
             && view.items.iter().any(|item| {
