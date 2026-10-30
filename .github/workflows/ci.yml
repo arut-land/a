@@ -31,12 +31,17 @@ jobs:
       - uses: jdx/mise-action@v5
         with:
           install_args: mr-boxington
-      - name: Compare pristine and controlled handle lifetimes
+      - name: Install native nextest
+        shell: pwsh
+        run: |
+          $archive = "$env:RUNNER_TEMP/nextest.zip"
+          Invoke-WebRequest "https://get.nexte.st/0.9.148/windows" -OutFile $archive
+          Expand-Archive $archive -DestinationPath "$env:USERPROFILE/.cargo/bin" -Force
+      - name: Compare handle lifetimes under the CI nextest runner
         shell: pwsh
         run: |
           @'
           import json
-          import concurrent.futures
           import os
           from pathlib import Path
           import shutil
@@ -47,57 +52,32 @@ jobs:
           evidence.mkdir(exist_ok=True)
           keep = {"PATH", "PATHEXT", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "COMMONPROGRAMFILES", "COMMONPROGRAMFILES(X86)", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "TMP", "TEMP", "RUSTUP_HOME", "CARGO_HOME", "RUSTUP_TOOLCHAIN", "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS", "LIB", "INCLUDE", "LIBPATH", "VSINSTALLDIR", "VCINSTALLDIR", "VCTOOLSINSTALLDIR", "WINDOWSSDKDIR", "WINDOWSSDKVERSION"}
           clean = {k: v for k, v in os.environ.items() if k.upper() in keep}
-          clean.update(MISE_TRUSTED_CONFIG_PATHS=str(Path.cwd()), MISE_YES="1", MISE_NO_ENV="1", MISE_AUTO_INSTALL="false", CARGO_BUILD_JOBS="2", CARGO_PROFILE_DEV_CODEGEN_BACKEND="llvm", CARGO_TARGET_DIR=str(root / "tgt-small-fixes"), MBX_CACHE_DIR=str(root / "mbx"), A_HOME=str(root / "retirement-home"), OPENAI_API_KEY="loopback-dummy", OPENAI_BASE_URL="http://127.0.0.1:1/v1", ANTHROPIC_API_KEY="loopback-dummy", ANTHROPIC_BASE_URL="http://127.0.0.1:1", NO_PROXY="127.0.0.1,localhost")
+          clean.update(NEXTEST_PROFILE="windows", MISE_TRUSTED_CONFIG_PATHS=str(Path.cwd()), MISE_YES="1", MISE_NO_ENV="1", MISE_AUTO_INSTALL="false", CARGO_BUILD_JOBS="2", CARGO_PROFILE_DEV_CODEGEN_BACKEND="llvm", CARGO_TARGET_DIR=str(root / "tgt-small-fixes"), MBX_CACHE_DIR=str(root / "mbx"), A_HOME=str(root / "retirement-home"), OPENAI_API_KEY="loopback-dummy", OPENAI_BASE_URL="http://127.0.0.1:1/v1", ANTHROPIC_API_KEY="loopback-dummy", ANTHROPIC_BASE_URL="http://127.0.0.1:1", NO_PROXY="127.0.0.1,localhost")
           source = Path("crates/sys/src/runtime/image.rs")
           probed = source.read_bytes()
           pristine = subprocess.check_output(["git", "show", "c6e1b87f:crates/sys/src/runtime/image.rs"], env=clean)
 
-          def build(label):
-              result = subprocess.run(["mise", "exec", "--", "cargo", "test", "-p", "sys", "--lib", "--no-run", "--message-format=json"], env=clean, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, encoding="utf-8", errors="replace")
-              (evidence / f"build-{label}.log").write_text(result.stdout)
-              if result.returncode:
-                  print(result.stdout, flush=True)
-                  raise SystemExit(result.returncode)
-              for line in result.stdout.splitlines():
-                  try:
-                      item = json.loads(line)
-                  except ValueError:
-                      continue
-                  if item.get("reason") == "compiler-artifact" and item.get("executable") and item["target"]["name"] == "sys":
-                      target = root / f"sys-{label}.exe"
-                      shutil.copy2(item["executable"], target)
-                      return str(target)
-              raise RuntimeError("sys test executable missing from Cargo metadata")
+          def run_stress(label, count, mode=None):
+              env = dict(clean)
+              if mode is not None:
+                  env["A_TEST_IMAGE_HANDLE_PROBE"] = mode
+              command = ["mise", "exec", "--", "cargo", "nextest", "run", "-p", "sys", "--features", "test-support", "-E", "test(=runtime::image::tests::retiring_a_running_image_allows_updates_and_reclamation_after_exit)", "--stress-count", str(count), "--no-fail-fast", "--success-output", "immediate", "--failure-output", "immediate"]
+              result = subprocess.run(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, encoding="utf-8", errors="replace")
+              (evidence / f"{label}.log").write_text(result.stdout)
+              summaries = [line for line in result.stdout.splitlines() if "Summary" in line or "stress run iterations" in line]
+              print(json.dumps({"label": label, "returncode": result.returncode, "summaries": summaries}), flush=True)
+              return {"returncode": result.returncode, "summaries": summaries}
 
+          results = {}
           try:
               source.write_bytes(pristine)
-              original_exe = build("pristine")
+              results["pristine"] = run_stress("pristine", 1000)
           finally:
               source.write_bytes(probed)
-          probe_exe = build("probe")
-          name = "runtime::image::tests::retiring_a_running_image_allows_updates_and_reclamation_after_exit"
-          modes = ["pristine", "held", "dropped", "duplicate", "thread", "file", "file-dropped", "posix-file"]
-          counts = {mode: {"passed": 0, "failed": 0} for mode in modes}
-          def run_case(case):
-              round_number, mode = case
-              env = dict(clean)
-              if mode != "pristine":
-                  env["A_TEST_IMAGE_HANDLE_PROBE"] = mode
-              result = subprocess.run([original_exe if mode == "pristine" else probe_exe, "--exact", name, "--nocapture"], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, encoding="utf-8", errors="replace")
-              (evidence / f"{round_number:03d}-{mode}.log").write_text(result.stdout)
-              return mode, result.returncode, result.stdout
-
-          cases = [(n, mode) for n in range(1, 201) for mode in (modes if n % 2 else list(reversed(modes)))]
-          with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-              for completed, future in enumerate(concurrent.futures.as_completed([pool.submit(run_case, case) for case in cases]), 1):
-                  mode, returncode, output = future.result()
-                  counts[mode]["passed" if returncode == 0 else "failed"] += 1
-                  if returncode and counts[mode]["failed"] <= 3:
-                      print(f"mode={mode}\n{output}", flush=True)
-                  if completed % 100 == 0:
-                      print(json.dumps({"completed": completed, "counts": counts}), flush=True)
-          (evidence / "summary.json").write_text(json.dumps({"rounds": 200, "counts": counts}, indent=2))
-          print(json.dumps(counts), flush=True)
+          for mode in ["held", "dropped", "duplicate", "thread", "file", "file-dropped", "posix-file"]:
+              results[mode] = run_stress(mode, 200, mode)
+          (evidence / "summary.json").write_text(json.dumps(results, indent=2))
+          print(json.dumps(results), flush=True)
           '@ | Set-Content "$env:RUNNER_TEMP/retirement-probe.py"
           python "$env:RUNNER_TEMP/retirement-probe.py"
       - if: always()
