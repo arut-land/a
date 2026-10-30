@@ -467,6 +467,16 @@ do not include direct VM allocations outside the heaps. See Microsoft's
 [HeapSummary contract](https://learn.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-heapsummary)
 and [counter definitions](https://learn.microsoft.com/en-us/windows/win32/api/heapapi/ns-heapapi-heap_summary).
 
+Heap capacity is not a partition of the process's private commit: the Server
+2025 observations can report more heap committed capacity than process
+private commit. Subtracting these counters does not identify non-heap charge.
+The optional `census_vmmap=true` diagnostic captures Microsoft's
+[VMMap](https://learn.microsoft.com/en-us/sysinternals/downloads/vmmap)
+CSV snapshots at each boundary to classify private bytes by allocation type.
+The native tool is downloaded only on the runner and its hashes are recorded;
+it adds no shipped dependency. `residency_cases=32:4` selects a focused
+five-round cohort without changing the primary six-case workload.
+
 Every raw response carries the daemon PID and charged bytes immediately
 before and after collecting allocator statistics. The external charge probe
 continues to report PSS or private commit separately. Neither the native

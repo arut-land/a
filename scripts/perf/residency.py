@@ -377,6 +377,12 @@ def allocation_census(active):
     assert value["pid"] == active.pid, value
     value["observed_at_ns"] = time.time_ns()
     value["maps"] = memory_maps(active.pid)
+    if getattr(active, "vmmap", None):
+        active.census_index += 1
+        filename = f"vmmap-{active.pid}-{active.census_index:02}.csv"
+        subprocess.run([str(active.vmmap), "-accepteula", "-p", str(active.pid),
+                        str(active.census_output / filename)], check=True, timeout=60)
+        value["vmmap"] = filename
     return value
 
 
@@ -395,7 +401,7 @@ def observe(probe, active, idle_seconds):
                 switches=after["ctx_switches"] - before["ctx_switches"])
 
 
-def sample(binary, probe_binary, output, stored, count, turns, size, idle_seconds, census=False):
+def sample(binary, probe_binary, output, stored, count, turns, size, idle_seconds, census=False, vmmap=None):
     with daemon(str(binary), output) as active:
         # lifecycle owns startup/teardown; restart applies this benchmark's
         # hibernation interval without changing the shared helper or product.
@@ -406,6 +412,7 @@ def sample(binary, probe_binary, output, stored, count, turns, size, idle_second
         if census:
             active.census = active.home / "alloc-census"
             active.census_output = output
+            active.vmmap, active.census_index = vmmap, 0
             active.census.mkdir()
         checked([str(binary), "ls"], env=active.env, cwd=active.home, timeout=60)
         active.pid = int((active.home / "run/daemon.pid").read_text().splitlines()[0])
@@ -588,6 +595,8 @@ def main():
     parser.add_argument("--binary", type=Path)
     parser.add_argument("--probe", type=Path)
     parser.add_argument("--build-only", action="store_true")
+    parser.add_argument("--cases", help="explicit stored:active pairs for a focused diagnostic cohort")
+    parser.add_argument("--vmmap", type=Path, help="native VMMap executable; census diagnostics only")
     parser.add_argument("--census", action="store_true", help="instrumented native allocator cohort; excluded from timing claims")
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--stored", default="1,8,32")
@@ -609,11 +618,21 @@ def main():
                       NO_PROXY="127.0.0.1,localhost", CARGO_BUILD_JOBS="2")
     if args.census and sys.platform not in ("linux", "win32"):
         parser.error("native census cohort requires glibc Linux or Windows")
+    if args.vmmap and (not args.census or sys.platform != "win32"):
+        parser.error("VMMap requires a native Windows census cohort")
     if args.rounds < 5:
         parser.error("at least five interleaved rounds are required")
     stored, counts = [int(n) for n in args.stored.split(",")], [int(n) for n in args.active.split(",")]
     if min(stored + counts) < 1 or max(counts) > max(stored) or args.turns < 1 or args.bytes < 1 or args.idle_seconds <= 0:
         parser.error("positive populations/work required, with active <= maximum stored")
+    cases = list(dict.fromkeys([(1, 0), *((n, 1) for n in stored), *((max(stored), n) for n in counts)]))
+    if args.cases:
+        try:
+            cases = [tuple(map(int, pair.split(":"))) for pair in args.cases.split(",")]
+            if any(len(pair) != 2 or pair[0] < 1 or pair[1] < 0 or pair[1] > pair[0] for pair in cases):
+                raise ValueError("invalid populations")
+        except ValueError:
+            parser.error("cases must be stored:active pairs with 0 <= active <= stored")
     output, target, source = args.output.resolve(), args.target.resolve(), args.source.resolve()
     if (output / "residency.jsonl").exists() or (output / "residency-failures.jsonl").exists():
         parser.error("select a fresh output directory; existing samples must not be mixed")
@@ -629,11 +648,10 @@ def main():
                     working_tree=subprocess.check_output(["git", "status", "--short"], cwd=source, text=True),
                     workload_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                     binaries={str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in (binary, probe)},
-                    parameters=dict(census=args.census, stored=stored, active=counts, turns=args.turns, bytes=args.bytes, idle_seconds=args.idle_seconds))
+                    parameters=dict(census=args.census, cases=cases, vmmap=str(args.vmmap) if args.vmmap else None, stored=stored, active=counts, turns=args.turns, bytes=args.bytes, idle_seconds=args.idle_seconds))
     (output / "residency-host.json").write_text(json.dumps(metadata, indent=2) + "\n")
     if args.build_only:
         return
-    cases = list(dict.fromkeys([(1, 0), *((n, 1) for n in stored), *((max(stored), n) for n in counts)]))
     records = []
     for round in range(args.rounds):
         for total, active in (cases if round % 2 == 0 else list(reversed(cases))):
@@ -641,7 +659,7 @@ def main():
                 print(f"round={round} {label} stored={total} active={active}", flush=True)
                 record = dict(round=round, label=label, stored=total, active=active)
                 try:
-                    record["stages"] = sample(binary, probe, output, total, active, args.turns, args.bytes, args.idle_seconds, args.census)
+                    record["stages"] = sample(binary, probe, output, total, active, args.turns, args.bytes, args.idle_seconds, args.census, args.vmmap)
                 except Exception as error:
                     record["failure"] = repr(error)
                     with (output / "residency-failures.jsonl").open("a") as stream:

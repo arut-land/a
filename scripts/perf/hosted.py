@@ -445,7 +445,9 @@ def main():
         run([sys.executable, ROOT / "scripts/perf/residency.py", "--source", source,
              "--output", output, "--target", Path(os.environ["CARGO_TARGET_DIR"]),
              "--rounds", os.environ.get("PERF_PAIRED_ROUNDS", "5"),
-             *(["--census"] if os.environ.get("PERF_ALLOC_CENSUS") == "true" else [])], cwd=source)
+             *(["--census"] if os.environ.get("PERF_ALLOC_CENSUS") == "true" else []),
+             *(["--cases", os.environ["PERF_RESIDENCY_CASES"]] if os.environ.get("PERF_RESIDENCY_CASES") else []),
+             *(["--vmmap", os.environ["PERF_VMMAP"]] if os.environ.get("PERF_VMMAP") else [])], cwd=source)
         return
     if args.phase == "sessions":
         sessions(source, output, variant, args.paired_ref)
