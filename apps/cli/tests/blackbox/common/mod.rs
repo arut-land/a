@@ -339,8 +339,7 @@ impl Env {
         Repl::spawn(cmd)
     }
 
-    /// A session's log as stored, asserting that every line is a complete
-    /// entry.
+    /// A session's complete log records; the daemon may still be appending its tail.
     pub fn log(&self, id: SessionId) -> Vec<Entry> {
         log(&self.home, id)
     }
@@ -361,11 +360,20 @@ fn log(home: &Home, id: SessionId) -> Vec<Entry> {
             }
         }
     };
-    let text = fs::read_to_string(path).unwrap();
-    assert!(text.ends_with('\n'), "torn final line in {text}");
-    text.lines()
+    let bytes = fs::read(path).unwrap();
+    // A concurrent append can end inside JSON or even a UTF-8 code point.
+    let complete = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(&[][..], |end| &bytes[..=end]);
+    std::str::from_utf8(complete)
+        .unwrap()
+        .lines()
         .skip(1)
-        .map(|line| serde_json::from_str(line).unwrap_or_else(|e| panic!("torn entry {line}: {e}")))
+        .map(|line| {
+            serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("malformed complete entry {line}: {e}"))
+        })
         .collect()
 }
 
@@ -893,4 +901,37 @@ fn every_case_executes_the_same_fixture_without_aliases() {
     assert_ne!(first.home.root(), second.home.root());
     assert_eq!(first.exe, built());
     assert_eq!(second.exe, first.exe);
+}
+
+#[test]
+fn incomplete_log_tails_wait_for_a_newline_but_malformed_records_fail() {
+    let env = Env::new("log-tail");
+    env.start();
+    let mut conn = env.connect();
+    let (id, _) = conn.attach(Target::New, &env.ws);
+    conn.input("a crab 🦀");
+    conn.until(|entry| matches!(entry.body, Body::Assistant { .. }));
+    drop(conn);
+    assert!(env.cmd(&["daemon", "stop"]).status().unwrap().success());
+    let path = env
+        .home
+        .sessions_dir()
+        .join(id.to_string())
+        .join("log.jsonl");
+    let bytes = fs::read(&path).unwrap();
+    let count = env.log(id).len();
+    let record = bytes
+        .split_inclusive(|byte| *byte == b'\n')
+        .find(|line| !line.is_ascii())
+        .unwrap();
+    let cut = record.iter().position(|byte| !byte.is_ascii()).unwrap() + 1;
+    let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+    file.write_all(&record[..cut]).unwrap();
+    assert_eq!(env.log(id).len(), count);
+    file.write_all(&record[cut..record.len() - 1]).unwrap();
+    assert_eq!(env.log(id).len(), count);
+    file.write_all(b"\n").unwrap();
+    assert_eq!(env.log(id).len(), count + 1);
+    file.write_all(b"not json\n").unwrap();
+    assert!(std::panic::catch_unwind(|| env.log(id)).is_err());
 }
