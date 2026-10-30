@@ -217,6 +217,37 @@ impl<T> Receiver<T> {
         Some(item)
     }
 
+    /// Appends at most `limit` ready items in order, without waiting for more.
+    /// Caller storage is reserved before locking; producers wake after unlocking.
+    pub fn try_recv_batch(&self, out: &mut VecDeque<T>, limit: usize) {
+        if limit == 0 {
+            return;
+        }
+        out.reserve(limit);
+        let mut state = self.0.state();
+        let count = limit.min(state.items.len());
+        if count == 0 {
+            return;
+        }
+        // A handoff must not attach a past queue high-water allocation to
+        // the caller's finite ready buffer.
+        if out.is_empty() && count == state.items.len() && state.items.capacity() <= out.capacity()
+        {
+            std::mem::swap(out, &mut state.items);
+        } else {
+            out.extend(state.items.drain(..count));
+        }
+        let waiting = state.waiting > 0;
+        let sender = state.sender.take();
+        drop(state);
+        if waiting {
+            self.0.space.notify_all();
+        }
+        if let Some(sender) = sender {
+            sender.wake();
+        }
+    }
+
     /// The next item, as a future.
     pub fn recv(&self) -> impl Future<Output = Option<T>> + '_ {
         std::future::poll_fn(|cx| self.poll_recv(cx))
@@ -253,6 +284,100 @@ impl<T> futures_core::Stream for Receiver<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_ready_batch_is_finite_fifo_and_appends_without_waiting() {
+        let (tx, rx) = unbounded();
+        for n in 0..5 {
+            tx.send(n).unwrap();
+        }
+        let mut out = VecDeque::from([9]);
+        rx.try_recv_batch(&mut out, 0);
+        assert_eq!(out, [9]);
+        rx.try_recv_batch(&mut out, 3);
+        assert_eq!(out, [9, 0, 1, 2]);
+        assert_eq!(rx.try_recv(), Some(3));
+        drop(tx);
+        rx.try_recv_batch(&mut out, 64);
+        assert_eq!(out, [9, 0, 1, 2, 4]);
+        rx.try_recv_batch(&mut out, 64);
+        assert_eq!(out.len(), 5);
+    }
+
+    #[test]
+    fn a_ready_handoff_reuses_storage_without_inheriting_a_larger_queue() {
+        let (tx, rx) = unbounded();
+        for n in 0..4 {
+            tx.send(n).unwrap();
+        }
+        let storage = rx.0.state().items.as_slices().0.as_ptr();
+        let mut out = VecDeque::with_capacity(64);
+        rx.try_recv_batch(&mut out, 64);
+        assert_eq!(out.as_slices().0.as_ptr(), storage);
+        assert_eq!(out, [0, 1, 2, 3]);
+        out.clear();
+        for n in 0..128 {
+            tx.send(n).unwrap();
+        }
+        for n in 0..126 {
+            assert_eq!(rx.try_recv(), Some(n));
+        }
+        rx.try_recv_batch(&mut out, 64);
+        assert_eq!(out, [126, 127]);
+        assert!(out.capacity() <= 64);
+        assert_eq!(rx.0.state().items.capacity(), 128);
+    }
+
+    #[test]
+    fn a_batch_releases_every_blocked_producer_that_has_space() {
+        let (tx, rx) = bounded(2);
+        let tx = Arc::new(tx);
+        tx.send(0).unwrap();
+        tx.send(1).unwrap();
+        let waiting: Vec<_> = (2..4)
+            .map(|n| {
+                let tx = Arc::clone(&tx);
+                std::thread::spawn(move || tx.send(n))
+            })
+            .collect();
+        crate::block_on(tx.0.blocked.until(|| tx.0.state().waiting == 2));
+        let mut out = VecDeque::new();
+        rx.try_recv_batch(&mut out, 2);
+        assert_eq!(out, [0, 1]);
+        for producer in waiting {
+            assert_eq!(producer.join().unwrap(), Ok(()));
+        }
+        out.clear();
+        rx.try_recv_batch(&mut out, 2);
+        out.make_contiguous().sort_unstable();
+        assert_eq!(out, [2, 3]);
+    }
+
+    #[test]
+    fn a_batch_wakes_async_producers_outside_the_queue_lock() {
+        struct Unlocked(Arc<Shared<u8>>);
+        impl std::task::Wake for Unlocked {
+            fn wake(self: Arc<Self>) {
+                assert!(self.0.state.try_lock().is_ok());
+            }
+        }
+        let (mut tx, rx) = bounded_async(2);
+        crate::block_on(tx.send(0)).unwrap();
+        crate::block_on(tx.send(1)).unwrap();
+        let waker = Waker::from(Arc::new(Unlocked(Arc::clone(&tx.0))));
+        let send = tx.send(2);
+        let mut send = std::pin::pin!(send);
+        assert!(
+            send.as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        let mut out = VecDeque::new();
+        rx.try_recv_batch(&mut out, 2);
+        assert_eq!(out, [0, 1]);
+        assert_eq!(crate::block_on(send), Ok(()));
+        assert_eq!(rx.try_recv(), Some(2));
+    }
 
     #[test]
     fn consumer_wakes_and_discarded_values_never_run_under_the_queue_lock() {

@@ -12,7 +12,7 @@
 //! outside the queue. Framing read buffers and socket/SSH transport buffers
 //! are also outside these allowances. Queue weights do not bound process RSS.
 
-use std::collections::VecDeque;
+use std::collections::{LinkedList, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
@@ -21,11 +21,82 @@ pub use protocol::QueueBudget;
 
 pub const PUMP_BATCH: usize = 64;
 
+// Completed segments leave with the work instead of keeping a burst's high-water
+// allocation attached to the inbox. The last segment is reused by small traffic.
+struct Segments<T> {
+    head: VecDeque<T>,
+    #[expect(
+        clippy::linkedlist,
+        reason = "drained segments must not leave a second growable queue's high-water allocation"
+    )]
+    tail: LinkedList<VecDeque<T>>,
+    queued: usize,
+}
+
+impl<T> Segments<T> {
+    fn new() -> Self {
+        Self {
+            head: VecDeque::new(),
+            tail: LinkedList::new(),
+            queued: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.head.len() + self.queued
+    }
+
+    fn is_empty(&self) -> bool {
+        self.head.is_empty()
+    }
+
+    fn push_back(&mut self, item: T) {
+        if self.tail.is_empty() && self.head.len() < PUMP_BATCH {
+            self.head.push_back(item);
+            return;
+        }
+        if self
+            .tail
+            .back()
+            .is_none_or(|chunk| chunk.len() == PUMP_BATCH)
+        {
+            self.tail.push_back(VecDeque::with_capacity(PUMP_BATCH));
+        }
+        self.tail
+            .back_mut()
+            .expect("a tail segment exists")
+            .push_back(item);
+        self.queued += 1;
+    }
+
+    fn pop_front(&mut self) -> Option<T> {
+        let item = self.head.pop_front()?;
+        if self.head.is_empty()
+            && let Some(head) = self.tail.pop_front()
+        {
+            self.queued -= head.len();
+            self.head = head;
+        }
+        Some(item)
+    }
+
+    fn clear(&mut self) {
+        self.head.clear();
+        self.tail.clear();
+        self.queued = 0;
+    }
+
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
+        self.head.capacity() + self.tail.iter().map(VecDeque::capacity).sum::<usize>()
+    }
+}
+
 struct Queue<T> {
     /// Posted with [`Post::send_first`]: taken before `items`, in their
     /// own order.
-    first: VecDeque<(usize, T)>,
-    items: VecDeque<(usize, T)>,
+    first: Segments<(usize, T)>,
+    items: Segments<(usize, T)>,
     posts: usize,
     bytes: usize,
     first_bytes: usize,
@@ -81,8 +152,8 @@ pub fn inbox<T>(budget: QueueBudget, weight: fn(&T) -> usize) -> (Post<T>, Inbox
         budget,
         weight,
         queue: Mutex::new(Queue {
-            first: VecDeque::new(),
-            items: VecDeque::new(),
+            first: Segments::new(),
+            items: Segments::new(),
             posts: 1,
             bytes: 0,
             first_bytes: 0,
@@ -285,6 +356,32 @@ mod tests {
     use std::time::Duration;
 
     use super::{QueueBudget, inbox};
+
+    #[test]
+    fn drained_lanes_retain_only_one_pump_segment() {
+        let (post, inbox) = inbox(
+            QueueBudget {
+                bytes: usize::MAX,
+                requests: 1 << 18,
+                control_reserve: 0,
+            },
+            |_| 1,
+        );
+        for n in 0..32768 {
+            post.send(n).unwrap();
+            post.send_first(n).unwrap();
+        }
+        for n in 0..32768 {
+            assert_eq!(inbox.try_recv(), Some(n));
+        }
+        for n in 0..32768 {
+            assert_eq!(inbox.try_recv(), Some(n));
+        }
+        let queue = inbox.0.queue();
+        assert!(queue.items.capacity() <= super::PUMP_BATCH);
+        assert!(queue.first.capacity() <= super::PUMP_BATCH);
+        assert_eq!((queue.bytes, queue.first_bytes), (0, 0));
+    }
 
     #[test]
     fn durable_backpressure_preserves_order_and_reserves_control_capacity() {
