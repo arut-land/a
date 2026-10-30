@@ -7,6 +7,18 @@ on:
     - cron: '17 4 * * 1'
   workflow_dispatch:
     inputs:
+      census_vmmap:
+        description: "Add native Microsoft VMMap snapshots to a Windows census"
+        default: false
+        type: boolean
+      residency_cases:
+        description: "Optional focused stored:active pairs, e.g. 32:1,32:4"
+        default: ''
+        type: string
+      alloc_census:
+        description: "Native census of the selected residency source"
+        default: false
+        type: boolean
       residency:
         description: "Complete lifecycle ownership waves (five alternating A/A rounds)"
         default: false
@@ -82,7 +94,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: perf-${{ github.ref }}-${{ inputs.autostart && 'autostart' || 'measure' }}-${{ inputs.runner || 'all' }}-${{ inputs.source_ref || github.sha }}-${{ inputs.paired_ref }}-${{ inputs.build_only }}-${{ inputs.sessions }}-${{ inputs.residency }}-${{ inputs.variant || '{}' }}
+  group: perf-${{ github.ref }}-${{ inputs.autostart && 'autostart' || 'measure' }}-${{ inputs.runner || 'all' }}-${{ inputs.source_ref || github.sha }}-${{ inputs.paired_ref }}-${{ inputs.build_only }}-${{ inputs.sessions }}-${{ inputs.residency }}-${{ inputs.alloc_census }}-${{ inputs.census_vmmap }}-${{ inputs.variant || '{}' }}
   cancel-in-progress: false
 
 env:
@@ -93,14 +105,14 @@ env:
 
 jobs:
   residency:
-    if: inputs.residency
+    if: inputs.residency || inputs.alloc_census || inputs.census_vmmap
     name: residency (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        runner: ${{ fromJSON(inputs.runner == 'linux-windows' && '["ubuntu-latest", "windows-latest"]' || inputs.runner && inputs.runner != 'all' && format('["{0}"]', inputs.runner) || '["ubuntu-latest", "ubuntu-24.04-arm", "windows-latest", "windows-11-arm", "macos-latest", "macos-15-intel"]') }}
+        runner: ${{ fromJSON(inputs.census_vmmap && inputs.runner == 'all' && '["windows-latest", "windows-11-arm"]' || inputs.alloc_census && inputs.runner == 'all' && '["ubuntu-latest", "ubuntu-24.04-arm", "windows-latest", "windows-11-arm"]' || inputs.runner == 'linux-windows' && '["ubuntu-latest", "windows-latest"]' || inputs.runner && inputs.runner != 'all' && format('["{0}"]', inputs.runner) || '["ubuntu-latest", "ubuntu-24.04-arm", "windows-latest", "windows-11-arm", "macos-latest", "macos-15-intel"]') }}
     defaults:
       run:
         shell: bash
@@ -108,6 +120,10 @@ jobs:
       CARGO_BUILD_JOBS: 2
       CARGO_PROFILE_DEV_CODEGEN_BACKEND: llvm
       PYTHONDONTWRITEBYTECODE: 1
+      MISE_IGNORED_CONFIG_PATHS: ${{ github.workspace }}
+      MISE_CARGO_BINSTALL_NATIVE: 'true'
+      PERF_ALLOC_CENSUS: ${{ inputs.alloc_census || inputs.census_vmmap || false }}
+      PERF_RESIDENCY_CASES: ${{ inputs.residency_cases }}
       PERF_PAIRED_ROUNDS: ${{ inputs.paired_rounds || '5' }}
     steps:
       - name: External build directory
@@ -148,9 +164,35 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang mold pkg-config libssl-dev
+      - uses: jdx/mise-action@v5
+        with:
+          working_directory: measured
+          install_args: cargo:cargo-nextest@0.9.150
       - name: Native Cargo path
         working-directory: measured
         run: echo "$(dirname "$(rustup which cargo)")" >> "$GITHUB_PATH"
+      - name: Native VMMap diagnostic tool
+        if: inputs.census_vmmap && runner.os == 'Windows'
+        run: |
+          python - <<'PYTHON'
+          import hashlib, json, os, pathlib, urllib.request, zipfile
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'census-vmmap'
+          root.mkdir()
+          archive = root / 'VMMap.zip'
+          url = 'https://download.sysinternals.com/files/VMMap.zip'
+          urllib.request.urlretrieve(url, archive)
+          with zipfile.ZipFile(archive) as bundle:
+              bundle.extractall(root)
+          name = 'vmmap64a.exe' if os.environ['RUNNER_ARCH'] == 'ARM64' else 'vmmap64.exe'
+          executable = next(path for path in root.iterdir() if path.name.lower() == name)
+          output = pathlib.Path(os.environ['RUNNER_TEMP']) / 'residency-output'
+          output.mkdir()
+          (output / 'vmmap-tool.json').write_text(json.dumps(dict(
+              source=url, archive_sha256=hashlib.sha256(archive.read_bytes()).hexdigest(),
+              binary=executable.name, sha256=hashlib.sha256(executable.read_bytes()).hexdigest()), indent=2))
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              env.write(f'PERF_VMMAP={executable}\n')
+          PYTHON
       - name: Build and measure complete ownership waves
         working-directory: harness
         run: python scripts/perf/hosted.py --phase residency --source ../measured --runner '${{ matrix.runner }}' --output "$RUNNER_TEMP/residency-output"
@@ -158,13 +200,18 @@ jobs:
         if: always()
         with:
           name: residency-${{ matrix.runner }}
-          path: ${{ runner.temp }}/residency-output/*.json*
+          path: |
+            ${{ runner.temp }}/residency-output/*.json*
+            ${{ runner.temp }}/residency-output/*.md
+            ${{ runner.temp }}/residency-output/*.csv
+            ${{ runner.temp }}/residency-output/*.patch
+            ${{ runner.temp }}/residency-output/census-module.rs
           retention-days: 30
       - name: Clean owned target
         if: always()
         working-directory: measured
         run: |
-          cargo clean --target-dir "$CARGO_TARGET_DIR"
+          mise exec -- rustup run "$RUSTUP_TOOLCHAIN" cargo clean --target-dir "$CARGO_TARGET_DIR"
           python - <<'PYTHON'
           import os, shutil
           shutil.rmtree(os.environ['CARGO_TARGET_DIR'], ignore_errors=True)
@@ -218,7 +265,7 @@ jobs:
           path: ${{ runner.temp }}/idle-charge-output/*.json
 
   measure:
-    if: github.event_name != 'schedule' && !inputs.autostart && !inputs.idle_charge && !inputs.residency
+    if: github.event_name != 'schedule' && !inputs.autostart && !inputs.idle_charge && !inputs.residency && !inputs.alloc_census && !inputs.census_vmmap
     name: perf (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
     # Churn workloads and twenty-round ablations need longer than the standard suite.

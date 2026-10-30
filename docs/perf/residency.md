@@ -444,3 +444,173 @@ verified. Hosted jobs clean their external targets as their final step.
 Only the four owned paths differ from `origin/main`. No product source fix,
 new dependency or branch-owned wire change was made. CI has not been
 dispatched; phase 2 awaits independent review.
+
+
+### Opt-in Linux and Windows allocator census
+
+The `perf` workflow's `alloc_census=true` input selects an instrumented
+residency cohort. The source defaults to the workflow revision; `source_ref`
+can override it. The probe and measured source must use the same protocol.
+The historical protocol-37 census below pins source
+`b1d6f9c0d18110854d701057dac7bc584985f69a` and its recorded harness revisions;
+reproducing it requires both pins. The current probe uses protocol-43
+Head/History. The hook is applied to the four approved feature/module/startup
+wiring files when absent, with its module copied from the harness revision.
+Artifacts include the exact wiring patch and module. With `runner=all`, it
+runs on native Ubuntu x64/ARM64 and
+Windows x64/ARM64 runners. Five alternating A/A rounds remain the minimum;
+the lifecycle, equal stored histories, slow follower assertions and reopen
+checks are unchanged. This cohort must not be used for latency, idle CPU or
+thread-count comparisons with the uninstrumented workload.
+
+Only `a --features fixtures` includes `sys::census`. With the feature off,
+the CLI initialization call and census module are compiled out. With fixtures
+on, only the internal daemon entry point checks for an `alloc-census`
+directory under an explicit `A_HOME`; the harness creates it inside its
+isolated home. This survives the daemon startup environment allowlist. The hook publishes a PID
+specific loopback port there and serves one native census per connection.
+One extra diagnostic thread persists for the daemon's lifetime. The harness
+warms the endpoint before seeding histories, samples every lifecycle boundary,
+and stops the daemon through that home's ordinary stop command.
+
+On glibc, `malloc_info(0, ...)` supplies raw XML for all arenas, with no
+preload or replacement allocator. The report derives free capacity from the
+root free totals (`rest`, plus `fast` where the native allocator exposes
+fastbins; newer [glibc output](https://github.com/bminor/glibc/blob/master/malloc/malloc.c)
+omits that total), allocator capacity from the root current
+system bytes plus `mmap` bytes, and allocated bytes by subtraction. Raw
+`mallinfo2` allocated/free counters are also retained as a cross-check.
+Allocator-accounted allocated bytes include metadata and per-thread cached
+blocks; they are not an exact count of application-live payloads. Free
+capacity can include pages already discarded by the allocator and therefore
+is not a measurement of resident free pages.
+
+On Windows, `GetProcessHeaps` enumerates process heaps and `HeapSummary`
+records each heap's allocated, committed and reserved bytes. The report
+sums allocated bytes and committed capacity, with their difference labeled
+free capacity; that difference also includes heap overhead. These totals
+do not include direct VM allocations outside the heaps. See Microsoft's
+[HeapSummary contract](https://learn.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-heapsummary)
+and [counter definitions](https://learn.microsoft.com/en-us/windows/win32/api/heapapi/ns-heapapi-heap_summary).
+
+Heap capacity is not a partition of the process's private commit: the Server
+2025 observations can report more heap committed capacity than process
+private commit. Subtracting these counters does not identify non-heap charge.
+The optional `census_vmmap=true` diagnostic captures Microsoft's
+[VMMap](https://learn.microsoft.com/en-us/sysinternals/downloads/vmmap)
+CSV snapshots at each boundary to classify private bytes by allocation type.
+The native tool is downloaded only on the runner and its hashes are recorded;
+it adds no shipped dependency. `residency_cases=32:4` selects a focused
+five-round cohort without changing the primary six-case workload.
+
+Every raw response carries the daemon PID and charged bytes immediately
+before and after collecting allocator statistics. The external charge probe
+continues to report PSS or private commit separately. Neither the native
+heap collection nor the charge bracket freezes all daemon threads; only
+stable lifecycle boundaries should be compared. Raw XML/per-heap records, per-stage VM maps,
+all stage distributions and paired hibernation deltas remain in JSON/JSONL
+artifacts. Summary tables give median [min, max] in KiB.
+
+The platform guidance is to preserve allocator hysteresis and profile
+before tuning. glibc's [trim and mmap thresholds](https://sourceware.org/glibc/manual/latest/html_node/Memory-Allocation-Tunables.html)
+adapt when left at their defaults; setting thresholds explicitly disables
+that adaptation. Microsoft's [LFH guidance](https://learn.microsoft.com/en-us/windows/win32/memory/low-fragmentation-heap)
+says modern Windows enables the policy as needed and recommends profiling
+to assess its benefit. This census changes no arena limit, threshold,
+heap policy or reclamation schedule. Native findings and any proposed policy
+experiment must be supported by the resulting cohort, not by the M3 result.
+
+### Native census results on the published source
+
+The primary cohort contains 240 successful fresh-home samples: six workload
+cases, five alternating A/A rounds, two unchanged-source samples per case
+and round, on each of four native runners. All lifecycle, slow-follower and
+complete-replay assertions passed. The product source is
+`b1d6f9c0d18110854d701057dac7bc584985f69a`; the exact fixture instrumentation
+is in the artifacts. The three successful ARM64/Windows jobs are on
+[run 41058433900](https://github.com/arut-land/a/actions/runs/41058433900).
+Its Linux x64 pilot failed while decoding a missing glibc `fast` total;
+that lane's complete corrected cohort is on
+[run 41059926424](https://github.com/arut-land/a/actions/runs/41059926424).
+No failed or partial sample is included in the distributions below.
+
+The fixed stored=32, previously attached=8 case is summarized below. Values
+are KiB, median [min, max] over ten samples (five round pairs). "Allocated"
+means allocator-accounted bytes, including allocator metadata/caches; it is
+an upper bound on application-live malloc payloads. "Free capacity" has the
+platform-specific meaning described above and is not resident free memory.
+
+| runner | catalog allocated | wave 1 used allocated | wave 2 hibernated allocated | wave 2 native charge | wave 2 free capacity |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| ubuntu-24.04-arm | 855.197 [838.199, 872.912] | 2905.171 [2888.034, 2910.546] | 893.163 [881.602, 900.769] | 15059.000 [12555.000, 15323.000] | 10576.837 [6380.400, 11252.595] |
+| windows-11-arm | 633.348 [626.436, 641.821] | 3220.182 [3216.361, 3228.247] | 634.133 [626.852, 638.499] | 3096.000 [3036.000, 3164.000] | 522.364 [475.304, 584.074] |
+| windows-latest | 633.515 [629.796, 641.657] | 3221.059 [3216.644, 3228.683] | 641.085 [634.665, 649.228] | 5284.000 [3936.000, 5640.000] | 4716.558 [3885.335, 6147.895] |
+| ubuntu-latest | 1037.323 [1025.593, 1049.248] | 3106.123 [3081.865, 3143.102] | 1145.303 [1116.394, 1153.231] | 14694.500 [13386.000, 18290.000] | 6367.959 [5559.021, 11325.565] |
+
+On Linux, the charged growth belongs to glibc arena mappings. Matching the
+main heap and the anonymous writable arena prefix against `malloc_info`
+(`system current` for the main heap, `aspace mprotect` for secondary arenas)
+finds exactly one mapping for each of 480 hibernation arena observations
+across the two architectures. For stored=32/attached=8, the paired wave-2
+minus wave-1 PSS delta is 570.000 [-3092.000, 1208.000] KiB on x64, entirely
+in those mappings; on ARM64 it is 1244.000 [-2572.000, 3344.000] KiB, with
+1236.000 [-2572.000, 3344.000] KiB in arena mappings and only
+2.000 [0.000, 12.000] KiB elsewhere. File-backed and main-stack PSS do not
+increase in these comparisons. Allocated-byte deltas are much smaller:
+44.642 [29.643, 75.907] KiB on x64 and 11.794 [2.660, 22.056] KiB on ARM64.
+Arena capacity need not grow for its PSS to grow: another wave touches
+previously uncharged pages in capacity the allocator already owns, and
+freeing the objects does not necessarily discard those pages. This is
+allocator retention, with small allocator-accounted drift left unattributed;
+it does not identify a retained multi-MiB session execution object.
+
+Windows ARM64 stays nearly flat between hibernated waves: at 32/8, private
+commit changes by -2.000 [-264.000, 60.000] KiB and allocated bytes by
+1.531 [0.000, 9.010] KiB. Windows x64 releases its large used heap too, but
+its private-commit movement cannot be inferred from `HeapSummary` capacity
+alone. The focused VMMap diagnostic classifies that movement separately.
+
+The [Windows x64 VMMap run](https://github.com/arut-land/a/actions/runs/41070040573)
+adds ten fresh-home 32/4 samples (five alternating A/A pairs), excluded from
+timing comparisons. Between hibernated waves, native private commit changes
+by -44.000 [-1200.000, 1428.000] KiB; VMMap heap-private bytes change by
+-52.000 [-1196.000, 1424.000] KiB. Each individual commit delta agrees with
+VMMap's total-private delta within 4 KiB and with its heap-private delta
+within 16 KiB. Non-heap private bytes change by 0.000 [-4.000, 20.000] KiB,
+while allocated bytes change by only 1.500 [0.500, 10.418] KiB. Final heap
+private charge is 3702.000 [2332.000, 4044.000] KiB, versus allocated bytes
+of 643.486 [640.082, 652.528] KiB. Their paired difference leaves
+3059.144 [1679.472, 3403.021] KiB of heap-private charge outside allocated
+blocks, including heap overhead. In the largest positive sample, private
+commit rises 1428 KiB, heap-private charge rises 1424 KiB, and allocated
+bytes rise 1.5 KiB. The movement is heap retention, not a growing live
+session payload. It is not monotonic: other samples return capacity to the
+OS. The diagnostic median is negative and is not substituted for the
+positive median in the primary 32/4 case.
+
+The native owners of the large post-use charge are glibc arenas and Windows
+process heaps. No multi-MiB live execution object, and therefore no
+application allocation site for such an object, was identified. The small
+allocator-accounted deltas remain unattributed; counters include caches
+and metadata and do not establish an application allocation leak. Direct VM
+allocations and other workloads still need their own ownership evidence.
+
+No allocator policy, trim timer or reclamation call was added. A possible
+follow-up is an A/B measurement of the existing `sys::release` primitive at
+a settled hibernation boundary using the current protocol-43 demand-loaded
+history workload. It needs an engine boundary hook outside
+this branch's ownership, a lifecycle invariant, and at least five native
+release-build round pairs measuring both charge and reopen cost. Expected
+costs include heap synchronization and more page faults on reuse; no saving
+or latency cost has been measured. Those are owner-pending experiments,
+not recommendations to ship a timer or force LFH/trim thresholds.
+
+Local verification passed: native M3 `sys` nextest (198 tests, 2 skipped),
+the complete package(a) nextest selection (147 tests, 10 skipped), native
+and fixture-enabled Windows-target sys clippy, workspace `check:windows`,
+Python harness tests (50 tests, 12 skipped), and the real release-fixture
+endpoint test. Earlier FSEvents/remote-bridge failures and missing browser
+setup are retained in the phase-1 evidence; focused rechecks and complete
+two-process suites passed. `mise run size` passed at 7,505,808 shipped bytes;
+explicit census marker/symbol scans also passed. The feature-off call and
+module are compiled out. CI remains undispatched for phase 1.
