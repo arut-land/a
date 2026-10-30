@@ -1266,38 +1266,131 @@ fn a_gate_cut_off_by_a_crash_logs_its_decisions_once() {
     );
 }
 
-/// One worker runs every session: a wait for approval, a sleep and running
-/// commands all overlap.
+struct HeldProcess(std::sync::mpsc::Sender<Box<dyn ext::ProcessPipe>>);
+
+impl Tool for HeldProcess {
+    type In = Nothing;
+    type Out = bool;
+    const NAME: &'static str = "held_process";
+    const DESCRIPTION: &'static str = "Waits for stdin before exiting.";
+
+    async fn call(&self, _: &Nothing, cx: &Cx) -> Result<bool, String> {
+        let mut process = cx
+            .service::<dyn ext::Processes>()
+            .unwrap()
+            .spawn(
+                cx,
+                ext::LaunchSpec {
+                    process: ext::SpawnSpec {
+                        argv: vec![
+                            std::env::current_exe()
+                                .unwrap()
+                                .into_os_string()
+                                .into_string()
+                                .unwrap(),
+                            "--exact".into(),
+                            "driver::tests::a_process_waits_for_its_release".into(),
+                            "--ignored".into(),
+                            "--nocapture".into(),
+                        ],
+                        env: std::env::vars().collect(),
+                        cwd: cx.workspace.to_path_buf(),
+                    },
+                    output: ext::ProcessOutput::Stdio,
+                },
+            )
+            .await
+            .unwrap();
+        // The Rust harness also writes stdout; NUL marks the child's readiness.
+        let mut byte = [1];
+        while byte != [0] {
+            assert_eq!(
+                process
+                    .output
+                    .as_ref()
+                    .unwrap()
+                    .read(&mut byte)
+                    .await
+                    .unwrap(),
+                1
+            );
+        }
+        self.0.send(process.input.take().unwrap()).unwrap();
+        Ok(process.wait().await.unwrap().success())
+    }
+}
+
+impl Extension for HeldProcess {
+    const NAME: &'static str = "held_process";
+    const VERSION: u32 = 1;
+    fn contribute(&self, r: &mut Registrar) {
+        r.tool(Self(self.0.clone()));
+    }
+}
+
+#[test]
+#[ignore = "child process fixture for sessions_wait_on_effects_without_holding_the_worker"]
+fn a_process_waits_for_its_release() {
+    use std::io::{Read, Write};
+
+    io::stdout().write_all(&[0]).unwrap();
+    io::stdout().flush().unwrap();
+    let mut byte = [0];
+    io::stdin().read_exact(&mut byte).unwrap();
+    assert_eq!(byte, [1]);
+}
+
+/// Every process starts before any is released, on the fixture's single worker.
 #[test]
 fn sessions_wait_on_effects_without_holding_the_worker() {
+    let (ready, started) = std::sync::mpsc::channel();
     let fixture = Fixture::new(
         ext_fixtures::ECHO,
-        echoing(&Policy::ask(&["sleep"])),
+        echoing(&Policy::ask(&[<HeldProcess as Tool>::NAME]))
+            .with(&HeldProcess(ready))
+            .unwrap(),
         openai(&Script::new(&[])),
     );
     let asked = fixture.start(&[]);
-    asked.submit("sleep 1").unwrap();
+    asked.submit("call held_process {}").unwrap();
     settle(&asked);
-    let started = Instant::now();
     let commands: Vec<_> = (0..2)
         .map(|_| {
             let session = fixture.start(&[]);
-            session.submit("$ sleep 1").unwrap();
+            session.submit("call held_process {}").unwrap();
+            settle(&session);
             session
         })
         .collect();
-    asked.answer(2, true).unwrap();
     for session in &commands {
-        finished(session, 2);
+        session.answer(2, true).unwrap();
+    }
+    let mut inputs = Vec::new();
+    for _ in &commands {
+        inputs.push(started.recv_timeout(PATIENCE).unwrap());
+    }
+    asked.answer(2, true).unwrap();
+    inputs.push(started.recv_timeout(PATIENCE).unwrap());
+    for session in commands.iter().chain([&asked]) {
+        assert!(
+            log_of(session)
+                .iter()
+                .all(|e| !matches!(e.body, Body::ToolResult { .. }))
+        );
+    }
+    for input in inputs {
+        rt::block_on(async {
+            assert_eq!(input.write(&[1]).await.unwrap(), 1);
+            input.flush().await.unwrap();
+        });
+    }
+    for session in commands.iter().chain([&asked]) {
+        let log = finished(session, 2);
+        assert!(log.iter().any(|e| matches!(&e.body,
+            Body::ToolResult { outcome: Outcome::Done { output: protocol::Payload::Inline(output) }, .. }
+                if output.parse::<bool>().unwrap())));
         session.halt();
     }
-    finished(&asked, 2);
-    let took = started.elapsed();
-    asked.halt();
-    assert!(
-        took < Duration::from_millis(1900),
-        "ran one at a time: {took:?}"
-    );
 }
 
 fn asking() -> Fixture {

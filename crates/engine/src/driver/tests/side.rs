@@ -312,6 +312,8 @@ fn a_title_call_is_a_side_call() {
 
 struct Probe;
 
+const PROBE_TIMEOUT: Duration = Duration::from_millis(50);
+
 impl Tool for Probe {
     type In = ext::Args;
     type Out = String;
@@ -343,7 +345,7 @@ impl Tool for Probe {
                 "-owner" => probe.owner_context(),
                 "-prefix" => probe.owner_prefix(),
                 "-timeout" => probe.budget(ext::Budget {
-                    timeout: Duration::from_millis(50),
+                    timeout: PROBE_TIMEOUT,
                     ..ext::Budget::default()
                 }),
                 _ => probe,
@@ -549,24 +551,75 @@ fn every_ephemeral_prefix_chunk_keeps_registry_system_instructions() {
 /// made, with no usage, and fails as a timeout.
 #[test]
 fn an_ephemeral_timeout_keeps_its_attempts_metrics() {
+    struct Deadline {
+        runtime: rt::Threads,
+        started: Instant,
+        expired: Flag,
+    }
+    impl rt::Runtime for Deadline {
+        fn spawn(&self, task: rt::BoxFuture<'static, ()>) {
+            self.runtime.spawn(task);
+        }
+        fn spawn_blocking(
+            &self,
+            class: rt::BlockingClass,
+            bytes: usize,
+            work: Box<dyn FnOnce() + Send>,
+        ) -> rt::BoxFuture<'static, io::Result<()>> {
+            self.runtime.spawn_blocking(class, bytes, work)
+        }
+        fn spawn_flush(
+            &self,
+            work: Box<dyn FnOnce() + Send>,
+        ) -> rt::BoxFuture<'static, io::Result<()>> {
+            self.runtime.spawn_flush(work)
+        }
+        fn reactor(&self) -> rt::Reactor {
+            self.runtime.reactor()
+        }
+        fn now(&self) -> Instant {
+            self.started
+                + if self.expired.is_set() {
+                    PROBE_TIMEOUT
+                } else {
+                    Duration::ZERO
+                }
+        }
+        fn sleep(&self, _: Duration) -> rt::BoxFuture<'static, ()> {
+            let expired = self.expired.clone();
+            Box::pin(async move { expired.wait().await })
+        }
+    }
+    let expired = Flag::default();
     let http = Flaky::new([Reply::Hang(String::new())]);
-    let session = probes(&http, Registry::default()).start(&[]);
+    let fixture = probes(&http, Registry::default()).configure(|shared| {
+        shared.rt = Arc::new(Deadline {
+            runtime: rt::Threads::new(1),
+            started: Instant::now(),
+            expired: expired.clone(),
+        });
+    });
+    let session = fixture.start(&[]);
     session.submit("ephemeral-timeout").unwrap();
+    // Preparation can consume a real deadline without ever sending an attempt.
+    http.wait_sent(1);
+    expired.set();
     until(&session, "the side call failed", |log| {
         log.iter().any(|e| {
             matches!(
                 &e.body,
                 Body::ModelResult {
                     r#for: Some(_),
-                    outcome: Outcome::Failed { .. },
+                    outcome: Outcome::Failed { error },
                     ..
-                }
+                } if error.contains("timed out")
             )
         })
     });
     settle(&session);
     let log = log_of(&session);
     session.halt();
+    assert_eq!(http.sent(), 1);
     let facts = ephemeral_attempts(&log);
     assert_eq!(facts.len(), 1, "{log:#?}");
     assert!(facts[0].usage.is_none());

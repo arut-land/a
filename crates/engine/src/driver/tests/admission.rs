@@ -1263,18 +1263,12 @@ fn delegated_results_wait_for_their_own_durable_prefix() {
 fn metrics_add_no_flushes_to_provider_execution() {
     let mut counts = Vec::new();
     for metrics in [false, true] {
-        let faulty = Arc::new(Faulty::new(Arc::new(Memory::default())));
         let mut registry = Registry::default().with(&Harbor).unwrap();
         if metrics {
             registry = registry.with(&ext_metrics::Metrics).unwrap();
         }
-        let replies = cassette("openai/streaming_grammar/tool_then_followup_text.yaml");
-        let fixture = Fixture::on(
-            Arc::clone(&faulty) as _,
-            ext::LOOP,
-            registry,
-            openai(&Script::new(&replies)),
-        );
+        // Periodic syncs depend on scheduling, not on whether metrics are enabled.
+        let (fixture, faulty, _) = pipeline(registry);
         let session = fixture.create();
         settle(&session);
         let before = faulty.flushes();

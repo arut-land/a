@@ -113,7 +113,7 @@ jobs:
               }
               "spinner_pids=$($spinners.Id -join ',')" | Add-Content "$scratch/run.txt"
             }
-            for ($round = 1; $round -le 20; $round++) {
+            for ($round = 1; $round -le 50; $round++) {
               $log = "$scratch/round-$round.log"
               "round=$round start=$([DateTime]::UtcNow.ToString('o'))" | Tee-Object -Append "$scratch/run.txt"
               & mise @testArgs --no-fail-fast --no-tests=fail 2>&1 | Tee-Object $log
@@ -122,6 +122,7 @@ jobs:
               if ($code -ne 0) {
                 $failed++
                 Get-Process | Select-Object Id, ProcessName, CPU, StartTime | Format-Table -AutoSize | Out-String -Width 240 | Tee-Object "$scratch/processes-$round.txt"
+                break
               }
             }
           } finally {
@@ -197,7 +198,7 @@ jobs:
               }
               "spinner_pids=$($spinners.Id -join ',')" | Add-Content "$scratch/run.txt"
             }
-            for ($round = 1; $round -le 20; $round++) {
+            for ($round = 1; $round -le 50; $round++) {
               $log = "$scratch/round-$round.log"
               "round=$round start=$([DateTime]::UtcNow.ToString('o'))" | Tee-Object -Append "$scratch/run.txt"
               & mise @testArgs --no-fail-fast --no-tests=fail 2>&1 | Tee-Object $log
@@ -206,6 +207,7 @@ jobs:
               if ($code -ne 0) {
                 $failed++
                 Get-Process | Select-Object Id, ProcessName, CPU, StartTime | Format-Table -AutoSize | Out-String -Width 240 | Tee-Object "$scratch/processes-$round.txt"
+                break
               }
             }
           } finally {
