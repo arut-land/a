@@ -261,7 +261,7 @@ def cargo_run(command, **kwargs):
         if not toolchain:
             with (Path(kwargs["cwd"]) / "rust-toolchain.toml").open("rb") as stream:
                 toolchain = tomllib.load(stream)["toolchain"]["channel"]
-        command = ["mise", "exec", *(["cargo:cargo-nextest"] if command[1] == "nextest" else []),
+        command = ["mise", "exec", *(["cargo:cargo-nextest@0.9.150"] if command[1] == "nextest" else []),
                    "--", "cargo", f"+{toolchain}", *command[1:]]
     return subprocess.run(command, **kwargs)
 
@@ -372,6 +372,7 @@ def allocation_census(active):
                      allocator_bytes=committed)
     assert value["pid"] == active.pid, value
     value["observed_at_ns"] = time.time_ns()
+    value["maps"] = memory_maps(active.pid)
     return value
 
 
@@ -399,9 +400,8 @@ def sample(binary, probe_binary, output, stored, count, turns, size, idle_second
         stop_daemon(binary, active.env, active.home)
         (active.home / "config.toml").write_text('[daemon]\nagent="echo"\nidle_secs=600\nhibernate_secs=1\n')
         if census:
-            active.census = active.home / "census"
+            active.census = active.home / "alloc-census"
             active.census.mkdir()
-            active.env["A_ALLOC_CENSUS"] = str(active.census)
         checked([str(binary), "ls"], env=active.env, cwd=active.home, timeout=60)
         active.pid = int((active.home / "run/daemon.pid").read_text().splitlines()[0])
         if census:
@@ -502,6 +502,26 @@ def summarize(records):
 
 
 class ResidencyTests(unittest.TestCase):
+    def test_census_is_available_only_after_isolated_daemon_opt_in(self):
+        if not (binary := os.environ.get("RESIDENCY_BINARY")):
+            self.skipTest("set RESIDENCY_BINARY to a release fixture executable")
+        with daemon(binary) as active:
+            active.census = active.home / "alloc-census"
+            assert not active.census.exists()
+            active.client.stdin.close()
+            active.client.wait(timeout=30)
+            stop_daemon(binary, active.env, active.home)
+            active.census.mkdir()
+            checked([binary, "ls"], env=active.env, cwd=active.home, timeout=60)
+            active.pid = int((active.home / "run/daemon.pid").read_text().splitlines()[0])
+            if sys.platform == "darwin":
+                with self.assertRaisesRegex(RuntimeError, "native census requires glibc or Windows"):
+                    allocation_census(active)
+            else:
+                value = allocation_census(active)
+                self.assertGreater(value["allocated_bytes"], 0)
+                self.assertGreaterEqual(value["allocator_bytes"], value["allocated_bytes"])
+
     def test_full_lifecycle_preserves_history_and_slow_followers_own_only_their_session(self):
         binary, probe = os.environ.get("RESIDENCY_BINARY"), os.environ.get("RESIDENCY_PROBE")
         if not binary or not probe:

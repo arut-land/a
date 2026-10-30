@@ -113,6 +113,8 @@ jobs:
       CARGO_PROFILE_DEV_CODEGEN_BACKEND: llvm
       PYTHONDONTWRITEBYTECODE: 1
       MISE_IGNORED_CONFIG_PATHS: ${{ github.workspace }}
+      MISE_CARGO_BINSTALL_NATIVE: 'true'
+      MISE_CARGO_BINSTALL_ONLY: 'true'
       PERF_ALLOC_CENSUS: ${{ inputs.alloc_census || false }}
       PERF_PAIRED_ROUNDS: ${{ inputs.paired_rounds || '5' }}
     steps:
@@ -157,11 +159,11 @@ jobs:
       - uses: jdx/mise-action@v5
         with:
           working_directory: measured
-          install_args: cargo:cargo-nextest
+          install_args: cargo:cargo-nextest@0.9.150
       - name: Fixture census invariants
         if: inputs.alloc_census
         working-directory: measured
-        run: mise exec cargo:cargo-nextest -- cargo +"$RUSTUP_TOOLCHAIN" nextest run -p sys --features fixtures
+        run: mise exec cargo:cargo-nextest@0.9.150 -- cargo +"$RUSTUP_TOOLCHAIN" nextest run -p sys --features fixtures
       - name: Native Cargo path
         working-directory: measured
         run: echo "$(dirname "$(rustup which cargo)")" >> "$GITHUB_PATH"

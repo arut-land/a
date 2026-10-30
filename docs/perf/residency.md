@@ -432,8 +432,9 @@ thread-count comparisons with the uninstrumented workload.
 
 Only `a --features fixtures` includes `sys::census`. With the feature off,
 the CLI initialization call and census module are compiled out. With fixtures
-on, only the internal daemon entry point checks `A_ALLOC_CENSUS`; the harness
-sets it to a directory inside its isolated home. The hook publishes a PID
+on, only the internal daemon entry point checks for an `alloc-census`
+directory under an explicit `A_HOME`; the harness creates it inside its
+isolated home. This survives the daemon startup environment allowlist. The hook publishes a PID
 specific loopback port there and serves one native census per connection.
 One extra diagnostic thread persists for the daemon's lifetime. The harness
 warms the endpoint before seeding histories, samples every lifecycle boundary,
@@ -461,7 +462,7 @@ Every raw response carries the daemon PID and charged bytes immediately
 before and after collecting allocator statistics. The external charge probe
 continues to report PSS or private commit separately. Neither the native
 heap collection nor the charge bracket freezes all daemon threads; only
-stable lifecycle boundaries should be compared. Raw XML/per-heap records,
+stable lifecycle boundaries should be compared. Raw XML/per-heap records, per-stage VM maps,
 all stage distributions and paired hibernation deltas remain in JSON/JSONL
 artifacts. Summary tables give median [min, max] in KiB.
 

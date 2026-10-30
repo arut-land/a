@@ -11,13 +11,18 @@ pub fn initialize() {
     {
         return;
     }
-    let Some(directory) = std::env::var_os("A_ALLOC_CENSUS") else {
+    let Some(home) = std::env::var_os("A_HOME") else {
         return;
     };
+    // Daemon startup deliberately does not inherit arbitrary client environment.
+    let directory = std::path::PathBuf::from(home).join("alloc-census");
+    if !directory.is_dir() {
+        return;
+    }
     let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .expect("fixture census must bind loopback");
     std::fs::write(
-        std::path::Path::new(&directory).join(format!("{}.port", std::process::id())),
+        directory.join(format!("{}.port", std::process::id())),
         listener
             .local_addr()
             .expect("bound listener has a local address")
