@@ -356,13 +356,17 @@ def allocation_census(active):
     with socket.create_connection(("127.0.0.1", int(port.read_text())), timeout=30) as stream:
         with stream.makefile("r") as reader:
             value = json.loads(reader.readline())
+    if output := getattr(active, "census_output", None):
+        with (output / "census-native.jsonl").open("a", encoding="utf-8") as raw:
+            raw.write(json.dumps(value) + "\n")
     if "error" in value:
         raise RuntimeError(value["error"])
     if value["allocator"] == "glibc":
         root = ET.fromstring(value["malloc_info"])
         arena = int(root.find("./system[@type='current']").attrib["size"])
-        free = sum(int(root.find(f"./total[@type='{kind}']").attrib["size"]) for kind in ("fast", "rest"))
-        mapped = int(root.find("./total[@type='mmap']").attrib["size"])
+        totals = {total.attrib["type"]: int(total.attrib["size"]) for total in root.findall("./total")}
+        free = totals["rest"] + totals.get("fast", 0)
+        mapped = totals["mmap"]
         value.update(allocated_bytes=arena - free + mapped, retained_free_bytes=free,
                      allocator_bytes=arena + mapped)
     else:
@@ -401,6 +405,7 @@ def sample(binary, probe_binary, output, stored, count, turns, size, idle_second
         (active.home / "config.toml").write_text('[daemon]\nagent="echo"\nidle_secs=600\nhibernate_secs=1\n')
         if census:
             active.census = active.home / "alloc-census"
+            active.census_output = output
             active.census.mkdir()
         checked([str(binary), "ls"], env=active.env, cwd=active.home, timeout=60)
         active.pid = int((active.home / "run/daemon.pid").read_text().splitlines()[0])

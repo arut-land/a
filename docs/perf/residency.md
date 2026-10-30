@@ -449,7 +449,9 @@ and stops the daemon through that home's ordinary stop command.
 
 On glibc, `malloc_info(0, ...)` supplies raw XML for all arenas, with no
 preload or replacement allocator. The report derives free capacity from the
-root `fast` and `rest` totals, allocator capacity from the root current
+root free totals (`rest`, plus `fast` where the native allocator exposes
+fastbins; newer [glibc output](https://github.com/bminor/glibc/blob/master/malloc/malloc.c)
+omits that total), allocator capacity from the root current
 system bytes plus `mmap` bytes, and allocated bytes by subtraction. Raw
 `mallinfo2` allocated/free counters are also retained as a cross-check.
 Allocator-accounted allocated bytes include metadata and per-thread cached
