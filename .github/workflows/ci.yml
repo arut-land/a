@@ -19,6 +19,8 @@ jobs:
     steps:
       - run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - name: Install native LLVM toolchain
         shell: pwsh
         run: |
@@ -44,13 +46,13 @@ jobs:
           evidence.mkdir(exist_ok=True)
           keep = {"PATH", "PATHEXT", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "COMMONPROGRAMFILES", "COMMONPROGRAMFILES(X86)", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "TMP", "TEMP", "RUSTUP_HOME", "CARGO_HOME", "RUSTUP_TOOLCHAIN", "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS", "LIB", "INCLUDE", "LIBPATH", "VSINSTALLDIR", "VCINSTALLDIR", "VCTOOLSINSTALLDIR", "WINDOWSSDKDIR", "WINDOWSSDKVERSION"}
           clean = {k: v for k, v in os.environ.items() if k.upper() in keep}
-          clean.update(MISE_NO_ENV="1", MISE_AUTO_INSTALL="false", CARGO_BUILD_JOBS="2", CARGO_PROFILE_DEV_CODEGEN_BACKEND="llvm", CARGO_TARGET_DIR=str(root / "tgt-small-fixes"), MBX_CACHE_DIR=str(root / "mbx"), A_HOME=str(root / "retirement-home"), OPENAI_API_KEY="loopback-dummy", OPENAI_BASE_URL="http://127.0.0.1:1/v1", ANTHROPIC_API_KEY="loopback-dummy", ANTHROPIC_BASE_URL="http://127.0.0.1:1", NO_PROXY="127.0.0.1,localhost")
+          clean.update(MISE_TRUSTED_CONFIG_PATHS=str(Path.cwd()), MISE_YES="1", MISE_NO_ENV="1", MISE_AUTO_INSTALL="false", CARGO_BUILD_JOBS="2", CARGO_PROFILE_DEV_CODEGEN_BACKEND="llvm", CARGO_TARGET_DIR=str(root / "tgt-small-fixes"), MBX_CACHE_DIR=str(root / "mbx"), A_HOME=str(root / "retirement-home"), OPENAI_API_KEY="loopback-dummy", OPENAI_BASE_URL="http://127.0.0.1:1/v1", ANTHROPIC_API_KEY="loopback-dummy", ANTHROPIC_BASE_URL="http://127.0.0.1:1", NO_PROXY="127.0.0.1,localhost")
           source = Path("crates/sys/src/runtime/image.rs")
           probed = source.read_bytes()
           pristine = subprocess.check_output(["git", "show", "c6e1b87f:crates/sys/src/runtime/image.rs"], env=clean)
 
           def build(label):
-              result = subprocess.run(["mise", "exec", "--", "cargo", "test", "-p", "sys", "--lib", "--no-run", "--message-format=json"], env=clean, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+              result = subprocess.run(["mise", "exec", "--", "cargo", "test", "-p", "sys", "--lib", "--no-run", "--message-format=json"], env=clean, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, encoding="utf-8", errors="replace")
               (evidence / f"build-{label}.log").write_text(result.stdout)
               if result.returncode:
                   print(result.stdout, flush=True)
@@ -81,7 +83,7 @@ jobs:
                   env = dict(clean)
                   if mode != "pristine":
                       env["A_TEST_IMAGE_HANDLE_PROBE"] = mode
-                  result = subprocess.run([original_exe if mode == "pristine" else probe_exe, "--exact", name, "--nocapture"], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                  result = subprocess.run([original_exe if mode == "pristine" else probe_exe, "--exact", name, "--nocapture"], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, encoding="utf-8", errors="replace")
                   (evidence / f"{round_number:03d}-{mode}.log").write_text(result.stdout)
                   counts[mode]["passed" if result.returncode == 0 else "failed"] += 1
                   if result.returncode and counts[mode]["failed"] <= 3:
