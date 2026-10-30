@@ -947,6 +947,9 @@ def main():
     reference = args.reference_binary.resolve() if args.reference_binary else None
     if args.reference_source:
         reference = stage(executable(args.reference_source.resolve(), environment(target), ["--features", "fixtures"], run=cargo_run), output / ("a-reference" + SUFFIX))
+        # Cargo's local-package freshness can reuse the other checkout's image
+        # in a shared target directory. Keep the staged control, not that cache.
+        cargo_run(["cargo", "clean", "--release"], cwd=source, env=environment(target), check=True)
     binary = args.binary.resolve() if args.binary else stage(executable(source, environment(target), ["--features", "fixtures"], run=cargo_run), output / ("a-fixtures" + SUFFIX))
     reference = reference or binary
     probe = args.probe.resolve() if args.probe else build_probe(source, output, target)
