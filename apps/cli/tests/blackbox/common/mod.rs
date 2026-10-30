@@ -905,6 +905,18 @@ fn every_case_executes_the_same_fixture_without_aliases() {
 
 #[test]
 fn incomplete_log_tails_wait_for_a_newline_but_malformed_records_fail() {
+    if let Some(home) = std::env::var_os("A_LOG_RECORD_TEST_HOME") {
+        log(
+            &Home::from(PathBuf::from(home)),
+            SessionId(
+                std::env::var("A_LOG_RECORD_TEST_ID")
+                    .unwrap()
+                    .parse()
+                    .unwrap(),
+            ),
+        );
+        panic!("malformed complete record was accepted");
+    }
     let env = Env::new("log-tail");
     env.start();
     let mut conn = env.connect();
@@ -933,5 +945,21 @@ fn incomplete_log_tails_wait_for_a_newline_but_malformed_records_fail() {
     file.write_all(b"\n").unwrap();
     assert_eq!(env.log(id).len(), count + 1);
     file.write_all(b"not json\n").unwrap();
-    assert!(std::panic::catch_unwind(|| env.log(id)).is_err());
+    // Cranelift cannot unwind through these frames; verify rejection in a child.
+    let rejected = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "common::incomplete_log_tails_wait_for_a_newline_but_malformed_records_fail",
+        ])
+        .env("A_LOG_RECORD_TEST_HOME", env.home.root())
+        .env("A_LOG_RECORD_TEST_ID", id.to_string())
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stdout).contains("malformed complete entry not json")
+            || String::from_utf8_lossy(&rejected.stderr)
+                .contains("malformed complete entry not json"),
+        "{rejected:?}"
+    );
 }
