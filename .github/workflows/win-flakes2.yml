@@ -126,7 +126,16 @@ jobs:
               }
             }
           } finally {
-            foreach ($spinner in $spinners) { if (-not $spinner.HasExited) { Stop-Process -Id $spinner.Id } }
+            foreach ($spinner in $spinners) {
+              $spinner.Refresh()
+              if ($spinner.HasExited) {
+                "spinner=$($spinner.Id) exited-before-load-ended" | Tee-Object -Append "$scratch/run.txt"
+                $failed++
+                continue
+              }
+              "spinner=$($spinner.Id) cpu_seconds=$($spinner.TotalProcessorTime.TotalSeconds) alive=true" | Tee-Object -Append "$scratch/run.txt"
+              Stop-Process -Id $spinner.Id
+            }
           }
           if ($failed -ne 0) { exit 1 }
       - name: Preserve timestamps and failure traces
@@ -211,7 +220,16 @@ jobs:
               }
             }
           } finally {
-            foreach ($spinner in $spinners) { if (-not $spinner.HasExited) { Stop-Process -Id $spinner.Id } }
+            foreach ($spinner in $spinners) {
+              $spinner.Refresh()
+              if ($spinner.HasExited) {
+                "spinner=$($spinner.Id) exited-before-load-ended" | Tee-Object -Append "$scratch/run.txt"
+                $failed++
+                continue
+              }
+              "spinner=$($spinner.Id) cpu_seconds=$($spinner.TotalProcessorTime.TotalSeconds) alive=true" | Tee-Object -Append "$scratch/run.txt"
+              Stop-Process -Id $spinner.Id
+            }
           }
           if ($failed -ne 0) { exit 1 }
       - name: Preserve timestamps and failure traces
