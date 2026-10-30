@@ -24,7 +24,16 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def cargo_run(command, **kwargs):
-    return subprocess.run(["mise", "exec", "--", *command], **kwargs)
+    cargo = subprocess.check_output(["rustup", "which", "cargo"], cwd=kwargs.get("cwd"),
+                                    env=kwargs.get("env"), text=True).strip()
+    try:
+        return subprocess.run(["mise", "exec", "--", cargo, *command[1:]], **kwargs)
+    except subprocess.CalledProcessError as error:
+        if error.stdout:
+            print(error.stdout, file=sys.stderr)
+        if error.stderr:
+            print(error.stderr, file=sys.stderr)
+        raise
 
 # Generated only under CARGO_TARGET_DIR. Protocol encoding and native endpoints
 # stay in their owning Rust crates, including Windows named pipes.

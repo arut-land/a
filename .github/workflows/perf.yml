@@ -160,7 +160,8 @@ jobs:
       - uses: jdx/mise-action@v5
         with:
           working_directory: measured
-          install_args: mr-boxington
+          install: false
+          env: false
       - name: Build and measure complete ownership waves
         working-directory: harness
         env:
@@ -179,7 +180,7 @@ jobs:
         if: always()
         working-directory: measured
         run: |
-          mise exec -- cargo clean --target-dir "$CARGO_TARGET_DIR"
+          mise exec -- "$(rustup which cargo)" clean --target-dir "$CARGO_TARGET_DIR"
           python - <<'PYTHON'
           import os, shutil
           shutil.rmtree(os.environ['CARGO_TARGET_DIR'], ignore_errors=True)

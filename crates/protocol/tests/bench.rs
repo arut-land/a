@@ -67,6 +67,62 @@ fn log() -> Option<Vec<String>> {
 }
 
 #[test]
+#[ignore = "a measurement; run alone"]
+fn completed_frames_share_exact_storage() {
+    use protocol::{DaemonMsg, Frame, FrameReader};
+    use std::hint::black_box;
+
+    for (bytes, frames) in [(32, 1_000_000), (65_536, 8192), (5 << 20, 128)] {
+        let message = DaemonMsg::Error {
+            message: "x".repeat(bytes),
+        };
+        let held = {
+            let before = LIVE.load(Relaxed);
+            let frame = Frame::new(&message).unwrap();
+            black_box(&frame);
+            LIVE.load(Relaxed) - before
+        };
+        let before = ALLOCS.load(Relaxed);
+        let start = Instant::now();
+        for _ in 0..frames {
+            black_box(Frame::new(&message).unwrap());
+        }
+        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+        let allocations = ALLOCS.load(Relaxed) - before;
+        eprintln!(
+            "frame-measurement {}",
+            serde_json::json!({
+                "mode": "encode", "bytes": bytes, "frames": frames,
+                "ms": elapsed, "allocations": allocations, "held_bytes": held,
+            })
+        );
+
+        let frame = Frame::new(&message).unwrap();
+        let mut reader = FrameReader::new();
+        let before = ALLOCS.load(Relaxed);
+        let start = Instant::now();
+        for _ in 0..frames {
+            for bytes in frame.as_bytes().chunks(64 << 10) {
+                reader.extend_from_slice(bytes).unwrap();
+                if let Some((_, message)) = reader.decode::<DaemonMsg>().unwrap() {
+                    black_box(message);
+                }
+            }
+            assert!(reader.is_empty());
+        }
+        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+        let allocations = ALLOCS.load(Relaxed) - before;
+        eprintln!(
+            "frame-measurement {}",
+            serde_json::json!({
+                "mode": "decode", "bytes": bytes, "frames": frames,
+                "ms": elapsed, "allocations": allocations,
+            })
+        );
+    }
+}
+
+#[test]
 #[ignore = "a benchmark"]
 fn attach_to_a_logged_session() {
     let Some(lines) = log() else {

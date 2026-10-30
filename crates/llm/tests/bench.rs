@@ -483,6 +483,44 @@ fn encode_long_transcript() {
 }
 
 #[test]
+#[ignore = "a measurement; run alone"]
+fn unique_prefixes_transfer_their_encoding() {
+    let (host, quirks) = responses::HOSTS[0];
+    let provider = Provider::new(
+        host.id,
+        "http://127.0.0.1:1/v1",
+        llm::Auth::None,
+        responses::Responses::new(quirks),
+    );
+    let canonical = transcript(200, 8 << 10, &llm::origin(&provider, "m"));
+    let messages = canonical.messages.canonical().unwrap().into_owned();
+    let saved = messages.clone();
+    let request = Request {
+        messages: llm::Conversation::retained(llm::Resident::default(), messages, move || {
+            Ok(saved.clone())
+        }),
+        ..canonical
+    };
+    provider.request(&request.model, &request).unwrap();
+    let prefixes: Vec<_> = (0..1000)
+        .map(|_| request.messages.prefix().expect("closed encoded prefix"))
+        .collect();
+    let before = ALLOCS.with(Cell::get);
+    let start = Instant::now();
+    for prefix in prefixes {
+        std::hint::black_box(llm::Resident::from(prefix));
+    }
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+    let allocations = ALLOCS.with(Cell::get) - before;
+    eprintln!(
+        "prefix-measurement {}",
+        serde_json::json!({
+            "prefixes": 1000, "ms": elapsed, "allocations": allocations,
+        })
+    );
+}
+
+#[test]
 #[ignore = "a benchmark"]
 fn read_logged_reply() {
     let origin = Origin {
