@@ -73,7 +73,7 @@ index = ["dep:ext-index"]
 search = ["index", "dep:ext-search"]
 # The `echo` agent and `sleep` tool; the tests build them in, as the
 # dev-dependency below turns them on.
-fixtures = ["ext-fixtures/on"]
+fixtures = ["ext-fixtures/on", "sys/fixtures"]
 
 # TLS uses the host's crypto library and trust store on every platform.
 [dependencies.llm]
