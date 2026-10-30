@@ -55,7 +55,10 @@ route client startup and replacement through their systemd user unit; isolated
 and unmanaged installations start directly.
 
 The daemon serves connections and session actors on `rt`. Idle sessions
-hibernate; the daemon exits when no clients or work pin it. Upgrades drain
+hibernate; their public residency stays `loaded` through actor teardown and
+becomes `hibernated` only after actor exit releases the slot's live state.
+Loading starts from that completed transition, preserving the single writer.
+The daemon exits when no clients or work pin it. Upgrades drain
 work and restart the staged build; clients reconnect from their last seq.
 Work left running only in the background (detached calls, the process groups
 sessions own) is handed to the staged build live rather than waited out,

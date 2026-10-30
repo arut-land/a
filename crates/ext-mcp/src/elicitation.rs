@@ -8,6 +8,7 @@ use protocol::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use unicode_security::MixedScript;
 
 use crate::{CallInput, Failure, Mcp, ResultFact, ServerName, Transport};
 
@@ -155,6 +156,86 @@ fn invalid(message: impl Into<String>) -> Failure {
     Failure::Protocol(message.into())
 }
 
+pub(crate) fn destination(value: &str) -> Result<protocol::Destination, Failure> {
+    let url = url::Url::parse(value).map_err(|_| invalid("invalid question URL"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| invalid("question URL has no host"))?;
+    let loopback = match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Domain(name)) => name == "localhost",
+        None => false,
+    };
+    if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
+        return Err(invalid("question URL requires HTTPS except on loopback"));
+    }
+    let raw_origin = url.origin().ascii_serialization();
+    let decoded = if matches!(url.host(), Some(url::Host::Domain(_))) {
+        let (decoded, valid) = idna::domain_to_unicode(host);
+        valid.map_err(|_| invalid("invalid question URL host"))?;
+        decoded
+    } else {
+        host.into()
+    };
+    let origin = format!(
+        "{}://{}{}",
+        url.scheme(),
+        decoded,
+        url.port()
+            .map_or_else(String::new, |port| format!(":{port}"))
+    );
+    Ok(protocol::Destination {
+        suspicious: decoded != host
+            || !decoded.as_str().is_single_script()
+            || decoded.chars().any(|c| {
+                !c.is_ascii() && unicode_security::is_potential_mixed_script_confusable_char(c)
+            }),
+        raw_origin: (origin != raw_origin).then_some(raw_origin),
+        origin,
+    })
+}
+
+fn sensitive(value: &str) -> bool {
+    let normalized: String = value
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect();
+    [
+        "password",
+        "passwd",
+        "passphrase",
+        "passcode",
+        "token",
+        "apikey",
+        "accesskey",
+        "secret",
+        "onetime",
+        "verificationcode",
+        "securitycode",
+        "authenticationcode",
+        "privatekey",
+        "credential",
+        "recoverycode",
+        "backupcode",
+    ]
+    .iter()
+    .any(|term| normalized.contains(term))
+        || value
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|word| {
+                matches!(
+                    word.to_ascii_lowercase().as_str(),
+                    "otp" | "totp" | "mfa" | "2fa" | "pin" | "cvv" | "cvc"
+                )
+            })
+        || matches!(
+            normalized.as_str(),
+            "otpcode" | "totpcode" | "mfacode" | "2facode" | "pincode"
+        )
+}
+
 fn decode(server: &ServerName, value: &Value) -> Result<(Question, Option<String>), Failure> {
     let state = value
         .get("requestState")
@@ -187,15 +268,10 @@ fn decode(server: &ServerName, value: &Value) -> Result<(Question, Option<String
                     let url = params["url"]
                         .as_str()
                         .ok_or_else(|| invalid("elicitation has no URL"))?;
-                    let uri: http::Uri = url
-                        .parse()
-                        .map_err(|_| invalid("invalid elicitation URL"))?;
-                    if !matches!(uri.scheme_str(), Some("http" | "https")) || uri.host().is_none() {
-                        return Err(invalid("elicitation URL must use HTTP or HTTPS"));
-                    }
                     Prompt::Url {
                         message,
                         url: url.into(),
+                        destination: destination(url)?,
                     }
                 }
                 _ => return Err(invalid("unknown elicitation mode")),
@@ -313,11 +389,21 @@ fn field(name: &str, schema: &Value, required: bool) -> Result<Field, Failure> {
         return Err(invalid("field minimum exceeds maximum"));
     }
     let kind = kind(schema)?;
+    let sensitive = [
+        Some(name),
+        schema["title"].as_str(),
+        schema["description"].as_str(),
+        schema["format"].as_str(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(sensitive);
     let field = Field {
         name: name.into(),
         title: text(schema, "title")?,
         description: text(schema, "description")?,
         required,
+        sensitive,
         default: schema
             .get("default")
             .map(Json::encode)
@@ -339,7 +425,7 @@ fn kind(schema: &Value) -> Result<FieldKind, Failure> {
             }
         }
         Some("string") => {
-            let format = text(schema, "format")?;
+            let format = text(schema, "format")?.filter(|f| !sensitive(f));
             if format
                 .as_ref()
                 .is_some_and(|f| !matches!(f.as_str(), "email" | "uri" | "date" | "date-time"))
@@ -472,4 +558,122 @@ fn choices(schema: &Value, titled: &str) -> Result<Vec<Choice>, Failure> {
         return Err(invalid("choices must be nonempty and distinct"));
     }
     Ok(choices)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_destinations_require_https_and_loopback_is_literal() {
+        for url in [
+            "https://example.com/a",
+            "http://localhost:123/a",
+            "http://127.0.0.2:123",
+            "http://[::1]:123",
+        ] {
+            assert!(destination(url).is_ok(), "{url}");
+        }
+        for url in [
+            "http://example.com",
+            "http://localhost.example.com",
+            "http://127.0.0.1.example.com",
+            "file:///tmp/a",
+            "javascript:alert(1)",
+            "ftp://127.0.0.1",
+            "https://",
+        ] {
+            assert!(destination(url).is_err(), "{url}");
+        }
+        let destination = destination("https://example.com:8443/path?host=evil.com").unwrap();
+        assert_eq!(destination.origin, "https://example.com:8443");
+        assert!(!destination.suspicious);
+    }
+
+    #[test]
+    fn international_hosts_show_both_spellings_and_flag_ambiguity() {
+        for url in ["https://xn--pple-43d.com/path", "https://аpple.com/path"] {
+            let destination = destination(url).unwrap();
+            assert_eq!(destination.origin, "https://аpple.com");
+            assert_eq!(
+                destination.raw_origin.as_deref(),
+                Some("https://xn--pple-43d.com")
+            );
+            assert!(destination.suspicious);
+        }
+    }
+
+    #[test]
+    fn sensitive_metadata_is_classified_once_without_changing_answer_validation() {
+        for (name, metadata) in [
+            ("password", json!({})),
+            ("apiKey", json!({})),
+            ("value", json!({"title":"Access token"})),
+            ("value", json!({"description":"One-time verification code"})),
+            ("value", json!({"format":"password"})),
+            ("OTP", json!({})),
+            ("TOTP", json!({})),
+            ("MFA code", json!({})),
+            ("2FA code", json!({})),
+            ("mfaCode", json!({})),
+            ("totpCode", json!({})),
+            ("2fa_code", json!({})),
+            ("value", json!({"title":"TOTP"})),
+            ("value", json!({"title":"MFA code"})),
+            ("value", json!({"description":"2FA code"})),
+            ("payment", json!({"description":"CVV"})),
+        ] {
+            let mut schema = json!({"type":"string"});
+            schema
+                .as_object_mut()
+                .unwrap()
+                .extend(metadata.as_object().unwrap().clone());
+            let field = field(name, &schema, true).unwrap();
+            assert!(field.sensitive, "{name}: {metadata}");
+            assert!(
+                field
+                    .validate(&Json::encode("fixture-secret").unwrap())
+                    .is_ok()
+            );
+        }
+        for name in ["name", "email", "shipping", "description"] {
+            assert!(
+                !field(name, &json!({"type":"string"}), false)
+                    .unwrap()
+                    .sensitive
+            );
+        }
+    }
+    #[test]
+    fn sensitive_classification_preserves_single_and_multiple_choice_schemas() {
+        for schema in [
+            json!({"type":"string","title":"API key permissions","oneOf":[{"const":"opaque-read","title":"Read access"},{"const":"opaque-write","title":"Write access"}]}),
+            json!({"type":"array","title":"API key permissions","items":{"anyOf":[{"const":"opaque-read","title":"Read access"},{"const":"opaque-write","title":"Write access"}]}}),
+        ] {
+            let field = field("permissions", &schema, true).unwrap();
+            assert!(field.sensitive);
+            let FieldKind::Choice { options, selection } = &field.kind else {
+                panic!("choice kind retained")
+            };
+            assert_eq!(
+                options[0],
+                Choice {
+                    value: "opaque-read".into(),
+                    title: "Read access".into()
+                }
+            );
+            assert_eq!(
+                options[1],
+                Choice {
+                    value: "opaque-write".into(),
+                    title: "Write access".into()
+                }
+            );
+            let value = match selection {
+                Selection::One => Json::encode("opaque-read").unwrap(),
+                Selection::Many { .. } => Json::encode(&["opaque-read", "opaque-write"]).unwrap(),
+            };
+            field.validate(&value).unwrap();
+        }
+    }
 }

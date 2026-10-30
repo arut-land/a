@@ -26,10 +26,29 @@ pub struct QuestionWait {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Prompt {
-    Confirm { message: String },
-    Form { message: String, fields: Vec<Field> },
-    Url { message: String, url: String },
-    Continue { message: String },
+    Confirm {
+        message: String,
+    },
+    Form {
+        message: String,
+        fields: Vec<Field>,
+    },
+    Url {
+        message: String,
+        url: String,
+        destination: Destination,
+    },
+    Continue {
+        message: String,
+    },
+}
+
+/// Display metadata computed when an external URL enters the question boundary.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Destination {
+    pub origin: String,
+    pub raw_origin: Option<String>,
+    pub suspicious: bool,
 }
 
 impl Prompt {
@@ -58,6 +77,7 @@ pub struct Field {
     pub title: Option<String>,
     pub description: Option<String>,
     pub required: bool,
+    pub sensitive: bool,
     pub default: Option<Json>,
     pub kind: FieldKind,
 }
@@ -454,6 +474,7 @@ mod tests {
                             title: None,
                             description: None,
                             required: true,
+                            sensitive: false,
                             default: None,
                             kind: FieldKind::Number {
                                 integer: true,
@@ -466,6 +487,7 @@ mod tests {
                             title: None,
                             description: None,
                             required: false,
+                            sensitive: false,
                             default: None,
                             kind: FieldKind::Boolean,
                         },

@@ -23,32 +23,57 @@ resident and observed; the used-stage turn has finished, rather than holding
 CPU busy artificially. Inputs are sent to all attached sessions before replies
 are consumed. The slow follower stops reading after initial synchronization,
 then drains through the last exact reply and idle acknowledgement before
-closing. Its entire accumulated entry tail must match the durable log exactly. A slow or disconnected follower is a failed sample, not successful
-work with discarded history. This fixture covers finite reader lag, not an
-indefinitely stalled consumer.
+closing. It demands its original immutable cut again, then the complete newer
+head. Both must match the durable log, with the original items preserved and
+a nonempty new tail. A slow or disconnected follower is a failed sample, not
+successful work with discarded history. This fixture covers finite reader lag,
+not an indefinitely stalled consumer.
 
 The public catalog must have exactly the requested population, idle activity,
 and the expected resident/client counts. Hibernation requires every session
 to report `hibernated` with zero clients, bounded by a failure deadline.
-**The public summary also represents the internal stopping state as
-hibernated.** Twelve additional seconds allow blocking workers to retire;
-this is a settling interval, not proof that an internal weak owner expired.
-The existing real-engine `hibernating_frees_the_session` invariant separately
-checks that owner. Successful reattachment also crosses the prior actor-exit
-barrier, verified by its existing engine invariant. A stronger per-sample actor-exit acknowledgement needs an
-engine/protocol interface outside this branch's ownership. Do not infer a leak
-or prove its absence from the public summary alone.
+The engine keeps a stopping actor publicly `loaded` until the actor has
+finished teardown and the residency transition releases its live state. The
+`hibernated` acknowledgement therefore crosses the actor-exit barrier before
+measurement. Twelve additional seconds allow blocking workers to retire; this
+settling interval serves a separate purpose. The real-engine
+`a_stopping_actor_is_never_published_as_hibernated` invariant holds teardown,
+checks both direct and published summaries, then verifies actor release and
+successful reattachment. `hibernating_frees_the_session` separately checks
+that no live owner remains after hibernation.
 
-Every initial attach, second-wave attach and final reopen decodes with the
-real protocol crate and compares the entire replay, including the synced
-sequence, against the independently read durable log. Latency starts just
-before Attach and ends at Synced, excluding connection/Hello, log comparison
-and process startup. Summaries retain the slowest session per sample, then
-report its median and full range over rounds. They are not tail percentiles.
-The generated probe's invariant rejects incomplete or prematurely synced
-replay as a sample. The Python integration invariant runs two real sessions
-through both waves, verifies the slow follower pins only its session, and
-checks complete history on reopen.
+The historical tables below predate this publication fix: their public
+hibernation acknowledgement also covered stopping actors. Their settling
+interval does not retroactively prove actor exit. Do not infer a leak or prove
+its absence from those public summaries alone.
+
+Every initial attach, second-wave attach and final reopen uses public heads
+and committed history requests decoded by the real protocol crate. The
+complete-history invariant is: **demanded ranges from item 0 to the head
+reproduce every durable transcript item exactly once, in order**. The probe
+independently reads the durable log through that immutable head's sequence
+and folds it with `protocol::view::SessionView::from_log`. Concatenated ranges
+must have every index, the exact full item values, and the head's item count;
+the log prefix must reach the head's sequence. Attach also rejects a head behind
+facts already durable before its request. Control facts contribute to
+the log cut and reducer, rather than appearing as transcript items.
+
+Requests use a 64 KiB allowance. Transport chunks and oversized text-item
+fragments must be contiguous; fragments are assembled without losing bytes
+or counting an item twice. The generated tests reject missing, duplicate,
+reordered, truncated or premature-cut history and exercise UTF-8 fragment
+assembly. The slow follower deliberately reads nothing during each wave's turns,
+then validates complete history at its original and latest cuts. The Python
+integration invariant runs two real sessions through both waves, verifies
+the slow follower pins only its session, and checks complete history on reopen.
+
+Latency starts just before Attach and ends after complete ranged history is
+validated, excluding connection/Hello and process startup. It includes range
+requests, decoding and independent durable-log comparison. Summaries retain
+the slowest session per sample, then report its median and full range over
+rounds. They are not tail percentiles. The historical tables below used the
+older Attach-to-Synced boundary; their latency values are not directly
+comparable to the complete-history boundary.
 
 ## Accounting and interpretation
 
@@ -79,8 +104,8 @@ Context-graph owns inherited context representation; turn-residency stage B
 owns client transcript paging. This workload uses the echo fixture and
 protocol clients, so it neither measures inherited model contexts nor claims
 TUI/web/FFI paging savings. Interpret their live-history evidence separately;
-no files in either product lane are changed here. No product fix, allocator
-trim, history cap, new dependency, log change or wire change is included.
+no files in either product lane are changed here. The actor-exit publication
+fix adds no allocator trim, history cap, dependency, log change or wire change.
 
 ## Reproduction
 

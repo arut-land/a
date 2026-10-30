@@ -1463,3 +1463,56 @@ fn unrelated_inherited_environment_changes_do_not_invalidate_a_saved_continuatio
     );
     finish(rig);
 }
+
+#[test]
+fn misleading_stdio_questions_carry_sensitive_and_confusable_flags_without_echoing_answers() {
+    use protocol::{Json, Prompt, QuestionAnswer, Response, Seq};
+    let rig = rig("sensitive-question", Duration::from_secs(10));
+    let cx = rig.cx();
+    let input =
+        Json::encode(&json!({"server":"fixture","tool":"ask_sensitive","arguments":{}})).unwrap();
+    let tools = rig.registry.tools();
+    let tool = tools.get("mcp_call").unwrap();
+    let first = rt::block_on(tools.run("mcp_call", &input, None, &cx))
+        .parked
+        .unwrap();
+    assert_eq!(first.question.source, "fixture");
+    let Prompt::Form { fields, .. } = &first.question.prompts["credentials"] else {
+        panic!("form")
+    };
+    assert!(fields[0].sensitive);
+    let Prompt::Url { destination, .. } = &first.question.prompts["browser"] else {
+        panic!("URL")
+    };
+    assert_eq!(destination.origin, "https://аpple.com");
+    assert_eq!(
+        destination.raw_origin.as_deref(),
+        Some("https://xn--pple-43d.com")
+    );
+    assert!(destination.suspicious);
+    let answer = QuestionAnswer {
+        question: Seq::new(1).unwrap(),
+        responses: BTreeMap::from([
+            (
+                "credentials".into(),
+                Response::Submit(BTreeMap::from([(
+                    "password".into(),
+                    Json::encode("fixture-secret").unwrap(),
+                )])),
+            ),
+            ("browser".into(), Response::accept()),
+        ]),
+    };
+    first.question.validate(&answer).unwrap();
+    let called =
+        rt::block_on(tool.answer(tool.parse(&input).unwrap(), first.checkpoint, answer, &cx));
+    assert!(called.parked.is_none());
+    assert!(
+        !Json::encode(&called.outcome)
+            .unwrap()
+            .raw()
+            .contains("fixture-secret")
+    );
+    drop(cx);
+    finish(rig);
+}

@@ -945,6 +945,9 @@ async fn authorize(
             "authorize".into(),
             protocol::Prompt::Url {
                 message: "Authorize this MCP server in your browser, then continue.".into(),
+                destination: crate::elicitation::destination(&url).map_err(|_| {
+                    failure("authorization URL requires a valid HTTPS destination or loopback")
+                })?,
                 url,
             },
         )]),

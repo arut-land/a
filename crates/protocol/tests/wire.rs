@@ -675,6 +675,11 @@ fn input_samples() -> Vec<Sample<DaemonMsg>> {
                             "url".into(),
                             protocol::Prompt::Url {
                                 message: "Continue in your browser".into(),
+                                destination: protocol::Destination {
+                                    origin: "https://example.com".into(),
+                                    raw_origin: None,
+                                    suspicious: false,
+                                },
                                 url: "https://example.com/consent".into(),
                             },
                         )]),
