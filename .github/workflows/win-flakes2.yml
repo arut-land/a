@@ -100,7 +100,7 @@ jobs:
           $env:CI = 'true'
           & mise trust "$config/mise.toml"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $testArgs = @('--cd', $config, 'exec', '--', 'cargo', '--config', "$root/.cargo/config.toml", 'nextest', 'run', '--manifest-path', "$root/Cargo.toml", '-p', 'engine', '-p', 'client', '--no-fail-fast', '--no-tests=fail')
+          $testArgs = @('--cd', $config, 'exec', '--', 'cargo', '--config', "$root/.cargo/config.toml", 'nextest', 'run', '--manifest-path', "$root/Cargo.toml", '-p', 'engine', '-p', 'client')
           "sha=$sha contention=$contention cores=$env:NUMBER_OF_PROCESSORS start=$([DateTime]::UtcNow.ToString('o'))" | Tee-Object "$scratch/run.txt"
           & mise @testArgs --no-run 2>&1 | Tee-Object "$scratch/build.log"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -116,7 +116,7 @@ jobs:
             for ($round = 1; $round -le 20; $round++) {
               $log = "$scratch/round-$round.log"
               "round=$round start=$([DateTime]::UtcNow.ToString('o'))" | Tee-Object -Append "$scratch/run.txt"
-              & mise @testArgs 2>&1 | Tee-Object $log
+              & mise @testArgs --no-fail-fast --no-tests=fail 2>&1 | Tee-Object $log
               $code = $LASTEXITCODE
               "round=$round exit=$code end=$([DateTime]::UtcNow.ToString('o'))" | Tee-Object -Append "$scratch/run.txt"
               if ($code -ne 0) {
