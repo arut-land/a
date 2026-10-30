@@ -71,10 +71,10 @@ jobs:
           results = {}
           try:
               source.write_bytes(pristine)
-              results["pristine"] = run_stress("pristine", 1000)
+              results["pristine"] = run_stress("pristine", 200)
           finally:
               source.write_bytes(probed)
-          for mode in ["held", "dropped", "duplicate", "thread", "file", "file-dropped", "posix-file"]:
+          for mode in ["mapped", "unmapped", "unmapped-held"]:
               results[mode] = run_stress(mode, 200, mode)
           (evidence / "summary.json").write_text(json.dumps(results, indent=2))
           print(json.dumps(results), flush=True)

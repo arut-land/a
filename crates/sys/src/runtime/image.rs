@@ -348,6 +348,8 @@ mod tests {
         let exe = build.join(super::super::EXE);
         super::copy(&std::env::current_exe().unwrap(), &exe).unwrap();
         let mode = std::env::var("A_TEST_IMAGE_HANDLE_PROBE").unwrap_or_else(|_| "held".into());
+        let mut image_view = matches!(mode.as_str(), "mapped" | "unmapped" | "unmapped-held")
+            .then(|| ImageMapping::new(&exe));
         let mut image_reader = matches!(mode.as_str(), "file" | "file-dropped" | "posix-file")
             .then(|| std::fs::File::open(&exe).unwrap());
         let mut child = Some(Command::new(&exe)
@@ -400,9 +402,13 @@ mod tests {
                 .unwrap()
                 .write_all(&[0])?;
             assert!(child.as_mut().unwrap().wait()?.success());
-            if mode != "held" {
+            if mode != "held" && mode != "unmapped-held" {
                 drop(child.take());
             }
+            if matches!(mode.as_str(), "unmapped" | "unmapped-held") {
+                drop(image_view.take());
+            }
+            eprintln!("image_view_owned={}", image_view.is_some());
             if mode == "file-dropped" {
                 drop(image_reader.take());
             }
@@ -432,6 +438,45 @@ mod tests {
         drop(child);
         drop(retained);
         drop(image_reader);
+        drop(image_view);
         result.unwrap();
+    }
+
+    #[cfg(windows)]
+    struct ImageMapping(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS);
+
+    #[cfg(windows)]
+    impl ImageMapping {
+        fn new(path: &std::path::Path) -> Self {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::System::Memory::{
+                CreateFileMappingW, FILE_MAP_READ, MapViewOfFile, PAGE_READONLY, SEC_IMAGE,
+            };
+            let file = std::fs::File::open(path).unwrap();
+            // SAFETY: the file is owned through creation; null security/name pointers are allowed.
+            let mapping = crate::windows::owned(unsafe {
+                CreateFileMappingW(
+                    file.as_raw_handle(),
+                    std::ptr::null(),
+                    PAGE_READONLY | SEC_IMAGE,
+                    0,
+                    0,
+                    std::ptr::null(),
+                )
+            })
+            .unwrap();
+            // SAFETY: the mapping is live; a zero length maps the complete file.
+            let view = unsafe { MapViewOfFile(mapping.as_raw_handle(), FILE_MAP_READ, 0, 0, 0) };
+            assert!(!view.Value.is_null(), "{}", std::io::Error::last_os_error());
+            Self(view)
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for ImageMapping {
+        fn drop(&mut self) {
+            // SAFETY: this view has one owner and has not been unmapped.
+            unsafe { windows_sys::Win32::System::Memory::UnmapViewOfFile(self.0) };
+        }
     }
 }
