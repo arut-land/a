@@ -25,14 +25,12 @@ ROOT = Path(__file__).resolve().parents[2]
 # Generated only under CARGO_TARGET_DIR. Protocol encoding and native endpoints
 # stay in their owning Rust crates, including Windows named pipes.
 PROBE = r'''
-use protocol::{Activity, ClientMsg, DaemonMsg, Decode, Entry, SessionId, Target};
+use protocol::history::{Direction, Filter, Head, Heads, Located, Page, Request};
+use protocol::view::{Item, SessionView};
+use protocol::{Activity, ClientMsg, DaemonMsg, Decode, Entry, HostPath, SessionId, Target};
 use std::io::{BufRead, BufReader, Write};
 use std::time::{Duration, Instant};
 
-fn replay_is_complete(expected: &[Entry], actual: &[Entry], seq: u64) {
-    assert_eq!(actual, expected, "reopen must preserve every durable entry");
-    assert_eq!(seq, expected.last().map_or(0, |e| e.seq.get()));
-}
 fn durable(home: &sys::Home, id: SessionId) -> Vec<Entry> {
     let text = std::fs::read_to_string(home.sessions_dir().join(id.to_string()).join("log.jsonl"))
         .unwrap();
@@ -42,11 +40,105 @@ fn durable(home: &sys::Home, id: SessionId) -> Vec<Entry> {
         .map(|line| Entry::from_json(line.as_bytes()).unwrap())
         .collect()
 }
-fn main() {
-    let home = sys::Home::from(std::path::PathBuf::from(
-        std::env::var_os("A_HOME").unwrap(),
-    ));
-    let connect = || {
+
+fn replay_is_complete(expected: &SessionView, actual: &[Located], head: &Head) {
+    assert_eq!(
+        expected.seq, head.cut.seq,
+        "the head must name a durable log cut"
+    );
+    assert_eq!(
+        expected.items.len(),
+        head.count,
+        "the head must count every durable item"
+    );
+    assert_eq!(
+        actual.len(),
+        head.count,
+        "demanded history must cover the complete head"
+    );
+    for (index, (actual, expected)) in actual.iter().zip(expected.items.iter()).enumerate() {
+        assert_eq!(
+            actual.index, index,
+            "history must contain each index once, in order"
+        );
+        assert_eq!(
+            &actual.item, expected,
+            "history must preserve every durable item"
+        );
+    }
+}
+
+fn text(item: &mut Item) -> &mut String {
+    match item {
+        Item::User { text, .. } | Item::Assistant { text, .. } | Item::Reply { text, .. } => text,
+        _ => panic!("only text items can be fragmented"),
+    }
+}
+
+#[derive(Default)]
+struct Replay {
+    items: Vec<Located>,
+    partial: Option<Item>,
+    offset: Option<usize>,
+}
+
+impl Replay {
+    fn append(&mut self, page: Page, head: &Head) {
+        assert_eq!(page.cut, head.cut, "a page must belong to the demanded cut");
+        assert_eq!(page.total, head.count);
+        assert_eq!(page.start, self.items.len());
+        assert!(!page.items.is_empty(), "a demanded page must advance");
+        for mut located in page.items {
+            assert_eq!(
+                located.index,
+                self.items.len(),
+                "a range skipped or repeated an item"
+            );
+            if let Some(span) = page.fragment.as_ref().filter(|s| s.index == located.index) {
+                assert_eq!(span.key, located.item.key());
+                assert_eq!(span.start, self.offset.unwrap_or(0));
+                assert!(span.end > span.start && span.end <= span.total);
+                assert_eq!(text(&mut located.item).len(), span.end - span.start);
+                if let Some(mut previous) = self.partial.take() {
+                    let suffix = std::mem::take(text(&mut located.item));
+                    let prefix = std::mem::take(text(&mut previous));
+                    assert_eq!(
+                        previous, located.item,
+                        "fragment metadata changed within a cut"
+                    );
+                    *text(&mut located.item) = prefix + &suffix;
+                }
+                if span.end < span.total {
+                    self.partial = Some(located.item);
+                    self.offset = Some(span.end);
+                    continue;
+                }
+                assert_eq!(text(&mut located.item).len(), span.total);
+                self.offset = None;
+            } else {
+                assert!(self.partial.is_none(), "a fragment was left incomplete");
+            }
+            self.items.push(located);
+        }
+        assert_eq!(
+            page.end,
+            self.items.len() + usize::from(self.partial.is_some())
+        );
+    }
+}
+
+struct Client {
+    stream: sys::OwnedConnection,
+    reader: BufReader<sys::OwnedConnection>,
+    session: Option<(SessionId, HostPath)>,
+    heads: Heads,
+    head: Option<Head>,
+    activity: Option<(u64, Activity)>,
+    request: u64,
+}
+
+impl Client {
+    fn connect(home: &sys::Home) -> Self {
         let mut stream = home.endpoint().connect().unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(60)))
@@ -67,13 +159,57 @@ fn main() {
             protocol::read_frame(&mut reader).unwrap(),
             Some(DaemonMsg::Welcome { .. })
         ));
-        (stream, reader)
-    };
-    let attach = |target| {
-        let (mut stream, mut reader) = connect();
+        Self {
+            stream,
+            reader,
+            session: None,
+            heads: Heads::default(),
+            head: None,
+            activity: None,
+            request: 0,
+        }
+    }
+
+    fn receive(&mut self) -> DaemonMsg {
+        let msg = protocol::read_frame::<DaemonMsg>(&mut self.reader)
+            .unwrap()
+            .expect("daemon disconnected");
+        match &msg {
+            DaemonMsg::Attached { session, workspace } => {
+                self.session = Some((*session, workspace.clone()))
+            }
+            DaemonMsg::Head { head } => self.head = Some((**head).clone()),
+            DaemonMsg::HeadPart {
+                seq,
+                offset,
+                text,
+                done,
+            } => {
+                if let Some(head) = self.heads.part(*seq, *offset, text, *done).unwrap() {
+                    self.head = Some(head);
+                }
+            }
+            DaemonMsg::Activity { seq, activity } => self.activity = Some((*seq, *activity)),
+            DaemonMsg::Error { message } => panic!("{message}"),
+            DaemonMsg::Reply { outcome, .. } => assert!(
+                matches!(outcome, protocol::Outcome::Done { .. }),
+                "history request failed: {outcome:?}"
+            ),
+            _ => {}
+        }
+        msg
+    }
+
+    fn attach(home: &sys::Home, target: Target) -> (Self, f64, usize) {
+        let committed = if let Target::Id(id) = &target {
+            durable(home, *id).last().map_or(0, |e| e.seq.get())
+        } else {
+            0
+        };
+        let mut client = Self::connect(home);
         let started = Instant::now();
         protocol::write_frame(
-            &mut stream,
+            &mut client.stream,
             &ClientMsg::Attach {
                 target,
                 workspace: Some(std::env::current_dir().unwrap().try_into().unwrap()),
@@ -83,66 +219,161 @@ fn main() {
             },
         )
         .unwrap();
-        let mut id = None;
-        let mut entries = Vec::new();
         let seq = loop {
-            match protocol::read_frame::<DaemonMsg>(&mut reader)
-                .unwrap()
-                .unwrap()
-            {
-                DaemonMsg::Attached { session, .. } => id = Some(session),
-                DaemonMsg::Entry(entry) => entries.push(entry),
-                DaemonMsg::Synced { seq } => break seq,
-                DaemonMsg::Error { message } => panic!("{message}"),
-                _ => {}
+            if let DaemonMsg::Synced { seq } = client.receive() {
+                break seq;
             }
         };
+        let head = client
+            .head
+            .clone()
+            .expect("attach must publish a head before Synced");
+        assert_eq!(head.cut.seq, seq);
+        assert!(
+            seq >= committed,
+            "attach omitted facts already durable before its head"
+        );
+        let items = client.replay(home, &head);
         let ms = started.elapsed().as_secs_f64() * 1000.;
-        let id = id.unwrap();
-        let expected = durable(&home, id);
-        replay_is_complete(&expected, &entries, seq);
-        (stream, reader, id, ms, entries.len(), seq)
-    };
-    let mut held = Vec::new();
+        (client, ms, items.len())
+    }
+
+    fn replay(&mut self, home: &sys::Home, head: &Head) -> Vec<Located> {
+        let (id, workspace) = self.session.as_ref().unwrap();
+        assert_eq!(head.cut.session, *id);
+        let expected = SessionView::from_log(
+            *id,
+            workspace.clone(),
+            durable(home, *id)
+                .into_iter()
+                .filter(|e| e.seq.get() <= head.cut.seq),
+        );
+        let mut replay = Replay::default();
+        while replay.items.len() < head.count {
+            self.request += 1;
+            protocol::write_frame(
+                &mut self.stream,
+                &ClientMsg::History {
+                    id: self.request,
+                    range: Request {
+                        cut: head.cut,
+                        anchor: replay.items.len(),
+                        text_offset: replay.offset,
+                        direction: Direction::After,
+                        bytes: 64 << 10,
+                        filter: Filter::Transcript,
+                    },
+                },
+            )
+            .unwrap();
+            let mut bytes = String::new();
+            loop {
+                if let DaemonMsg::HistoryPart {
+                    id,
+                    offset,
+                    text,
+                    done,
+                } = self.receive()
+                {
+                    assert_eq!(id, self.request);
+                    assert_eq!(
+                        offset,
+                        bytes.len() as u64,
+                        "history chunks must be contiguous"
+                    );
+                    bytes.push_str(&text);
+                    if done {
+                        break;
+                    }
+                }
+            }
+            replay.append(Page::from_json(bytes.as_bytes()).unwrap(), head);
+        }
+        assert!(replay.partial.is_none(), "the final item must be complete");
+        replay_is_complete(&expected, &replay.items, head);
+        replay.items
+    }
+
+    fn reply(&mut self, home: &sys::Home, since: u64, last: &str) -> Vec<Located> {
+        let mut checked = since;
+        loop {
+            if let Some((seq, Activity::Idle)) = self.activity
+                && seq > checked
+                && let Some(head) = self.head.clone().filter(|h| h.cut.seq == seq)
+            {
+                checked = seq;
+                let items = self.replay(home, &head);
+                if items.iter().rev().find_map(|i| match &i.item {
+                    Item::Assistant { text, .. } => Some(text.as_str()),
+                    _ => None,
+                }) == Some(last)
+                {
+                    return items;
+                }
+                continue;
+            }
+            self.receive();
+        }
+    }
+
+    fn detach(mut self) {
+        protocol::write_frame(&mut self.stream, &ClientMsg::Detach).unwrap();
+        while protocol::read_frame::<DaemonMsg>(&mut self.reader)
+            .unwrap()
+            .is_some()
+        {}
+    }
+}
+
+fn main() {
+    let home = sys::Home::from(std::path::PathBuf::from(
+        std::env::var_os("A_HOME").unwrap(),
+    ));
+    let mut held: Vec<Client> = Vec::new();
     let mut slow = None;
     let mut last = String::new();
     for line in std::io::stdin().lock().lines() {
         let value: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
         let result = match value["op"].as_str().unwrap() {
             "catalog" => {
-                let (mut stream, mut reader) = connect();
-                protocol::write_frame(&mut stream, &ClientMsg::List).unwrap();
-                let Some(DaemonMsg::Sessions { sessions }) =
-                    protocol::read_frame(&mut reader).unwrap()
-                else {
+                let mut client = Client::connect(&home);
+                protocol::write_frame(&mut client.stream, &ClientMsg::List).unwrap();
+                let DaemonMsg::Sessions { sessions } = client.receive() else {
                     panic!("expected catalog")
                 };
                 serde_json::to_value(sessions).unwrap()
             }
             "new" => {
-                let (_, _, id, _, _, _) = attach(Target::New);
+                let (client, _, _) = Client::attach(&home, Target::New);
+                let id = client.session.as_ref().unwrap().0;
+                client.detach();
                 serde_json::json!(id)
             }
             "attach" | "slow" => {
                 let id: SessionId = serde_json::from_value(value["id"].clone()).unwrap();
-                let (stream, reader, actual, ms, entries, seq) = attach(Target::Id(id));
-                assert_eq!(actual, id);
+                let (mut client, ms, items) = Client::attach(&home, Target::Id(id));
+                assert_eq!(client.session.as_ref().unwrap().0, id);
                 if value["op"] == "slow" {
-                    slow = Some((stream, reader, id, seq));
+                    let head = client.head.clone().unwrap();
+                    let before = client.replay(&home, &head);
+                    slow = Some((client, head, before));
                 } else {
-                    held.push((stream, reader));
+                    held.push(client);
                 }
-                serde_json::json!({"ms": ms, "entries": entries})
+                serde_json::json!({"ms": ms, "items": items})
             }
             "turns" => {
                 let count = value["count"].as_u64().unwrap();
                 let bytes = value["bytes"].as_u64().unwrap() as usize;
-                // Send to every active session before awaiting any reply.
                 for turn in 0..count {
                     last = format!("wave {} turn {turn}: {}", value["wave"], "x".repeat(bytes));
-                    for (stream, _) in &mut held {
+                    let since: Vec<_> = held
+                        .iter()
+                        .map(|c| c.head.as_ref().unwrap().cut.seq)
+                        .collect();
+                    for client in &mut held {
                         protocol::write_frame(
-                            stream,
+                            &mut client.stream,
                             &ClientMsg::Input {
                                 segments: last.clone().into(),
                                 mode: Default::default(),
@@ -152,74 +383,35 @@ fn main() {
                         )
                         .unwrap();
                     }
-                    for (_, reader) in &mut held {
-                        let mut answered = false;
-                        loop {
-                            match protocol::read_frame::<DaemonMsg>(reader).unwrap().unwrap() {
-                                DaemonMsg::Entry(entry) => {
-                                    if let protocol::Body::Assistant { text } = entry.body {
-                                        answered |= text == last;
-                                    }
-                                }
-                                DaemonMsg::Activity {
-                                    activity: Activity::Idle,
-                                    ..
-                                } if answered => break,
-                                DaemonMsg::Error { message } => panic!("{message}"),
-                                _ => {}
-                            }
-                        }
+                    for (client, since) in held.iter_mut().zip(since) {
+                        client.reply(&home, since, &last);
                     }
                 }
                 serde_json::json!({"completed": count * held.len() as u64})
             }
             "detach" => {
-                for (mut stream, mut reader) in held.drain(..) {
-                    protocol::write_frame(&mut stream, &ClientMsg::Detach).unwrap();
-                    while protocol::read_frame::<DaemonMsg>(&mut reader)
-                        .unwrap()
-                        .is_some()
-                    {}
+                for client in held.drain(..) {
+                    client.detach();
                 }
                 serde_json::Value::Null
             }
             "drain" => {
-                let (mut stream, mut reader, id, since) = slow.take().unwrap();
-                let mut entries = Vec::new();
-                let mut answered = false;
-                loop {
-                    match protocol::read_frame::<DaemonMsg>(&mut reader)
-                        .unwrap()
-                        .unwrap()
-                    {
-                        DaemonMsg::Entry(entry) => {
-                            if let protocol::Body::Assistant { text } = &entry.body {
-                                answered |= text == &last;
-                            }
-                            entries.push(entry);
-                        }
-                        DaemonMsg::Activity {
-                            activity: Activity::Idle,
-                            ..
-                        } if answered => break,
-                        DaemonMsg::Error { message } => panic!("slow follower: {message}"),
-                        _ => {}
-                    }
-                }
-                let expected: Vec<_> = durable(&home, id)
-                    .into_iter()
-                    .filter(|entry| entry.seq.get() > since)
-                    .collect();
+                let (mut client, head, before) = slow.take().unwrap();
+                assert_eq!(
+                    client.replay(&home, &head),
+                    before,
+                    "a lagging follower's original cut must remain immutable"
+                );
+                let items = client.reply(&home, head.cut.seq, &last);
                 assert!(
-                    !expected.is_empty(),
+                    items.len() > before.len(),
                     "slow follower must have work to drain"
                 );
-                replay_is_complete(&expected, &entries, entries.last().unwrap().seq.get());
-                protocol::write_frame(&mut stream, &ClientMsg::Detach).unwrap();
-                while protocol::read_frame::<DaemonMsg>(&mut reader)
-                    .unwrap()
-                    .is_some()
-                {}
+                assert!(
+                    items.starts_with(&before),
+                    "slow follower must preserve its complete prior history"
+                );
+                client.detach();
                 serde_json::json!({"complete": true})
             }
             "memory" => serde_json::json!({
@@ -232,22 +424,98 @@ fn main() {
         std::io::stdout().flush().unwrap();
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
-    fn missing_or_prematurely_synced_history_is_never_a_latency_sample() {
-        let entry = Entry::new(
-            protocol::Seq::new(1).unwrap(),
-            protocol::Epoch(1),
-            protocol::Body::Assistant {
-                text: "durable history".into(),
-            },
+    fn missing_duplicate_reordered_or_truncated_history_is_never_a_latency_sample() {
+        let id = SessionId::new();
+        let entries: Vec<_> = (1..=2)
+            .map(|n| {
+                Entry::new(
+                    protocol::Seq::new(n).unwrap(),
+                    protocol::Epoch(1),
+                    protocol::Body::Assistant {
+                        text: format!("durable item {n}"),
+                    },
+                )
+            })
+            .collect();
+        let expected = SessionView::from_log(id, "/fixture".into(), &entries);
+        let mut index = protocol::view::Index::new(id, expected.workspace.clone());
+        for entry in &entries {
+            index.apply(entry);
+        }
+        let head = index.head(protocol::Epoch(1));
+        let actual: Vec<_> = expected
+            .items
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, item)| Located { index, item })
+            .collect();
+        replay_is_complete(&expected, &actual, &head);
+        let rejects = |items: &[Located], head: &Head| {
+            assert!(
+                std::panic::catch_unwind(|| replay_is_complete(&expected, items, head)).is_err()
+            )
+        };
+        rejects(&actual[..1], &head);
+        rejects(&[actual[0].clone(), actual[0].clone()], &head);
+        rejects(&[actual[1].clone(), actual[0].clone()], &head);
+        let mut truncated = actual.clone();
+        text(&mut truncated[1].item).pop();
+        rejects(&truncated, &head);
+        let mut premature = head;
+        premature.cut.seq = 0;
+        rejects(&actual, &premature);
+    }
+
+    #[test]
+    fn demanded_fragments_reconstruct_every_item_once_in_order() {
+        let id = SessionId::new();
+        let entries: Vec<_> = (1..=2)
+            .map(|n| {
+                Entry::new(
+                    protocol::Seq::new(n).unwrap(),
+                    protocol::Epoch(1),
+                    protocol::Body::Assistant {
+                        text: format!("item {n}: {}", "αβγδεζηθ".repeat(8)),
+                    },
+                )
+            })
+            .collect();
+        let expected = SessionView::from_log(id, "/fixture".into(), &entries);
+        let mut index = protocol::view::Index::new(id, expected.workspace.clone());
+        for entry in &entries {
+            index.apply(entry);
+        }
+        let head = index.head(protocol::Epoch(1));
+        let mut replay = Replay::default();
+        let mut pages = 0;
+        while replay.items.len() < head.count {
+            let request = Request {
+                cut: head.cut,
+                anchor: replay.items.len(),
+                text_offset: replay.offset,
+                direction: Direction::After,
+                bytes: 9,
+                filter: Filter::Transcript,
+            };
+            let page = index
+                .page(&request, |seq| Ok(entries[seq.get() as usize - 1].clone()))
+                .unwrap();
+            replay.append(page, &head);
+            pages += 1;
+        }
+        assert!(
+            pages > head.count,
+            "the fixture must exercise multiple fragments per item"
         );
-        let expected = [entry];
-        replay_is_complete(&expected, &expected, 1);
-        assert!(std::panic::catch_unwind(|| replay_is_complete(&expected, &[], 1)).is_err());
-        assert!(std::panic::catch_unwind(|| replay_is_complete(&expected, &expected, 0)).is_err());
+        assert!(replay.partial.is_none());
+        replay_is_complete(&expected, &replay.items, &head);
     }
 }
 '''
