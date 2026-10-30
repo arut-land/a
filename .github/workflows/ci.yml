@@ -25,9 +25,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Apple silicon and x86_64 Linux. Branch runs skip macOS: it is
-        # verified locally on Apple silicon, and its runners are scarce.
-        os: ${{ fromJSON(github.ref == 'refs/heads/main' && '["macos-latest","ubuntu-latest"]' || '["ubuntu-latest"]') }}
+        # Apple silicon and x86_64 Linux on main and branches.
+        os: [macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -80,9 +79,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Latency is held to the design's budgets on one lane (strict);
-        # macOS on main only, as for check.
-        include: ${{ fromJSON(github.ref == 'refs/heads/main' && '[{"os":"macos-latest","strict":0},{"os":"ubuntu-latest","strict":1}]' || '[{"os":"ubuntu-latest","strict":1}]') }}
+        # Latency is held to the design's budgets on one lane (strict).
+        include:
+          - os: macos-latest
+            strict: 0
+          - os: ubuntu-latest
+            strict: 1
     runs-on: ${{ matrix.os }}
     env:
       A_STRICT_BUDGETS: ${{ matrix.strict }}
@@ -217,7 +219,6 @@ jobs:
   # reducer vectors and a live session through it in Swift, then the app
   # built headless with xcodebuild.
   apple:
-    if: github.ref == 'refs/heads/main'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7

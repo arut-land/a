@@ -2024,9 +2024,7 @@ mod tests {
 
     impl Workspace {
         fn new() -> Self {
-            let path = std::env::temp_dir().join(temporary_name());
-            fs::create_dir(&path).unwrap();
-            Self(path)
+            Self(tempfile::tempdir().unwrap().keep())
         }
 
         fn target(&self) -> PathBuf {
@@ -2050,6 +2048,20 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).unwrap();
         }
+    }
+
+    #[test]
+    fn workspaces_own_distinct_directories_and_cleanup_only_their_own() {
+        let first = Workspace::new();
+        let second = Workspace::new();
+        assert_ne!(first.0, second.0);
+        fs::write(first.target(), b"first").unwrap();
+        fs::write(second.target(), b"second").unwrap();
+        let removed = first.0.clone();
+        drop(first);
+        assert!(!removed.exists());
+        assert_eq!(fs::read(second.target()).unwrap(), b"second");
+        second.only_target_remains();
     }
 
     #[test]
@@ -2251,8 +2263,7 @@ mod tests {
     #[test]
     fn staged_content_never_inherits_public_read_access() {
         use std::os::unix::fs::PermissionsExt;
-        let work = Workspace(Path::new("/private/tmp").join(temporary_name()));
-        fs::create_dir(&work.0).unwrap();
+        let work = Workspace(tempfile::tempdir_in("/private/tmp").unwrap().keep());
         fs::set_permissions(&work.0, fs::Permissions::from_mode(0o755)).unwrap();
         fs::write(work.target(), b"original").unwrap();
         let reader = |path: &Path| {
@@ -2674,8 +2685,7 @@ mod tests {
     fn secured_home_inherited_access_survives_safe_save() {
         use windows_sys::Win32::Security::SE_DACL_AUTO_INHERITED;
         let root = std::env::var_os("RUNNER_TEMP").map_or_else(std::env::temp_dir, PathBuf::from);
-        let work = Workspace(root.join(temporary_name()));
-        fs::create_dir(&work.0).unwrap();
+        let work = Workspace(tempfile::tempdir_in(root).unwrap().keep());
         super::super::private_dir(&work.0).unwrap();
         fs::write(work.target(), b"original").unwrap();
         let before = WindowsPolicy::read(&File::open(work.target()).unwrap()).unwrap();
