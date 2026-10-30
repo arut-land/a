@@ -163,6 +163,7 @@ jobs:
           install: false
           env: false
       - name: Build and measure complete ownership waves
+        if: runner.os != 'Windows'
         working-directory: harness
         env:
           REFERENCE: ${{ inputs.paired_ref }}
@@ -170,6 +171,16 @@ jobs:
           reference=()
           if [[ -n "$REFERENCE" ]]; then reference+=(--reference-source ../reference); fi
           python scripts/perf/residency.py --source ../measured --target "$CARGO_TARGET_DIR" --output "$RUNNER_TEMP/residency-output" --rounds "$PERF_PAIRED_ROUNDS" "${reference[@]}"
+      - name: Build and measure complete ownership waves with MSVC
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: harness
+        env:
+          REFERENCE: ${{ inputs.paired_ref }}
+        run: |
+          $reference = @()
+          if ($env:REFERENCE) { $reference = @('--reference-source', '../reference') }
+          python scripts/perf/residency.py --source ../measured --target $env:CARGO_TARGET_DIR --output "$env:RUNNER_TEMP/residency-output" --rounds $env:PERF_PAIRED_ROUNDS @reference
       - uses: actions/upload-artifact@v5
         if: always()
         with:
