@@ -197,3 +197,40 @@ fn a_titling_reply_is_the_sessions_title() {
         }]
     ));
 }
+
+#[test]
+fn sensitive_answers_are_absent_from_snapshots_and_updates_but_warnings_survive() {
+    let vector = vectors()
+        .into_iter()
+        .find(|v| v["name"] == "sensitive answers never enter client history")
+        .unwrap();
+    let reducer = Reducer::new();
+    let mut seen = false;
+    for message in vector["frames"].as_array().unwrap() {
+        let update = reducer.fold(message.as_str().unwrap()).unwrap();
+        if let Some(question) = reducer
+            .snapshot()
+            .items
+            .first()
+            .and_then(|item| item.presentation.question.as_ref())
+        {
+            seen = true;
+            assert_eq!(question.source, "misleading fixture");
+            let field = &question
+                .prompts
+                .iter()
+                .find(|p| !p.fields.is_empty())
+                .unwrap()
+                .fields[0];
+            assert!(field.sensitive);
+            let url = question.prompts.iter().find(|p| p.url.is_some()).unwrap();
+            assert_eq!(url.origin.as_deref(), Some("https://аpple.com"));
+            assert_eq!(url.raw_origin.as_deref(), Some("https://xn--pple-43d.com"));
+            assert!(url.suspicious);
+        }
+        assert!(!format!("{update:?}").contains("fixture-secret-never-shown"));
+        assert!(!reducer.state_json().contains("fixture-secret-never-shown"));
+    }
+    assert!(seen);
+    assert!(reducer.snapshot().items[0].presentation.question.is_none());
+}

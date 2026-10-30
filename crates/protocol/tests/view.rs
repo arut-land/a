@@ -1215,6 +1215,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                         title: Some("Enabled".into()),
                         description: None,
                         required: true,
+                        sensitive: false,
                         default: Some(Json::encode(&false).unwrap()),
                         kind: protocol::FieldKind::Boolean,
                     }],
@@ -1273,6 +1274,11 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
             "url".into(),
             protocol::Prompt::Url {
                 message: "Continue in your browser".into(),
+                destination: protocol::Destination {
+                    origin: "https://example.com".into(),
+                    raw_origin: None,
+                    suspicious: false,
+                },
                 url: "https://example.com/consent".into(),
             },
         )]),
@@ -1297,6 +1303,71 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                     })
                     .unwrap(),
                     origin: None,
+                },
+            ),
+        ],
+    ));
+    let question = protocol::Question {
+        source: "misleading fixture".into(),
+        prompts: std::collections::BTreeMap::from([
+            (
+                "credentials".into(),
+                protocol::Prompt::Form {
+                    message: "Sign in".into(),
+                    fields: vec![protocol::Field {
+                        name: "password".into(),
+                        title: Some("Password".into()),
+                        description: None,
+                        required: true,
+                        sensitive: true,
+                        default: None,
+                        kind: protocol::FieldKind::String {
+                            min: None,
+                            max: None,
+                            format: None,
+                        },
+                    }],
+                },
+            ),
+            (
+                "browser".into(),
+                protocol::Prompt::Url {
+                    message: "Continue in browser".into(),
+                    url: "https://xn--pple-43d.com/consent".into(),
+                    destination: protocol::Destination {
+                        origin: "https://аpple.com".into(),
+                        raw_origin: Some("https://xn--pple-43d.com".into()),
+                        suspicious: true,
+                    },
+                },
+            ),
+        ]),
+    };
+    scenarios.push((
+        "sensitive answers never enter client history",
+        vec![
+            attached(),
+            entry(1, Body::Question { question }),
+            msg(DaemonMsg::Synced { seq: 1 }),
+            entry(
+                2,
+                Body::Answer {
+                    call: call(1),
+                    origin: None,
+                    value: Json::encode(&protocol::QuestionAnswer {
+                        question: Seq::new(1).unwrap(),
+                        responses: std::collections::BTreeMap::from([
+                            (
+                                "credentials".into(),
+                                protocol::Response::Submit(std::collections::BTreeMap::from([(
+                                    "password".into(),
+                                    Json::encode("fixture-secret-never-shown").unwrap(),
+                                )])),
+                            ),
+                            ("browser".into(), protocol::Response::accept()),
+                        ]),
+                    })
+                    .unwrap(),
                 },
             ),
         ],

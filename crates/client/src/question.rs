@@ -110,6 +110,13 @@ pub fn question_text(question: &Question) -> String {
         match prompt {
             Prompt::Form { fields, .. } => {
                 for field in fields {
+                    if field.sensitive {
+                        let _ = writeln!(
+                            text,
+                            "Warning: {} is requesting sensitive information. Secrets belong in a secure browser flow; you can decline.",
+                            question.source
+                        );
+                    }
                     text.push_str(field.title.as_deref().unwrap_or(&field.name));
                     text.push_str(if field.required {
                         " (required)"
@@ -120,7 +127,9 @@ pub fn question_text(question: &Question) -> String {
                         text.push_str(": ");
                         text.push_str(description);
                     }
-                    if let FieldKind::Choice { options, .. } = &field.kind {
+                    if let FieldKind::Choice { options, .. } = &field.kind
+                        && !field.sensitive
+                    {
                         let _ = write!(
                             text,
                             " {:?}",
@@ -133,7 +142,16 @@ pub fn question_text(question: &Question) -> String {
                     text.push('\n');
                 }
             }
-            Prompt::Url { url, .. } => {
+            Prompt::Url {
+                url, destination, ..
+            } => {
+                let _ = writeln!(text, "Destination: {}", destination.origin);
+                if let Some(raw) = &destination.raw_origin {
+                    let _ = writeln!(text, "Raw origin: {raw}");
+                }
+                if destination.suspicious {
+                    text.push_str("Warning: internationalized or confusable host. Inspect both spellings before opening.\n");
+                }
                 text.push_str(url);
                 text.push('\n');
             }
@@ -192,6 +210,7 @@ mod tests {
                         title: None,
                         description: None,
                         required: true,
+                        sensitive: false,
                         default: None,
                         kind: FieldKind::Choice {
                             options: vec![protocol::Choice {

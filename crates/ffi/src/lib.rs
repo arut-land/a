@@ -537,6 +537,9 @@ pub struct QuestionPrompt {
     pub key: String,
     pub message: String,
     pub url: Option<String>,
+    pub origin: Option<String>,
+    pub raw_origin: Option<String>,
+    pub suspicious: bool,
     pub fields: Vec<QuestionField>,
 }
 #[data]
@@ -546,6 +549,7 @@ pub struct QuestionField {
     pub title: String,
     pub description: Option<String>,
     pub required: bool,
+    pub sensitive: bool,
     pub kind: QuestionFieldKind,
     pub options: Vec<QuestionOption>,
     pub initial: Option<String>,
@@ -734,6 +738,17 @@ impl UserQuestion {
                         } else {
                             None
                         },
+                        origin: if let protocol::Prompt::Url { destination, .. } = prompt {
+                            Some(destination.origin.clone())
+                        } else {
+                            None
+                        },
+                        raw_origin: if let protocol::Prompt::Url { destination, .. } = prompt {
+                            destination.raw_origin.clone()
+                        } else {
+                            None
+                        },
+                        suspicious: matches!(prompt, protocol::Prompt::Url { destination, .. } if destination.suspicious),
                         fields: if let protocol::Prompt::Form { fields, .. } = prompt {
                             fields
                                 .iter()
@@ -763,6 +778,7 @@ impl UserQuestion {
                                             .unwrap_or_else(|| field.name.clone()),
                                         description: field.description.clone(),
                                         required: field.required,
+                                        sensitive: field.sensitive,
                                         kind,
                                         options: if let protocol::FieldKind::Choice {
                                             options,

@@ -300,7 +300,10 @@ fn tool_card<'a>(p: &'a Presented<'a>) -> impl Renderable {
                             }
                         }
                         @match prompt {
-                            protocol::Prompt::Url { url, .. } => {
+                            protocol::Prompt::Url { url, destination, .. } => {
+                                p { strong { "Destination: " (destination.origin) } }
+                                @if let Some(raw) = &destination.raw_origin { p { "Raw origin: " code { (raw) } } }
+                                @if destination.suspicious { p role="alert" { "Warning: internationalized or confusable host. Inspect both spellings before opening." } }
                                 pre style=(style::OUTPUT) { (url) }
                                 a href=(url) target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer" { "Open URL in browser" }
                             }
@@ -312,22 +315,27 @@ fn tool_card<'a>(p: &'a Presented<'a>) -> impl Renderable {
                                         }
                                         label for=(format!("field_{}_{}_{}",id.get(),pi,fi)) { (field.title.as_deref().unwrap_or(&field.name)) @if field.required { " (required)" } }
                                         @if let Some(description) = &field.description { p { (description) } }
-                                        @match &field.kind {
-                                            protocol::FieldKind::Boolean => {
-                                                select id=(format!("field_{}_{}_{}",id.get(),pi,fi)) name=(format!("f{pi}_{fi}")) data-field {
-                                                    option value="" { "Choose…" } option value="true" selected[field.default.as_ref().is_some_and(|v| v.raw()=="true")] { "Yes" } option value="false" selected[field.default.as_ref().is_some_and(|v| v.raw()=="false")] { "No" }
+                                        @if field.sensitive {
+                                            p role="alert" { "Warning: " (question.source) " is requesting sensitive information. Secrets belong in a secure browser flow; you can decline." }
+                                            input id=(format!("field_{}_{}_{}",id.get(),pi,fi)) name=(format!("f{pi}_{fi}")) data-field type="password" autocomplete="off" value=(field.default_text().unwrap_or_default());
+                                        } @else {
+                                            @match &field.kind {
+                                                protocol::FieldKind::Boolean => {
+                                                    select id=(format!("field_{}_{}_{}",id.get(),pi,fi)) name=(format!("f{pi}_{fi}")) data-field {
+                                                        option value="" { "Choose…" } option value="true" selected[field.default.as_ref().is_some_and(|v| v.raw()=="true")] { "Yes" } option value="false" selected[field.default.as_ref().is_some_and(|v| v.raw()=="false")] { "No" }
+                                                    }
                                                 }
-                                            }
-                                            protocol::FieldKind::Choice { options, selection } => {
-                                                select id=(format!("field_{}_{}_{}",id.get(),pi,fi)) name=(format!("f{pi}_{fi}")) data-field multiple[matches!(selection,protocol::Selection::Many { .. })] {
-                                                    @if matches!(selection, protocol::Selection::One) { option value="" disabled selected[field.default.is_none()] { "Choose…" } }
-                                                    @for option in options { option value=(option.value) selected[field.default.as_ref().is_some_and(|v| v.parse::<serde_json::Value>().is_ok_and(|v| v.as_str()==Some(option.value.as_str()) || v.as_array().is_some_and(|vs| vs.iter().any(|v| v.as_str()==Some(option.value.as_str())))))] { (option.title) } }
+                                                protocol::FieldKind::Choice { options, selection } => {
+                                                    select id=(format!("field_{}_{}_{}",id.get(),pi,fi)) name=(format!("f{pi}_{fi}")) data-field multiple[matches!(selection,protocol::Selection::Many { .. })] {
+                                                        @if matches!(selection, protocol::Selection::One) { option value="" disabled selected[field.default.is_none()] { "Choose…" } }
+                                                        @for option in options { option value=(option.value) selected[field.default.as_ref().is_some_and(|v| v.parse::<serde_json::Value>().is_ok_and(|v| v.as_str()==Some(option.value.as_str()) || v.as_array().is_some_and(|vs| vs.iter().any(|v| v.as_str()==Some(option.value.as_str())))))] { (option.title) } }
+                                                    }
                                                 }
-                                            }
-                                            kind => {
-                                                input id=(format!("field_{}_{}_{}",id.get(),pi,fi)) name=(format!("f{pi}_{fi}")) data-field
-                                                    type=(if matches!(kind,protocol::FieldKind::Number { .. }) {"number"} else {"text"}) step="any"
-                                                    value=(field.default_text().unwrap_or_default());
+                                                kind => {
+                                                    input id=(format!("field_{}_{}_{}",id.get(),pi,fi)) name=(format!("f{pi}_{fi}")) data-field
+                                                        type=(if matches!(kind,protocol::FieldKind::Number { .. }) {"number"} else {"text"}) step="any"
+                                                        value=(field.default_text().unwrap_or_default());
+                                                }
                                             }
                                         }
                                     }
@@ -467,6 +475,11 @@ mod tests {
                         "url".into(),
                         protocol::Prompt::Url {
                             message: "Continue".into(),
+                            destination: protocol::Destination {
+                                origin: "https://example.com".into(),
+                                raw_origin: None,
+                                suspicious: false,
+                            },
                             url: "https://example.com/authorize?secret=opaque&next=1".into(),
                         },
                     )]),
@@ -483,6 +496,40 @@ mod tests {
         assert!(rendered.contains("fetch('/api/answer'"));
         assert!(!rendered.contains("window.open"));
         assert!(!rendered.contains("/api/answer?"));
+    }
+
+    #[test]
+    fn sensitive_inputs_are_password_controls_and_answers_never_render_in_history() {
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../crates/protocol/tests/vectors/view.json"
+        ))
+        .unwrap();
+        let vector = vectors
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == "sensitive answers never enter client history")
+            .unwrap();
+        let mut view = SessionView::default();
+        let mut seen = false;
+        for message in vector["frames"].as_array().unwrap() {
+            view.fold(&DaemonMsg::from_json(message.as_str().unwrap().as_bytes()).unwrap());
+            for item in &view.items {
+                let rendered = html(ItemRow { item, view: &view });
+                if rendered.contains("type=\"password\"") {
+                    seen = true;
+                    assert!(
+                        rendered.contains("misleading fixture is requesting sensitive information")
+                    );
+                    assert!(rendered.contains("https://аpple.com"));
+                    assert!(rendered.contains("https://xn--pple-43d.com"));
+                    assert!(rendered.contains("confusable host"));
+                    assert!(!rendered.contains("window.open"));
+                }
+                assert!(!rendered.contains("fixture-secret-never-shown"));
+            }
+        }
+        assert!(seen);
     }
 
     #[test]

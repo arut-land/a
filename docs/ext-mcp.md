@@ -211,3 +211,34 @@ callback listener cannot be restored, so restart cancels that card rather than r
 The shared OAuth card has no human-wait deadline. Ordinary HTTP callers keep
 their existing per-request deadlines and cancellation; a renewal and its card
 can outlive those waiters, completing credentials for remaining or later calls.
+
+### Elicitation safeguards
+
+URL steps and OAuth authorization cards show the destination origin separately
+from the full URL. Internationalized hosts show decoded Unicode and raw ASCII
+spellings; Punycode, mixed scripts and potential Unicode confusables trigger a
+warning. URL validation happens in the MCP boundary, requires HTTPS except for
+literal loopback addresses and `localhost`, and does not resolve DNS. Navigation
+requires the user's explicit action. Clients neither open nor fetch destinations
+when a question arrives.
+
+The same boundary marks fields whose names, titles, descriptions or formats
+indicate credentials (including passwords, tokens, API keys and one-time codes).
+Clients read that marker, mask the input and show the asking server beside the
+warning. Sensitive format hints such as `password` become masked strings rather
+than unsupported validation formats. Users can still decline or cancel. This is
+mitigation for a misleading server: MCP prohibits requesting credentials through
+forms and directs legitimate credential collection to URL mode.
+
+Submitted answers remain the existing durable answer facts needed for replay;
+they are not copied into transcript items, history pages or question presentation
+updates. This projection already discards answer values, so no second redacted
+log or new answer fact is needed. Masking does not remove a submitted secret from
+the daemon's log or stop the asking server from receiving it. Classification is
+an advisory heuristic, not a guarantee that arbitrary requests are safe.
+
+These choices follow MCP 2026-07-28 Elicitation's
+[Safe URL Handling](https://modelcontextprotocol.io/specification/2026-07-28/client/elicitation#safe-url-handling),
+[Form Mode Security](https://modelcontextprotocol.io/specification/2026-07-28/client/elicitation#form-mode-security)
+and [User Interaction Model](https://modelcontextprotocol.io/specification/2026-07-28/client/elicitation#user-interaction-model).
+Dependency measurements are in [elicit-safety](perf/elicit-safety.md).
