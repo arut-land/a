@@ -100,7 +100,7 @@ jobs:
           $env:CI = 'true'
           & mise trust "$config/mise.toml"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $testArgs = @('--cd', $config, 'exec', '--', 'cargo', '--config', "$root/.cargo/config.toml", 'nextest', 'run', '--manifest-path', "$root/Cargo.toml", '-p', 'engine', '-p', 'client')
+          $testArgs = @('--cd', $config, 'exec', '--', 'cargo', 'nextest', 'run', '--config', "$root/.cargo/config.toml", '--manifest-path', "$root/Cargo.toml", '-p', 'engine', '-p', 'client')
           "sha=$sha contention=$contention cores=$env:NUMBER_OF_PROCESSORS start=$([DateTime]::UtcNow.ToString('o'))" | Tee-Object "$scratch/run.txt"
           & mise @testArgs --no-run 2>&1 | Tee-Object "$scratch/build.log"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
