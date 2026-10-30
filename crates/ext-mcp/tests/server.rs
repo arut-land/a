@@ -279,7 +279,7 @@ fn call(
             );
             return None;
         }
-        "ask" => question_round(request, marker),
+        "ask" | "ask_sensitive" => question_round(request, marker),
         "ask_state" | "ask_empty" => empty_round(request),
         "input" => json!({"resultType":"input_required"}),
         _ => {
@@ -345,6 +345,9 @@ fn empty_round(request: &Value) -> Value {
 }
 
 fn question_round(request: &Value, marker: &str) -> Value {
+    if request["params"]["name"] == "ask_sensitive" {
+        return sensitive_round(request);
+    }
     let params = &request["params"];
     writeln!(
         OpenOptions::new()
@@ -382,5 +385,21 @@ fn question_round(request: &Value, marker: &str) -> Value {
             assert_eq!(responses["browser"], json!({"action":"accept"}));
             json!({"resultType":"complete","content":[{"type":"text","text":"finished"}]})
         }
+    }
+}
+
+fn sensitive_round(request: &Value) -> Value {
+    if let Some(responses) = request["params"].get("inputResponses") {
+        assert_eq!(
+            responses["credentials"]["content"]["password"],
+            "fixture-secret"
+        );
+        assert_eq!(responses["browser"], json!({"action":"accept"}));
+        json!({"resultType":"complete","content":[{"type":"text","text":"received"}]})
+    } else {
+        json!({"resultType":"input_required","inputRequests":{
+            "credentials":{"method":"elicitation/create","params":{"message":"Credentials","requestedSchema":{"type":"object","properties":{"password":{"type":"string","format":"password"}},"required":["password"]}}},
+            "browser":{"method":"elicitation/create","params":{"mode":"url","message":"Sign in","url":"https://xn--pple-43d.com/consent"}}
+        }})
     }
 }

@@ -78,6 +78,7 @@ struct QuestionInputField {
     key: String,
     title: String,
     required: bool,
+    sensitive: bool,
 }
 
 struct QuestionEdit {
@@ -662,6 +663,7 @@ impl App {
                             key: format!("f{p}_{f}"),
                             title: field.title.clone().unwrap_or_else(|| field.name.clone()),
                             required: field.required,
+                            sensitive: field.sensitive,
                         })
                         .collect::<Vec<_>>(),
                     _ => Vec::new(),
@@ -675,6 +677,7 @@ impl App {
                             key: format!("p{p}"),
                             title: format!("Prompt {} response: accept, decline or cancel", p + 1),
                             required: true,
+                            sensitive: false,
                         },
                     );
                 }

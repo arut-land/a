@@ -298,8 +298,8 @@ enum Residency {
         last: SessionSummary,
     },
     Live(Arc<Live>),
-    /// Unloaded, its actor not yet ended: it lists as the actor last left
-    /// it, and loads again only once the actor has.
+    /// Still resident until its actor ends; it loads again only after
+    /// `ending` releases the live state.
     Stopping(Arc<Live>),
 }
 
@@ -363,8 +363,7 @@ impl Slot {
     /// How it lists now.
     fn summary(&self) -> SessionSummary {
         match &*lock(&self.residency) {
-            Residency::Live(live) => live.summary(),
-            Residency::Stopping(live) => hibernated(live.summary()),
+            Residency::Live(live) | Residency::Stopping(live) => live.summary(),
             Residency::Hibernated { last } | Residency::Loading { last, .. } => last.clone(),
         }
     }
@@ -372,11 +371,10 @@ impl Slot {
     /// Marks it loading, listed as it was; `false` if it is not unloaded.
     fn loading(&self) -> bool {
         let mut residency = lock(&self.residency);
-        let last = match &*residency {
-            Residency::Hibernated { last } => last.clone(),
-            Residency::Stopping(live) => hibernated(live.summary()),
-            Residency::Live(_) | Residency::Loading { .. } => return false,
+        let Residency::Hibernated { last } = &*residency else {
+            return false;
         };
+        let last = last.clone();
         *residency = Residency::Loading {
             finished: Flag::default(),
             waiters: Vec::new(),
@@ -1012,7 +1010,7 @@ impl Daemon {
         let residency = lock(&slot.residency);
         let (state, summary) = match &*residency {
             Residency::Live(live) => (Some(live.residency_state()), live.summary()),
-            Residency::Stopping(live) => (None, hibernated(live.summary())),
+            Residency::Stopping(live) => (None, live.summary()),
             Residency::Hibernated { last } | Residency::Loading { last, .. } => {
                 (None, last.clone())
             }

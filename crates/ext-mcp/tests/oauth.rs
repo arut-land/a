@@ -39,10 +39,23 @@ impl ext::host::QuestionPort for BrowserQuestions {
     ) -> ext::BoxFuture<'static, Result<protocol::QuestionAnswer, String>> {
         self.approvals.fetch_add(1, Ordering::SeqCst);
         let (key, prompt) = question.prompts.iter().next().unwrap();
-        let protocol::Prompt::Url { url, .. } = prompt else {
+        let protocol::Prompt::Url {
+            url, destination, ..
+        } = prompt
+        else {
             panic!("expected URL consent")
         };
         let uri: http::Uri = url.parse().unwrap();
+        assert_eq!(
+            destination.origin,
+            format!(
+                "{}://{}",
+                uri.scheme_str().unwrap(),
+                uri.authority().unwrap()
+            )
+        );
+        assert!(destination.raw_origin.is_none());
+        assert!(!destination.suspicious);
         let decline = self.decline_write
             && form_urlencoded::parse(uri.query().unwrap().as_bytes())
                 .any(|(k, v)| k == "scope" && v.split_whitespace().any(|s| s == "write"));
