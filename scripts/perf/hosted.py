@@ -368,6 +368,34 @@ def sessions(source, output, variant, reference=""):
          "--sessions", variant.get("sessions", "1,8,32,128"), *layouts, *round_trip], cwd=source)
 
 
+def instrument_census(source, output):
+    """Apply only the fixture hook to a historical measured source revision."""
+    changes = {
+        "crates/sys/Cargo.toml": ("[features]\n", "[features]\nfixtures = []\n"),
+        "crates/sys/src/lib.rs": ("pub mod autostart;", '#[cfg(feature = "fixtures")]\npub mod census;\npub mod autostart;'),
+        "apps/cli/Cargo.toml": ('fixtures = ["ext-fixtures/on"]', 'fixtures = ["ext-fixtures/on", "sys/fixtures"]'),
+        "apps/cli/src/main.rs": ("    sys::small_footprint();", '    sys::small_footprint();\n    #[cfg(feature = "fixtures")]\n    sys::census::initialize();'),
+    }
+    module = source / "crates/sys/src/census.rs"
+    if not module.exists():
+        for name, (old, new) in changes.items():
+            path = source / name
+            text = path.read_text()
+            if text.count(old) != 1:
+                raise ValueError(f"cannot instrument {name}: expected one fixture hook insertion point")
+            path.write_text(text.replace(old, new))
+    if source != ROOT:
+        shutil.copy2(ROOT / "crates/sys/src/census.rs", module)
+    (output / "census-instrumentation.patch").write_bytes(
+        subprocess.check_output(["git", "diff", "--", *changes], cwd=source))
+    shutil.copy2(module, output / "census-module.rs")
+    (output / "census-source.json").write_text(json.dumps(dict(
+        source_revision=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip(),
+        harness_revision=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+        sha256={name: hashlib.sha256((output / name).read_bytes()).hexdigest()
+                for name in ("census-instrumentation.patch", "census-module.rs")}), indent=2) + "\n")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--phase", choices=["toolchain", "all", "build", "measure", "paired", "sessions", "residency", "evidence", "memory", "survey"], default="all")
@@ -410,6 +438,8 @@ def main():
                 memory_only=args.phase == "memory")
         return
     if args.phase == "residency":
+        if os.environ.get("PERF_ALLOC_CENSUS") == "true":
+            instrument_census(source, output)
         if variant or args.paired_ref:
             parser.error("residency measures unchanged-source A/A ownership waves; omit variant and paired-ref")
         run([sys.executable, ROOT / "scripts/perf/residency.py", "--source", source,

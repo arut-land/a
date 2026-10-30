@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       alloc_census:
-        description: "Native fixture allocation census (instrumented residency cohort)"
+        description: "Native census of published residency source (override with source_ref)"
         default: false
         type: boolean
       residency:
@@ -114,7 +114,6 @@ jobs:
       PYTHONDONTWRITEBYTECODE: 1
       MISE_IGNORED_CONFIG_PATHS: ${{ github.workspace }}
       MISE_CARGO_BINSTALL_NATIVE: 'true'
-      MISE_CARGO_BINSTALL_ONLY: 'true'
       PERF_ALLOC_CENSUS: ${{ inputs.alloc_census || false }}
       PERF_PAIRED_ROUNDS: ${{ inputs.paired_rounds || '5' }}
     steps:
@@ -126,7 +125,7 @@ jobs:
           path: harness
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.source_ref || github.sha }}
+          ref: ${{ inputs.source_ref || inputs.alloc_census && 'b1d6f9c0d18110854d701057dac7bc584985f69a' || github.sha }}
           path: measured
       - uses: actions/setup-python@v6
         with:
@@ -160,10 +159,6 @@ jobs:
         with:
           working_directory: measured
           install_args: cargo:cargo-nextest@0.9.150
-      - name: Fixture census invariants
-        if: inputs.alloc_census
-        working-directory: measured
-        run: mise exec cargo:cargo-nextest@0.9.150 -- cargo +"$RUSTUP_TOOLCHAIN" nextest run -p sys --features fixtures
       - name: Native Cargo path
         working-directory: measured
         run: echo "$(dirname "$(rustup which cargo)")" >> "$GITHUB_PATH"
@@ -177,6 +172,8 @@ jobs:
           path: |
             ${{ runner.temp }}/residency-output/*.json*
             ${{ runner.temp }}/residency-output/*.md
+            ${{ runner.temp }}/residency-output/*.patch
+            ${{ runner.temp }}/residency-output/census-module.rs
           retention-days: 30
       - name: Clean owned target
         if: always()

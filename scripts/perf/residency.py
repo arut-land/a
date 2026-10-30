@@ -612,6 +612,9 @@ def main():
     if (output / "residency.jsonl").exists() or (output / "residency-failures.jsonl").exists():
         parser.error("select a fresh output directory; existing samples must not be mixed")
     output.mkdir(parents=True, exist_ok=True)
+    if args.census:
+        cargo_run(["cargo", "nextest", "run", "-p", "sys", "--features", "fixtures"],
+                  cwd=source, env=environment(target), check=True)
     binary = args.binary.resolve() if args.binary else stage(executable(source, environment(target), ["--features", "fixtures"], run=cargo_run), output / ("a-fixtures" + SUFFIX))
     probe = args.probe.resolve() if args.probe else build_probe(source, output, target)
     from hosted import hardware
