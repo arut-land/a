@@ -952,6 +952,8 @@ def main():
         cargo_run(["cargo", "clean", "--release"], cwd=source, env=environment(target), check=True)
     binary = args.binary.resolve() if args.binary else stage(executable(source, environment(target), ["--features", "fixtures"], run=cargo_run), output / ("a-fixtures" + SUFFIX))
     reference = reference or binary
+    if args.reference_source and reference.read_bytes() == binary.read_bytes():
+        raise ValueError("paired sources produced identical images; use --reference-binary for intentional A/A controls")
     probe = args.probe.resolve() if args.probe else build_probe(source, output, target)
     from hosted import hardware
     metadata = dict(hardware=hardware(), platform=platform.platform(), machine=platform.machine(),
