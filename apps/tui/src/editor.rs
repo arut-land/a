@@ -345,6 +345,16 @@ impl Editor {
         self.browsing = Some((at, draft, pastes));
     }
 
+    /// Keeps hidden input out of terminal output while preserving editing positions.
+    pub fn masked_lines(&self, width: usize, prompt: Style) -> (Vec<Line>, (u16, u16)) {
+        Self {
+            text: "•".repeat(self.text.chars().count()),
+            cursor: self.text[..self.cursor].chars().count() * '•'.len_utf8(),
+            ..Self::default()
+        }
+        .lines(width, prompt)
+    }
+
     /// The input as rows `width` wide behind a `❯ ` prompt, and the
     /// cursor's (column, row) among them.
     pub fn lines(&self, width: usize, prompt: Style) -> (Vec<Line>, (u16, u16)) {

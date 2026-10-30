@@ -13129,7 +13129,7 @@
     "frames": [
       "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
       "{\"epoch\":0,\"input\":null,\"kind\":\"tool_call\",\"seq\":1,\"t\":\"entry\",\"tool\":\"remote\"}",
-      "{\"call\":1,\"checkpoint\":\"opaque state\",\"epoch\":0,\"kind\":\"wait\",\"on\":\"question\",\"question\":{\"prompts\":{\"settings\":{\"form\":{\"fields\":[{\"default\":false,\"description\":null,\"kind\":\"boolean\",\"name\":\"enabled\",\"required\":true,\"title\":\"Enabled\"}],\"message\":\"Choose settings\"}}},\"source\":\"fixture\"},\"seq\":2,\"t\":\"entry\"}",
+      "{\"call\":1,\"checkpoint\":\"opaque state\",\"epoch\":0,\"kind\":\"wait\",\"on\":\"question\",\"question\":{\"prompts\":{\"settings\":{\"form\":{\"fields\":[{\"default\":false,\"description\":null,\"kind\":\"boolean\",\"name\":\"enabled\",\"required\":true,\"sensitive\":false,\"title\":\"Enabled\"}],\"message\":\"Choose settings\"}}},\"source\":\"fixture\"},\"seq\":2,\"t\":\"entry\"}",
       "{\"seq\":2,\"t\":\"synced\"}",
       "{\"call\":1,\"epoch\":0,\"kind\":\"answer\",\"seq\":3,\"t\":\"entry\",\"value\":{\"question\":2,\"responses\":{\"settings\":{\"submit\":{\"enabled\":false}}}}}"
     ],
@@ -13165,6 +13165,7 @@
                     "kind": "boolean",
                     "name": "enabled",
                     "required": true,
+                    "sensitive": false,
                     "title": "Enabled"
                   }
                 ],
@@ -13297,7 +13298,7 @@
     "frames": [
       "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
       "{\"epoch\":0,\"input\":null,\"kind\":\"tool_call\",\"seq\":1,\"t\":\"entry\",\"tool\":\"remote\"}",
-      "{\"call\":1,\"checkpoint\":\"opaque state\",\"epoch\":0,\"kind\":\"wait\",\"on\":\"question\",\"question\":{\"prompts\":{\"settings\":{\"form\":{\"fields\":[{\"default\":false,\"description\":null,\"kind\":\"boolean\",\"name\":\"enabled\",\"required\":true,\"title\":\"Enabled\"}],\"message\":\"Choose settings\"}}},\"source\":\"fixture\"},\"seq\":2,\"t\":\"entry\"}",
+      "{\"call\":1,\"checkpoint\":\"opaque state\",\"epoch\":0,\"kind\":\"wait\",\"on\":\"question\",\"question\":{\"prompts\":{\"settings\":{\"form\":{\"fields\":[{\"default\":false,\"description\":null,\"kind\":\"boolean\",\"name\":\"enabled\",\"required\":true,\"sensitive\":false,\"title\":\"Enabled\"}],\"message\":\"Choose settings\"}}},\"source\":\"fixture\"},\"seq\":2,\"t\":\"entry\"}",
       "{\"seq\":2,\"t\":\"synced\"}",
       "{\"call\":1,\"epoch\":0,\"kind\":\"answer\",\"seq\":3,\"t\":\"entry\",\"value\":{\"question\":2,\"responses\":{\"settings\":\"decline\"}}}"
     ],
@@ -13333,6 +13334,7 @@
                     "kind": "boolean",
                     "name": "enabled",
                     "required": true,
+                    "sensitive": false,
                     "title": "Enabled"
                   }
                 ],
@@ -13461,7 +13463,7 @@
     "frames": [
       "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
       "{\"epoch\":0,\"input\":null,\"kind\":\"tool_call\",\"seq\":1,\"t\":\"entry\",\"tool\":\"remote\"}",
-      "{\"call\":1,\"checkpoint\":\"opaque state\",\"epoch\":0,\"kind\":\"wait\",\"on\":\"question\",\"question\":{\"prompts\":{\"settings\":{\"form\":{\"fields\":[{\"default\":false,\"description\":null,\"kind\":\"boolean\",\"name\":\"enabled\",\"required\":true,\"title\":\"Enabled\"}],\"message\":\"Choose settings\"}}},\"source\":\"fixture\"},\"seq\":2,\"t\":\"entry\"}",
+      "{\"call\":1,\"checkpoint\":\"opaque state\",\"epoch\":0,\"kind\":\"wait\",\"on\":\"question\",\"question\":{\"prompts\":{\"settings\":{\"form\":{\"fields\":[{\"default\":false,\"description\":null,\"kind\":\"boolean\",\"name\":\"enabled\",\"required\":true,\"sensitive\":false,\"title\":\"Enabled\"}],\"message\":\"Choose settings\"}}},\"source\":\"fixture\"},\"seq\":2,\"t\":\"entry\"}",
       "{\"seq\":2,\"t\":\"synced\"}",
       "{\"call\":1,\"epoch\":0,\"kind\":\"answer\",\"seq\":3,\"t\":\"entry\",\"value\":{\"question\":2,\"responses\":{\"settings\":\"cancel\"}}}"
     ],
@@ -13497,6 +13499,7 @@
                     "kind": "boolean",
                     "name": "enabled",
                     "required": true,
+                    "sensitive": false,
                     "title": "Enabled"
                   }
                 ],
@@ -13624,7 +13627,7 @@
   {
     "frames": [
       "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
-      "{\"epoch\":0,\"kind\":\"question\",\"question\":{\"prompts\":{\"url\":{\"url\":{\"message\":\"Continue in your browser\",\"url\":\"https://example.com/consent\"}}},\"source\":\"credential owner\"},\"seq\":1,\"t\":\"entry\"}",
+      "{\"epoch\":0,\"kind\":\"question\",\"question\":{\"prompts\":{\"url\":{\"url\":{\"destination\":{\"origin\":\"https://example.com\",\"raw_origin\":null,\"suspicious\":false},\"message\":\"Continue in your browser\",\"url\":\"https://example.com/consent\"}}},\"source\":\"credential owner\"},\"seq\":1,\"t\":\"entry\"}",
       "{\"epoch\":0,\"kind\":\"interrupt\",\"seq\":2,\"t\":\"entry\"}",
       "{\"seq\":2,\"t\":\"synced\"}",
       "{\"call\":1,\"epoch\":0,\"kind\":\"answer\",\"seq\":3,\"t\":\"entry\",\"value\":{\"question\":1,\"responses\":{\"url\":{\"accept\":{}}}}}"
@@ -13643,6 +13646,11 @@
           "prompts": {
             "url": {
               "url": {
+                "destination": {
+                  "origin": "https://example.com",
+                  "raw_origin": null,
+                  "suspicious": false
+                },
                 "message": "Continue in your browser",
                 "url": "https://example.com/consent"
               }
@@ -13731,6 +13739,11 @@
                   "prompts": {
                     "url": {
                       "url": {
+                        "destination": {
+                          "origin": "https://example.com",
+                          "raw_origin": null,
+                          "suspicious": false
+                        },
                         "message": "Continue in your browser",
                         "url": "https://example.com/consent"
                       }
@@ -13764,6 +13777,562 @@
         },
         "rev": 4,
         "seq": 3
+      }
+    ]
+  },
+  {
+    "frames": [
+      "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
+      "{\"epoch\":0,\"kind\":\"question\",\"question\":{\"prompts\":{\"browser\":{\"url\":{\"destination\":{\"origin\":\"https://аpple.com\",\"raw_origin\":\"https://xn--pple-43d.com\",\"suspicious\":true},\"message\":\"Continue in browser\",\"url\":\"https://xn--pple-43d.com/consent\"}},\"credentials\":{\"form\":{\"fields\":[{\"default\":null,\"description\":null,\"kind\":{\"string\":{\"format\":null,\"max\":null,\"min\":null}},\"name\":\"password\",\"required\":true,\"sensitive\":true,\"title\":\"Password\"}],\"message\":\"Sign in\"}}},\"source\":\"misleading fixture\"},\"seq\":1,\"t\":\"entry\"}",
+      "{\"seq\":1,\"t\":\"synced\"}",
+      "{\"call\":1,\"epoch\":0,\"kind\":\"answer\",\"seq\":2,\"t\":\"entry\",\"value\":{\"question\":1,\"responses\":{\"browser\":{\"accept\":{}},\"credentials\":{\"submit\":{\"password\":\"fixture-secret-never-shown\"}}}}}"
+    ],
+    "hash": "3767ccb73a323876",
+    "messages": [
+      {
+        "session": "00000000-0000-0000-0000-00000000000a",
+        "t": "attached",
+        "workspace": "/w"
+      },
+      {
+        "epoch": 0,
+        "kind": "question",
+        "question": {
+          "prompts": {
+            "browser": {
+              "url": {
+                "destination": {
+                  "origin": "https://аpple.com",
+                  "raw_origin": "https://xn--pple-43d.com",
+                  "suspicious": true
+                },
+                "message": "Continue in browser",
+                "url": "https://xn--pple-43d.com/consent"
+              }
+            },
+            "credentials": {
+              "form": {
+                "fields": [
+                  {
+                    "default": null,
+                    "description": null,
+                    "kind": {
+                      "string": {
+                        "format": null,
+                        "max": null,
+                        "min": null
+                      }
+                    },
+                    "name": "password",
+                    "required": true,
+                    "sensitive": true,
+                    "title": "Password"
+                  }
+                ],
+                "message": "Sign in"
+              }
+            }
+          },
+          "source": "misleading fixture"
+        },
+        "seq": 1,
+        "t": "entry"
+      },
+      {
+        "seq": 1,
+        "t": "synced"
+      },
+      {
+        "call": 1,
+        "epoch": 0,
+        "kind": "answer",
+        "seq": 2,
+        "t": "entry",
+        "value": {
+          "question": 1,
+          "responses": {
+            "browser": {
+              "accept": {}
+            },
+            "credentials": {
+              "submit": {
+                "password": "fixture-secret-never-shown"
+              }
+            }
+          }
+        }
+      }
+    ],
+    "name": "sensitive answers never enter client history",
+    "state": {
+      "items": [
+        {
+          "by": "plugin",
+          "call": 1,
+          "input": null,
+          "outcome": null,
+          "phase": {
+            "settled": "done"
+          },
+          "tool": "misleading fixture",
+          "type": "tool"
+        }
+      ],
+      "seq": 2,
+      "session": "00000000-0000-0000-0000-00000000000a",
+      "state": {
+        "calls": [],
+        "queued": [],
+        "taken": [],
+        "turn": 0
+      },
+      "workspace": "/w"
+    },
+    "updates": [
+      {
+        "change": {
+          "change": "attached",
+          "reset": true,
+          "session": "00000000-0000-0000-0000-00000000000a",
+          "workspace": "/w"
+        },
+        "rev": 1,
+        "seq": 0
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 0,
+          "item": {
+            "by": "plugin",
+            "call": 1,
+            "input": null,
+            "outcome": null,
+            "phase": {
+              "waiting": {
+                "on": "question",
+                "question": {
+                  "prompts": {
+                    "browser": {
+                      "url": {
+                        "destination": {
+                          "origin": "https://аpple.com",
+                          "raw_origin": "https://xn--pple-43d.com",
+                          "suspicious": true
+                        },
+                        "message": "Continue in browser",
+                        "url": "https://xn--pple-43d.com/consent"
+                      }
+                    },
+                    "credentials": {
+                      "form": {
+                        "fields": [
+                          {
+                            "default": null,
+                            "description": null,
+                            "kind": {
+                              "string": {
+                                "format": null,
+                                "max": null,
+                                "min": null
+                              }
+                            },
+                            "name": "password",
+                            "required": true,
+                            "sensitive": true,
+                            "title": "Password"
+                          }
+                        ],
+                        "message": "Sign in"
+                      }
+                    }
+                  },
+                  "source": "misleading fixture"
+                }
+              }
+            },
+            "tool": "misleading fixture",
+            "type": "tool"
+          }
+        },
+        "rev": 2,
+        "seq": 1
+      },
+      {
+        "change": {
+          "change": "synced"
+        },
+        "rev": 3,
+        "seq": 1
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 0,
+          "part": {
+            "part": "phase"
+          }
+        },
+        "rev": 4,
+        "seq": 2
+      }
+    ]
+  },
+  {
+    "frames": [
+      "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
+      "{\"epoch\":0,\"kind\":\"question\",\"question\":{\"prompts\":{\"permissions\":{\"form\":{\"fields\":[{\"default\":null,\"description\":null,\"kind\":{\"choice\":{\"options\":[{\"title\":\"Read access\",\"value\":\"opaque-read\"},{\"title\":\"Write access\",\"value\":\"opaque-write\"}],\"selection\":\"one\"}},\"name\":\"permissions0\",\"required\":true,\"sensitive\":true,\"title\":\"API key permissions\"},{\"default\":null,\"description\":null,\"kind\":{\"choice\":{\"options\":[{\"title\":\"Read access\",\"value\":\"opaque-read\"},{\"title\":\"Write access\",\"value\":\"opaque-write\"}],\"selection\":{\"many\":{\"max\":null,\"min\":1}}}},\"name\":\"permissions1\",\"required\":true,\"sensitive\":true,\"title\":\"API key permissions\"}],\"message\":\"Choose API key permissions\"}}},\"source\":\"credential fixture\"},\"seq\":1,\"t\":\"entry\"}",
+      "{\"seq\":1,\"t\":\"synced\"}"
+    ],
+    "hash": "d60dd63635cbf55b",
+    "messages": [
+      {
+        "session": "00000000-0000-0000-0000-00000000000a",
+        "t": "attached",
+        "workspace": "/w"
+      },
+      {
+        "epoch": 0,
+        "kind": "question",
+        "question": {
+          "prompts": {
+            "permissions": {
+              "form": {
+                "fields": [
+                  {
+                    "default": null,
+                    "description": null,
+                    "kind": {
+                      "choice": {
+                        "options": [
+                          {
+                            "title": "Read access",
+                            "value": "opaque-read"
+                          },
+                          {
+                            "title": "Write access",
+                            "value": "opaque-write"
+                          }
+                        ],
+                        "selection": "one"
+                      }
+                    },
+                    "name": "permissions0",
+                    "required": true,
+                    "sensitive": true,
+                    "title": "API key permissions"
+                  },
+                  {
+                    "default": null,
+                    "description": null,
+                    "kind": {
+                      "choice": {
+                        "options": [
+                          {
+                            "title": "Read access",
+                            "value": "opaque-read"
+                          },
+                          {
+                            "title": "Write access",
+                            "value": "opaque-write"
+                          }
+                        ],
+                        "selection": {
+                          "many": {
+                            "max": null,
+                            "min": 1
+                          }
+                        }
+                      }
+                    },
+                    "name": "permissions1",
+                    "required": true,
+                    "sensitive": true,
+                    "title": "API key permissions"
+                  }
+                ],
+                "message": "Choose API key permissions"
+              }
+            }
+          },
+          "source": "credential fixture"
+        },
+        "seq": 1,
+        "t": "entry"
+      },
+      {
+        "seq": 1,
+        "t": "synced"
+      }
+    ],
+    "name": "sensitive choices retain titled options",
+    "state": {
+      "items": [
+        {
+          "by": "plugin",
+          "call": 1,
+          "input": null,
+          "outcome": null,
+          "phase": {
+            "waiting": {
+              "on": "question",
+              "question": {
+                "prompts": {
+                  "permissions": {
+                    "form": {
+                      "fields": [
+                        {
+                          "default": null,
+                          "description": null,
+                          "kind": {
+                            "choice": {
+                              "options": [
+                                {
+                                  "title": "Read access",
+                                  "value": "opaque-read"
+                                },
+                                {
+                                  "title": "Write access",
+                                  "value": "opaque-write"
+                                }
+                              ],
+                              "selection": "one"
+                            }
+                          },
+                          "name": "permissions0",
+                          "required": true,
+                          "sensitive": true,
+                          "title": "API key permissions"
+                        },
+                        {
+                          "default": null,
+                          "description": null,
+                          "kind": {
+                            "choice": {
+                              "options": [
+                                {
+                                  "title": "Read access",
+                                  "value": "opaque-read"
+                                },
+                                {
+                                  "title": "Write access",
+                                  "value": "opaque-write"
+                                }
+                              ],
+                              "selection": {
+                                "many": {
+                                  "max": null,
+                                  "min": 1
+                                }
+                              }
+                            }
+                          },
+                          "name": "permissions1",
+                          "required": true,
+                          "sensitive": true,
+                          "title": "API key permissions"
+                        }
+                      ],
+                      "message": "Choose API key permissions"
+                    }
+                  }
+                },
+                "source": "credential fixture"
+              }
+            }
+          },
+          "tool": "credential fixture",
+          "type": "tool"
+        }
+      ],
+      "seq": 1,
+      "session": "00000000-0000-0000-0000-00000000000a",
+      "state": {
+        "calls": [
+          [
+            1,
+            {
+              "independent": true,
+              "phase": {
+                "waiting": {
+                  "on": "question",
+                  "question": {
+                    "prompts": {
+                      "permissions": {
+                        "form": {
+                          "fields": [
+                            {
+                              "default": null,
+                              "description": null,
+                              "kind": {
+                                "choice": {
+                                  "options": [
+                                    {
+                                      "title": "Read access",
+                                      "value": "opaque-read"
+                                    },
+                                    {
+                                      "title": "Write access",
+                                      "value": "opaque-write"
+                                    }
+                                  ],
+                                  "selection": "one"
+                                }
+                              },
+                              "name": "permissions0",
+                              "required": true,
+                              "sensitive": true,
+                              "title": "API key permissions"
+                            },
+                            {
+                              "default": null,
+                              "description": null,
+                              "kind": {
+                                "choice": {
+                                  "options": [
+                                    {
+                                      "title": "Read access",
+                                      "value": "opaque-read"
+                                    },
+                                    {
+                                      "title": "Write access",
+                                      "value": "opaque-write"
+                                    }
+                                  ],
+                                  "selection": {
+                                    "many": {
+                                      "max": null,
+                                      "min": 1
+                                    }
+                                  }
+                                }
+                              },
+                              "name": "permissions1",
+                              "required": true,
+                              "sensitive": true,
+                              "title": "API key permissions"
+                            }
+                          ],
+                          "message": "Choose API key permissions"
+                        }
+                      }
+                    },
+                    "source": "credential fixture"
+                  }
+                }
+              },
+              "progress": null,
+              "question_seq": 1
+            }
+          ]
+        ],
+        "queued": [],
+        "taken": [],
+        "turn": 0
+      },
+      "workspace": "/w"
+    },
+    "updates": [
+      {
+        "change": {
+          "change": "attached",
+          "reset": true,
+          "session": "00000000-0000-0000-0000-00000000000a",
+          "workspace": "/w"
+        },
+        "rev": 1,
+        "seq": 0
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 0,
+          "item": {
+            "by": "plugin",
+            "call": 1,
+            "input": null,
+            "outcome": null,
+            "phase": {
+              "waiting": {
+                "on": "question",
+                "question": {
+                  "prompts": {
+                    "permissions": {
+                      "form": {
+                        "fields": [
+                          {
+                            "default": null,
+                            "description": null,
+                            "kind": {
+                              "choice": {
+                                "options": [
+                                  {
+                                    "title": "Read access",
+                                    "value": "opaque-read"
+                                  },
+                                  {
+                                    "title": "Write access",
+                                    "value": "opaque-write"
+                                  }
+                                ],
+                                "selection": "one"
+                              }
+                            },
+                            "name": "permissions0",
+                            "required": true,
+                            "sensitive": true,
+                            "title": "API key permissions"
+                          },
+                          {
+                            "default": null,
+                            "description": null,
+                            "kind": {
+                              "choice": {
+                                "options": [
+                                  {
+                                    "title": "Read access",
+                                    "value": "opaque-read"
+                                  },
+                                  {
+                                    "title": "Write access",
+                                    "value": "opaque-write"
+                                  }
+                                ],
+                                "selection": {
+                                  "many": {
+                                    "max": null,
+                                    "min": 1
+                                  }
+                                }
+                              }
+                            },
+                            "name": "permissions1",
+                            "required": true,
+                            "sensitive": true,
+                            "title": "API key permissions"
+                          }
+                        ],
+                        "message": "Choose API key permissions"
+                      }
+                    }
+                  },
+                  "source": "credential fixture"
+                }
+              }
+            },
+            "tool": "credential fixture",
+            "type": "tool"
+          }
+        },
+        "rev": 2,
+        "seq": 1
+      },
+      {
+        "change": {
+          "change": "synced"
+        },
+        "rev": 3,
+        "seq": 1
       }
     ]
   }

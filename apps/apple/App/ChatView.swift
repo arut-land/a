@@ -387,6 +387,27 @@ private struct QuestionForm: View {
         Binding(get: { values[key] ?? "" }, set: { values[key] = $0 })
     }
 
+    private func choicePicker(_ field: QuestionField) -> some View {
+        Picker(field.title, selection: Binding<String?>(get: { values[field.key] }, set: { values[field.key] = $0 })) {
+            Text("Choose…").tag(nil as String?)
+            ForEach(field.options, id: \.value) { Text($0.title).tag(Optional($0.value)) }
+        }
+    }
+
+    private func multipleChoices(_ field: QuestionField) -> some View {
+        ForEach(field.options, id: \.value) { option in
+            Toggle(option.title, isOn: Binding(get: {
+                let selected = (try? JSONDecoder().decode([String].self, from: Data((values[field.key] ?? "[]").utf8))) ?? []
+                return selected.contains(option.value)
+            }, set: { checked in
+                var selected = (try? JSONDecoder().decode([String].self, from: Data((values[field.key] ?? "[]").utf8))) ?? []
+                selected.removeAll { $0 == option.value }
+                if checked { selected.append(option.value) }
+                if let data = try? JSONEncoder().encode(selected) { values[field.key] = String(decoding: data, as: UTF8.self) }
+            }))
+        }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Requested by \(question.source)").font(.headline)
@@ -400,6 +421,16 @@ private struct QuestionForm: View {
                     }
                 }
                 if let url = prompt.url {
+                    if let origin = prompt.origin {
+                        Text("Destination: \(origin)").font(.headline).textSelection(.enabled)
+                    }
+                    if let raw = prompt.rawOrigin {
+                        Text("Raw origin: \(raw)").font(.callout.monospaced()).textSelection(.enabled)
+                    }
+                    if prompt.suspicious {
+                        Text("Warning: internationalized or confusable host. Inspect both spellings before opening.")
+                            .foregroundStyle(.orange)
+                    }
                     Text(url).font(.callout.monospaced()).textSelection(.enabled)
                     if let destination = URL(string: url) {
                         Link("Open URL in browser", destination: destination)
@@ -412,33 +443,44 @@ private struct QuestionForm: View {
                         }
                         Text(field.title + (field.required ? " (required)" : ""))
                         if let description = field.description { Text(description).font(.caption) }
-                        switch field.kind {
-                        case .boolean:
-                            Picker(field.title, selection: value(field.key)) {
-                                Text("Choose…").tag("")
-                                Text("Yes").tag("true")
-                                Text("No").tag("false")
-                            }
-                        case .choice:
-                            Picker(field.title, selection: Binding<String?>(get: { values[field.key] }, set: { values[field.key] = $0 })) {
-                                Text("Choose…").tag(nil as String?)
-                                ForEach(field.options, id: \.value) { Text($0.title).tag(Optional($0.value)) }
-                            }
-                        case .multipleChoice:
-                            ForEach(field.options, id: \.value) { option in
-                                Toggle(option.title, isOn: Binding(get: {
-                                    let selected = (try? JSONDecoder().decode([String].self, from: Data((values[field.key] ?? "[]").utf8))) ?? []
-                                    return selected.contains(option.value)
-                                }, set: { checked in
-                                    var selected = (try? JSONDecoder().decode([String].self, from: Data((values[field.key] ?? "[]").utf8))) ?? []
-                                    selected.removeAll { $0 == option.value }
-                                    if checked { selected.append(option.value) }
-                                    if let data = try? JSONEncoder().encode(selected) { values[field.key] = String(decoding: data, as: UTF8.self) }
-                                }))
-                            }
-                        case .number, .text:
-                            TextField(field.title, text: value(field.key))
+                        if field.sensitive {
+                            Text("Warning: \(question.source) is requesting sensitive information. Secrets belong in a secure browser flow; you can decline.").foregroundStyle(.orange)
+                        }
+                        if field.sensitive && field.kind != .choice && field.kind != .multipleChoice {
+                            SecureField(field.title, text: value(field.key))
                                 .textFieldStyle(.roundedBorder)
+                        } else {
+                            switch field.kind {
+                            case .boolean:
+                                Picker(field.title, selection: value(field.key)) {
+                                    Text("Choose…").tag("")
+                                    Text("Yes").tag("true")
+                                    Text("No").tag("false")
+                                }
+                            case .choice:
+                                if field.sensitive {
+                                    Menu {
+                                        choicePicker(field).pickerStyle(.inline)
+                                    } label: {
+                                        Text(values[field.key] == nil ? "Choose options" : "••••")
+                                    }
+                                } else {
+                                    choicePicker(field)
+                                }
+                            case .multipleChoice:
+                                if field.sensitive {
+                                    Menu {
+                                        multipleChoices(field)
+                                    } label: {
+                                        Text(values[field.key] == nil || values[field.key] == "[]" ? "Choose options" : "••••")
+                                    }
+                                } else {
+                                    multipleChoices(field)
+                                }
+                            case .number, .text:
+                                TextField(field.title, text: value(field.key))
+                                    .textFieldStyle(.roundedBorder)
+                            }
                         }
                     }
                 }

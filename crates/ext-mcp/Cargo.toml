@@ -6,6 +6,9 @@ publish.workspace = true
 autotests = false
 
 [dependencies]
+idna = "1.1"
+unicode-security = "0.1.2"
+url = "2.5"
 form_urlencoded = "1.2.2"
 http-auth = { version = "0.1.10", default-features = false }
 sha2 = { version = "0.11", default-features = false }
