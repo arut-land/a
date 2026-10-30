@@ -226,5 +226,5 @@ jobs:
       - *cache
       - uses: jdx/mise-action@v5
         with:
-          install_args: rust mr-boxington github:boltffi/boltffi aqua:yonaskolb/XcodeGen
+          install_args: rust mr-boxington github:boltffi/boltffi xcodegen
       - run: mise run --jobs 1 apple:check
