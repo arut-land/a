@@ -36,6 +36,7 @@ jobs:
         run: |
           @'
           import json
+          import concurrent.futures
           import os
           from pathlib import Path
           import shutil
@@ -64,7 +65,7 @@ jobs:
                       continue
                   if item.get("reason") == "compiler-artifact" and item.get("executable") and item["target"]["name"] == "sys":
                       target = root / f"sys-{label}.exe"
-                      shutil.copyfile(item["executable"], target)
+                      shutil.copy2(item["executable"], target)
                       return str(target)
               raise RuntimeError("sys test executable missing from Cargo metadata")
 
@@ -75,21 +76,26 @@ jobs:
               source.write_bytes(probed)
           probe_exe = build("probe")
           name = "runtime::image::tests::retiring_a_running_image_allows_updates_and_reclamation_after_exit"
-          modes = ["pristine", "held", "dropped", "duplicate", "thread"]
+          modes = ["pristine", "held", "dropped", "duplicate", "thread", "file", "file-dropped", "posix-file"]
           counts = {mode: {"passed": 0, "failed": 0} for mode in modes}
-          for round_number in range(1, 201):
-              order = modes if round_number % 2 else list(reversed(modes))
-              for mode in order:
-                  env = dict(clean)
-                  if mode != "pristine":
-                      env["A_TEST_IMAGE_HANDLE_PROBE"] = mode
-                  result = subprocess.run([original_exe if mode == "pristine" else probe_exe, "--exact", name, "--nocapture"], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, encoding="utf-8", errors="replace")
-                  (evidence / f"{round_number:03d}-{mode}.log").write_text(result.stdout)
-                  counts[mode]["passed" if result.returncode == 0 else "failed"] += 1
-                  if result.returncode and counts[mode]["failed"] <= 3:
-                      print(f"round={round_number} mode={mode}\n{result.stdout}", flush=True)
-              if round_number % 25 == 0:
-                  print(json.dumps({"rounds": round_number, "counts": counts}), flush=True)
+          def run_case(case):
+              round_number, mode = case
+              env = dict(clean)
+              if mode != "pristine":
+                  env["A_TEST_IMAGE_HANDLE_PROBE"] = mode
+              result = subprocess.run([original_exe if mode == "pristine" else probe_exe, "--exact", name, "--nocapture"], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, encoding="utf-8", errors="replace")
+              (evidence / f"{round_number:03d}-{mode}.log").write_text(result.stdout)
+              return mode, result.returncode, result.stdout
+
+          cases = [(n, mode) for n in range(1, 201) for mode in (modes if n % 2 else list(reversed(modes)))]
+          with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+              for completed, future in enumerate(concurrent.futures.as_completed([pool.submit(run_case, case) for case in cases]), 1):
+                  mode, returncode, output = future.result()
+                  counts[mode]["passed" if returncode == 0 else "failed"] += 1
+                  if returncode and counts[mode]["failed"] <= 3:
+                      print(f"mode={mode}\n{output}", flush=True)
+                  if completed % 100 == 0:
+                      print(json.dumps({"completed": completed, "counts": counts}), flush=True)
           (evidence / "summary.json").write_text(json.dumps({"rounds": 200, "counts": counts}, indent=2))
           print(json.dumps(counts), flush=True)
           '@ | Set-Content "$env:RUNNER_TEMP/retirement-probe.py"

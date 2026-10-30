@@ -219,7 +219,15 @@ pub(super) fn collect(dir: &Path) {
     for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
         let path = entry.path();
         if path.is_dir() {
+            #[cfg(not(test))]
             let result = discard(&path.join(".retired"));
+            #[cfg(test)]
+            let result =
+                if std::env::var("A_TEST_IMAGE_HANDLE_PROBE").as_deref() == Ok("posix-file") {
+                    probe_discard(&path.join(".retired"))
+                } else {
+                    discard(&path.join(".retired"))
+                };
             #[cfg(test)]
             if std::env::var_os("A_TEST_IMAGE_HANDLE_PROBE").is_some() {
                 eprintln!("collect {path:?}: {result:?}");
@@ -227,6 +235,34 @@ pub(super) fn collect(dir: &Path) {
             let _ = result;
         }
     }
+}
+
+#[cfg(all(test, windows))]
+fn probe_discard(image: &Path) -> io::Result<()> {
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+        FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX,
+        FILE_FLAG_OPEN_REPARSE_POINT, FileDispositionInfoEx, SetFileInformationByHandle,
+    };
+    let file = File::options()
+        .access_mode(DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(image)?;
+    let info = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE
+            | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
+            | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+    };
+    // SAFETY: the owned handle and correctly sized info structure outlive the call.
+    crate::windows::ok(unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfoEx,
+            (&raw const info).cast(),
+            u32::try_from(size_of::<FILE_DISPOSITION_INFO_EX>()).expect("fixed structure size"),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -289,6 +325,10 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "temporary native lifetime experiment"
+    )]
     fn retiring_a_running_image_allows_updates_and_reclamation_after_exit() {
         use std::io::{BufRead, Read, Write};
         use std::os::windows::io::AsHandle;
@@ -308,6 +348,8 @@ mod tests {
         let exe = build.join(super::super::EXE);
         super::copy(&std::env::current_exe().unwrap(), &exe).unwrap();
         let mode = std::env::var("A_TEST_IMAGE_HANDLE_PROBE").unwrap_or_else(|_| "held".into());
+        let mut image_reader = matches!(mode.as_str(), "file" | "file-dropped" | "posix-file")
+            .then(|| std::fs::File::open(&exe).unwrap());
         let mut child = Some(Command::new(&exe)
             .args([
                 "--exact",
@@ -361,6 +403,14 @@ mod tests {
             if mode != "held" {
                 drop(child.take());
             }
+            if mode == "file-dropped" {
+                drop(image_reader.take());
+            }
+            eprintln!(
+                "before collection: mode={mode} image_reader={} readonly={:?}",
+                image_reader.is_some(),
+                std::fs::metadata(build.join(".retired")).map(|m| m.permissions().readonly())
+            );
             super::collect(dir.path());
             eprintln!(
                 "probe mode={mode} child_owned={} extra_handle_owned={} entries={:?}",
@@ -381,6 +431,7 @@ mod tests {
         }
         drop(child);
         drop(retained);
+        drop(image_reader);
         result.unwrap();
     }
 }
