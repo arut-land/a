@@ -1090,6 +1090,100 @@ mod tests {
     }
 
     #[test]
+    fn a_completion_before_its_requested_page_preserves_the_final_reply_suffix() {
+        fn render(
+            client: &SessionClient,
+            stream: &mut crate::ReplyStream,
+            effects: &[Effect],
+        ) -> Vec<String> {
+            effects
+                .iter()
+                .filter_map(|effect| match effect {
+                    Effect::Show(Show::View(update)) => Some(update),
+                    _ => None,
+                })
+                .flat_map(|update| stream.update(client.view(), &update.change))
+                .map(|event| match event {
+                    crate::ReplyEvent::Start => "start".into(),
+                    crate::ReplyEvent::Text(text) => text.into(),
+                    crate::ReplyEvent::End => "end".into(),
+                })
+                .collect()
+        }
+
+        let mut client = SessionClient::new(Env::Keep);
+        client.open(Target::New);
+        client.step(live(1, Caps::ALL));
+        let call = CallId::new(1).unwrap();
+        let mut entries = vec![Entry::new(
+            call.0,
+            Epoch(1),
+            Body::ModelCall {
+                model: "m".into(),
+                purpose: None,
+                r#for: None,
+                attempt: 0,
+                choice: protocol::ToolChoice::None,
+                request: None,
+            },
+        )];
+        let mut index = protocol::view::Index::new(SessionId::new(), "/w".into());
+        index.apply(&entries[0]);
+        let mut pending = client.step(controls(index.head(Epoch(1))));
+        assert!(client.history_pending());
+        let mut stream = crate::ReplyStream::default();
+        assert_eq!(render(&client, &mut stream, &pending), Vec::<String>::new());
+        let effects = client.step(msg(
+            1,
+            DaemonMsg::Delta {
+                call,
+                text: "hel".into(),
+                attempt: 0,
+            },
+        ));
+        assert_eq!(render(&client, &mut stream, &effects), ["start", "hel"]);
+
+        entries.push(Entry::new(Seq::new(2).unwrap(), Epoch(1), Body::ModelResult {
+            call, r#for: None, failure: None,
+            outcome: protocol::Outcome::Done {
+                output: Json::encode(&serde_json::json!({"message":{"content":[{"type":"text","text":"hello!"}]}})).unwrap(),
+            },
+        }));
+        index.apply(&entries[1]);
+        let effects = client.step(controls(index.head_after(Epoch(1), 1)));
+        assert!(client.view().items.is_empty());
+        assert!(client.history_pending());
+        assert!(!client.view().state.is_open(call));
+        assert_eq!(render(&client, &mut stream, &effects), Vec::<String>::new());
+        pending.extend(effects);
+
+        let mut emitted = Vec::new();
+        while let Some((id, range)) = pending.into_iter().find_map(|effect| match effect {
+            Effect::Io(Io::Send(ClientMsg::History { id, range })) => Some((id, range)),
+            _ => None,
+        }) {
+            let page = index
+                .page(&range, |seq| {
+                    Ok(entries[usize::try_from(seq.get()).unwrap() - 1].clone())
+                })
+                .unwrap();
+            pending = client.step(msg(
+                1,
+                DaemonMsg::HistoryPart {
+                    id,
+                    offset: 0,
+                    text: serde_json::to_string(&page).unwrap(),
+                    done: true,
+                },
+            ));
+            emitted.extend(render(&client, &mut stream, &pending));
+        }
+        assert_eq!(emitted, ["lo!", "end"]);
+        assert_eq!(stream.project(client.view()), []);
+        assert!(!client.history_pending());
+    }
+
+    #[test]
     fn independent_scans_preserve_sparse_positions_fragments_and_the_original_cut() {
         let mut client = SessionClient::new(Env::Keep);
         client.open(Target::New);

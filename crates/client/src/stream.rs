@@ -143,15 +143,21 @@ impl ReplyStream {
                     item.key()
                 })
                 .is_err()
-            && view
+        {
+            // A public head can close the call before its committed page arrives.
+            if view.history.is_some() {
+                return events;
+            }
+            if view
                 .streaming
                 .as_ref()
                 .is_none_or(|stream| stream.call.0 != *seq)
-            && !view.state.is_open(protocol::CallId(*seq))
-        {
-            events.push(ReplyEvent::End);
-            self.settled = self.settled.max(seq.get());
-            self.open = None;
+                && !view.state.is_open(protocol::CallId(*seq))
+            {
+                events.push(ReplyEvent::End);
+                self.settled = self.settled.max(seq.get());
+                self.open = None;
+            }
         }
         let start = view.items.partition_point(|item| {
             #[cfg(test)]
