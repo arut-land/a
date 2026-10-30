@@ -543,7 +543,7 @@ mod tests {
 def build_probe(source, output, target):
     root = target / "residency-probe-source"
     root.mkdir(parents=True, exist_ok=True)
-    (root / "main.rs").write_text(PROBE)
+    (root / "main.rs").write_text(PROBE, encoding="utf-8")
     dependencies = tomllib.loads((source / "Cargo.toml").read_text(encoding="utf-8"))["workspace"]["dependencies"]
     manifest = '[workspace]\n[package]\nname="residency-probe"\nversion="0.0.0"\nedition="2024"\n[[bin]]\nname="residency-probe"\npath="main.rs"\n[dependencies]\n'
     for name in ("protocol", "sys", "serde_json"):
