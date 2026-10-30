@@ -1503,6 +1503,131 @@ impl Drop for ScheduledActor {
     }
 }
 
+#[test]
+fn shutdown_consumes_flushes_in_the_suffix_after_a_prefetched_read_fence() {
+    let dir = tempfile::tempdir().unwrap();
+    let faulty = Arc::new(Faulty::new(Arc::new(
+        crate::store::Jsonl::open(dir.path()).unwrap(),
+    )));
+    let runtime = Arc::new(ScheduledRuntime {
+        background: rt::Threads::new(1),
+        captured: AtomicBool::new(false),
+        actor: Mutex::default(),
+        tasks: Mutex::default(),
+        flushes: Mutex::default(),
+    });
+    let fixture = Fixture::on(
+        Arc::clone(&faulty) as _,
+        ext_fixtures::ECHO,
+        Registry::default(),
+        openai(&Script::new(&[])),
+    )
+    .configure(|shared| shared.rt = runtime.clone());
+    let mut scheduled = ScheduledActor::new(&fixture, Arc::clone(&runtime));
+    let flush = faulty.hold_next_flush();
+    scheduled
+        .live
+        .send(Msg::Step(Event::Environment(Environment {
+            tty: true,
+            ..Environment::default()
+        })));
+    scheduled.live.send(Msg::Sync);
+    scheduled.poll();
+    assert!(!lock(&runtime.flushes).is_empty());
+    runtime.poll_tasks();
+    flush.started();
+    flush.release();
+    runtime.wait_flushes();
+    scheduled.live.send(Msg::Stop);
+    scheduled.live.send(Msg::Sync);
+    let (done, _position) = oneshot::channel();
+    scheduled.live.send(Msg::Position(done));
+    runtime.poll_tasks();
+    let ended = scheduled
+        .actor
+        .as_mut()
+        .unwrap()
+        .as_mut()
+        .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+        .is_ready();
+    // A failing assertion must not leave TestingLive's shutdown guard waiting.
+    scheduled.live.ended.set();
+    assert!(ended, "shutdown lost the completion behind the read fence");
+    scheduled.actor.take();
+}
+
+#[test]
+fn prefetched_mail_cannot_cross_read_fences_or_reorder_thawed_inputs() {
+    for frozen in [false, true] {
+        let runtime = Arc::new(ScheduledRuntime {
+            background: rt::Threads::new(1),
+            captured: AtomicBool::new(false),
+            actor: Mutex::default(),
+            tasks: Mutex::default(),
+            flushes: Mutex::default(),
+        });
+        let fixture = Fixture::new(
+            ext_fixtures::ECHO,
+            Registry::default(),
+            openai(&Script::new(&[])),
+        )
+        .configure(|shared| shared.rt = runtime.clone());
+        let mut scheduled = ScheduledActor::new(&fixture, Arc::clone(&runtime));
+        if frozen {
+            let (done, frozen) = oneshot::channel();
+            scheduled.live.send(Msg::Freeze(done));
+            scheduled.poll();
+            assert_eq!(rt::block_on(frozen), Some(Ok(())));
+            for n in 0..BURST + 7 {
+                let _ack = enqueue(&scheduled.live, &format!("held {n}"));
+            }
+            scheduled.poll();
+            assert!(
+                log_of(&scheduled.live)
+                    .iter()
+                    .all(|entry| !matches!(entry.body, Body::Input { .. }))
+            );
+            scheduled.live.thaw();
+            scheduled.position();
+        }
+        let mut positions = Vec::new();
+        for n in 0..BURST + 7 {
+            let _ack = enqueue(&scheduled.live, &format!("mail {n}"));
+            // Several inputs before a fence force the adaptive receive path.
+            if n % 4 == 3 {
+                let (done, position) = oneshot::channel();
+                scheduled.live.send(Msg::Position(done));
+                positions.push((n, position));
+            }
+        }
+        scheduled.position();
+        let log = log_of(&scheduled.live);
+        let inputs: Vec<_> = log
+            .iter()
+            .filter(|entry| matches!(entry.body, Body::Input { .. }))
+            .collect();
+        let held = if frozen { BURST + 7 } else { 0 };
+        assert_eq!(inputs.len(), held + BURST + 7);
+        for (n, position) in positions {
+            let (ordered, _) = rt::block_on(position).unwrap();
+            assert!(inputs[held + n].seq.get() <= ordered);
+            assert!(ordered < inputs[held + n + 1].seq.get());
+        }
+        for (n, entry) in inputs.iter().enumerate() {
+            let Body::Input { segments, .. } = &entry.body else {
+                unreachable!();
+            };
+            let expected = if n < held {
+                format!("held {n}")
+            } else {
+                format!("mail {}", n - held)
+            };
+            assert_eq!(*segments, expected.as_str());
+        }
+        scheduled.stop();
+    }
+}
+
 struct ScheduledSleep(Option<Arc<channel::Sender<StartedHarbor>>>);
 impl Tool for ScheduledSleep {
     type In = ext_fixtures::Seconds;

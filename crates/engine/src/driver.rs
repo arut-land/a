@@ -1531,8 +1531,13 @@ impl Actor {
         let _ = self.carry(first).await;
         self.adopt_jobs();
         let mut next = None;
+        let mut ready = std::collections::VecDeque::new();
         while !(self.phase == Phase::Draining && self.reporting() == 0)
-            && let Some(msg) = match next.take().or_else(|| self.thawed()) {
+            && let Some(msg) = match next
+                .take()
+                .or_else(|| self.thawed())
+                .or_else(|| ready.pop_front())
+            {
                 Some(msg) => Some(msg),
                 None => mail.recv().await,
             }
@@ -1556,13 +1561,22 @@ impl Actor {
             // burst of its own, once what came before it is carried out.
             let mut burst = vec![msg];
             while burst.len() < BURST
-                && let Some(msg) = self.thawed().or_else(|| mail.try_recv())
+                && let Some(msg) = self
+                    .thawed()
+                    .or_else(|| ready.pop_front())
+                    .or_else(|| mail.try_recv())
             {
                 if msg.reads_the_log() {
                     next = Some(msg);
                     break;
                 }
                 burst.push(msg);
+                // A lone message keeps the scalar path, including its empty
+                // probe. Only an observed burst pays for batch storage.
+                if burst.len() == 2 && ready.is_empty() {
+                    ready.reserve(BURST);
+                    mail.try_recv_batch(&mut ready, BURST - burst.len());
+                }
             }
             self.refresh_settings().await;
             let (mut events, mut mutations) = (Vec::new(), Vec::new());
@@ -1625,7 +1639,20 @@ impl Actor {
                 self.keep_snapshot().await;
             }
         }
-        self.drain_flushes(&mail, next).await;
+        // Read fences can leave a suffix outside the mailbox, including the
+        // completion needed to finish shutdown's outstanding flush epochs.
+        for msg in next.into_iter().chain(ready) {
+            if let Msg::Flushed {
+                fence,
+                through,
+                result,
+            } = msg
+                && fence == self.live.session.fence.load(Ordering::SeqCst)
+            {
+                self.completed(through, result).await;
+            }
+        }
+        self.drain_flushes(&mail, None).await;
         self.publish();
         if self.journal.since_snapshot >= SNAPSHOT_EVERY {
             self.keep_snapshot().await;
