@@ -100,7 +100,7 @@ jobs:
           $env:CI = 'true'
           & mise trust "$config/mise.toml"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $testArgs = @('--cd', $config, 'exec', '--', 'cargo', 'nextest', 'run', '--config', "$root/.cargo/config.toml", '--manifest-path', "$root/Cargo.toml", '-p', 'engine', '-p', 'client')
+          $testArgs = @('--cd', $config, 'exec', '--', 'cargo', 'nextest', 'run', '--config', "$root/.cargo/config.toml", '--config', 'profile.dev.codegen-backend="llvm"', '--manifest-path', "$root/Cargo.toml", '-p', 'engine', '-p', 'client')
           "sha=$sha contention=$contention cores=$env:NUMBER_OF_PROCESSORS start=$([DateTime]::UtcNow.ToString('o'))" | Tee-Object "$scratch/run.txt"
           & mise @testArgs --no-run 2>&1 | Tee-Object "$scratch/build.log"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -121,7 +121,7 @@ jobs:
               "round=$round exit=$code end=$([DateTime]::UtcNow.ToString('o'))" | Tee-Object -Append "$scratch/run.txt"
               if ($code -ne 0) {
                 $failed++
-                Get-Process | Select-Object Id, ProcessName, CPU, StartTime | Format-Table -AutoSize | Out-String -Width 240 | Set-Content "$scratch/processes-$round.txt"
+                Get-Process | Select-Object Id, ProcessName, CPU, StartTime | Format-Table -AutoSize | Out-String -Width 240 | Tee-Object "$scratch/processes-$round.txt"
                 if (Select-String -Path $log -Pattern 'FAIL.*(the_host_list_follows_its_files|session_and_fast_roles_use_kind_seeded_settings)') { break }
               }
             }
