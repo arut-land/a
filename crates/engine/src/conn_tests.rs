@@ -153,12 +153,12 @@ impl Peer<'_> {
         }
     }
 
-    /// The next message other than an entry, a delta or a replay's end.
+    /// The next message other than public controls, deltas or a replay's end.
     fn answer(&mut self) -> DaemonMsg {
         loop {
             match self.recv() {
-                DaemonMsg::Entry(_)
-                | DaemonMsg::Head { .. }
+                DaemonMsg::Head { .. }
+                | DaemonMsg::HeadPart { .. }
                 | DaemonMsg::Delta { .. }
                 | DaemonMsg::Activity { .. }
                 | DaemonMsg::Synced { .. } => {}
@@ -274,12 +274,6 @@ fn is_input(body: &Body) -> bool {
     matches!(body, Body::Input { .. })
 }
 
-fn users(msgs: &[DaemonMsg]) -> usize {
-    msgs.iter()
-        .filter(|m| matches!(m, DaemonMsg::Entry(Entry { body, .. }) if is_input(body)))
-        .count()
-}
-
 #[test]
 fn a_pipelined_hello_attach_and_input_are_answered_in_order() {
     let fixture = Fixture::new("pipelined");
@@ -291,7 +285,9 @@ fn a_pipelined_hello_attach_and_input_are_answered_in_order() {
         panic!("no welcome");
     };
     assert_eq!(caps, Caps::SERVED);
-    assert!(matches!(peer.recv(), DaemonMsg::Attached { .. }));
+    let DaemonMsg::Attached { session, .. } = peer.recv() else {
+        panic!("no attached session");
+    };
     // A new session's first entry records its extensions.
     let first = peer.recv();
     assert!(
@@ -314,7 +310,8 @@ fn a_pipelined_hello_attach_and_input_are_answered_in_order() {
         "{logged:?}"
     );
     let seen = peer.until(|m| matches!(m, DaemonMsg::Ack { client_seq: o } if *o == origin(1, 1)));
-    assert_eq!(users(&seen), 0, "the input was already seen");
+    fixture.settle();
+    assert_eq!(inputs(&fixture, session), 1, "the input is committed once");
     assert!(
         std::iter::once(&logged)
             .chain(&seen)

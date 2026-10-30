@@ -167,7 +167,7 @@ with the same ordinary release profile and prebuilt standard library, not a
 claim about the shipped non-fixture binary size. Artifact hashes and source
 revisions accompany the raw measurements. No dependency was added.
 
-Changed Rust and Swift files have a net addition of 4,430 physical source lines,
+At phase 1, changed Rust and Swift files have a net addition of 4,430 physical source lines,
 including tests, comments and blank lines (excluding documentation and generated
 corpus). Paging replaces duplicate transcript ownership but adds range/index and
 continuation machinery; it is not a net source-line reduction.
@@ -374,18 +374,29 @@ are released after rendering.
 
 ## Verification and review scope
 
-The final local suite passed 1,254 Rust nextest tests (41 skipped), touched-crate
+The phase-1 local suite passed 1,254 Rust nextest tests (41 skipped), touched-crate
 check/clippy with warnings denied, formatting, the workspace Windows static
 check, 31 real-daemon Swift tests and the native macOS app build. The browser
 acceptance probe checks native find, selection text, accessibility content and
 unique IDs across demanded delivery. Swift tests/builds use copied packages and
 scratch paths under the one external target directory, preserving the worktree.
 
-The separately owned `crates/ext-mcp/tests/oauth.rs` still contains five raw-entry
-test readers. They require migration to public heads/ranges or test-side log
-inspection before unrestricted CI; production MCP is untouched. This known
-test dependency is not included in the touched-crate success claim. Native
-Linux/glibc and Windows large-drop allocator measurements also remain pending.
+Phase 2 migrates the OAuth socket tests to public control heads and demanded
+ranges. The workspace audit also replaces an engine test's vacuous raw-entry
+counter with a durable input-count assertion and updates the memory-survey
+probe used by the real-daemon harness tests. Reducer, codec and recorded-corpus
+tests still fold their own entries; the live public stream never supplies them.
+A regression through `SessionClient` delivers a completion head before the
+requested reply page, verifies that no premature end is emitted, and checks
+that the final suffix appears exactly once when committed history arrives.
+Phase-2 local verification passed 615 client/engine/MCP tests, 147 CLI tests,
+including the real browser composer test, and both real-daemon probe harness
+tests (subscription/replay and 32-turn PTY). Touched-crate check, clippy with
+warnings denied, docs, formatting and the workspace Windows check passed.
+These correctness changes do not alter browser DOM behavior or the wire format.
+The measurements above belong to the phase-1 executable recorded in the raw data.
+
+Native Linux/glibc and Windows large-drop allocator measurements also remain pending.
 The TUI inbox residual belongs to the separately coordinated mailbox work.
 The measured browser DOM latency and footprint costs need independent review
 and further profiling; no offscreen hiding, global GC/trim policy or speculative

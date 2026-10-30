@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
@@ -439,12 +439,16 @@ struct Client {
     writer: sys::OwnedConnection,
     reader: std::io::BufReader<sys::OwnedConnection>,
     decline_write: bool,
+    view: protocol::view::SessionView,
+    heads: protocol::history::Heads,
+    pages: BTreeMap<u64, Vec<u8>>,
+    next_id: u64,
 }
 impl Client {
     fn attach(root: &Path) -> Self {
-        use protocol::{ClientMsg, DaemonMsg, read_frame, write_frame};
+        use protocol::{ClientMsg, DaemonMsg, write_frame};
         let mut writer = connect(&sys::Home::from(root.to_owned()));
-        let mut reader = std::io::BufReader::new(writer.try_clone().unwrap());
+        let reader = std::io::BufReader::new(writer.try_clone().unwrap());
         write_frame(
             &mut writer,
             &ClientMsg::Attach {
@@ -456,25 +460,93 @@ impl Client {
             },
         )
         .unwrap();
-        loop {
-            if matches!(
-                read_frame::<DaemonMsg>(&mut reader).unwrap(),
-                Some(DaemonMsg::Synced { .. })
-            ) {
-                break;
-            }
-        }
-        Self {
+        let mut client = Self {
             writer,
             reader,
             decline_write: std::fs::read_to_string(sys::Home::from(root.to_owned()).config_file())
                 .unwrap()
                 .contains("decline_write=true"),
+            view: protocol::view::SessionView::default(),
+            heads: protocol::history::Heads::default(),
+            pages: BTreeMap::new(),
+            next_id: 0,
+        };
+        while !matches!(client.receive(), DaemonMsg::Synced { .. }) {}
+        client
+    }
+
+    fn receive(&mut self) -> protocol::DaemonMsg {
+        use protocol::{ClientMsg, DaemonMsg, Decode, read_frame, write_frame};
+        let message = read_frame::<DaemonMsg>(&mut self.reader)
+            .unwrap()
+            .expect("engine hung up");
+        let head = match &message {
+            DaemonMsg::Head { head } => Some(head.as_ref().clone()),
+            DaemonMsg::HeadPart {
+                seq,
+                offset,
+                text,
+                done,
+            } => self.heads.part(*seq, *offset, text, *done).unwrap(),
+            DaemonMsg::Error { message } => panic!("{message}"),
+            DaemonMsg::Entry(_) | DaemonMsg::Snapshot(_) => {
+                panic!("private history on the public stream")
+            }
+            _ => None,
+        };
+        if let Some(head) = head {
+            self.view.fold(&DaemonMsg::Head {
+                head: Box::new(head.clone()),
+            });
+            self.next_id += 1;
+            self.pages.insert(self.next_id, Vec::new());
+            write_frame(
+                &mut self.writer,
+                &ClientMsg::History {
+                    id: self.next_id,
+                    range: protocol::history::Request {
+                        cut: head.cut,
+                        anchor: 0,
+                        text_offset: None,
+                        direction: protocol::history::Direction::After,
+                        bytes: usize::MAX,
+                        filter: protocol::history::Filter::Transcript,
+                    },
+                },
+            )
+            .unwrap();
+        } else if let DaemonMsg::HistoryPart {
+            id,
+            offset,
+            text,
+            done,
+        } = &message
+        {
+            let bytes = self.pages.get_mut(id).expect("requested history");
+            assert_eq!(*offset, bytes.len() as u64);
+            bytes.extend_from_slice(text.as_bytes());
+            if *done {
+                let page =
+                    protocol::history::Page::from_json(&self.pages.remove(id).unwrap()).unwrap();
+                assert_eq!(
+                    page.end, page.total,
+                    "the fixture requests its complete small transcript"
+                );
+                assert!(page.fragment.is_none());
+                self.view.range(
+                    page.items.into_iter().map(|located| located.item).collect(),
+                    page.start..page.end,
+                    None,
+                );
+            }
+        } else {
+            self.view.fold(&message);
         }
+        message
     }
 
     fn list(&mut self) -> (serde_json::Value, usize) {
-        use protocol::{Body, ClientMsg, DaemonMsg, Outcome, read_frame, write_frame};
+        use protocol::{ClientMsg, Outcome, write_frame};
         write_frame(
             &mut self.writer,
             &ClientMsg::Input {
@@ -485,75 +557,87 @@ impl Client {
             },
         )
         .unwrap();
-        let mut parent = None;
+        let since = self.view.seq;
+        let mut answered: BTreeSet<_> = self
+            .view
+            .state
+            .inbox()
+            .filter_map(|call| self.view.state.question_id(call))
+            .collect();
         let mut authorizations = 0;
         loop {
-            let message = read_frame::<DaemonMsg>(&mut self.reader)
-                .unwrap()
-                .expect("engine hung up");
-            match message {
-                DaemonMsg::Entry(entry) => match entry.body {
-                    Body::ToolCall { tool, .. } if tool == "mcp_list" => {
-                        parent = Some(protocol::CallId(entry.seq));
-                    }
-                    Body::Question { question } => {
-                        authorizations += 1;
-                        let (key, prompt) = question.prompts.iter().next().unwrap();
-                        let protocol::Prompt::Url { url, .. } = prompt else {
-                            panic!("URL question expected")
-                        };
-                        let uri: http::Uri = url.parse().unwrap();
-                        let decline = self.decline_write
-                            && form_urlencoded::parse(uri.query().unwrap().as_bytes()).any(
-                                |(k, v)| k == "scope" && v.split_whitespace().any(|s| s == "write"),
-                            );
-                        let browser = (!decline).then(|| {
-                            let url = url.clone();
-                            std::thread::spawn(move || {
-                                let response = get(&url);
-                                let redirect = response
-                                    .lines()
-                                    .find_map(|line| line.strip_prefix("Location: "))
-                                    .unwrap();
-                                assert!(get(redirect).starts_with("HTTP/1.1 200"));
-                            })
-                        });
-                        if let Some(browser) = browser {
-                            browser.join().unwrap();
-                        }
-                        let answer = protocol::QuestionAnswer {
-                            question: entry.seq,
-                            responses: BTreeMap::from([(
-                                key.clone(),
-                                if decline {
-                                    protocol::Response::Decline
-                                } else {
-                                    protocol::Response::accept()
-                                },
-                            )]),
-                        };
-                        write_frame(
-                            &mut self.writer,
-                            &ClientMsg::answer(protocol::CallId(entry.seq), answer),
-                        )
-                        .unwrap();
-                    }
-                    Body::ToolResult { call, outcome, .. } if Some(call) == parent => {
-                        return (
-                            match outcome {
-                                Outcome::Done {
-                                    output: protocol::Payload::Inline(output),
-                                } => output.parse().unwrap(),
-                                Outcome::Interrupted { .. } => json!({"interrupted":true}),
-                                other => panic!("{other:?}"),
-                            },
-                            authorizations,
-                        );
-                    }
-                    _ => {}
-                },
-                DaemonMsg::Error { message } => panic!("{message}"),
-                _ => {}
+            self.receive();
+            let questions: Vec<_> = self
+                .view
+                .state
+                .inbox()
+                .filter_map(|call| self.view.state.question(call))
+                .collect();
+            for (id, question) in questions {
+                if !answered.insert(id) {
+                    continue;
+                }
+                authorizations += 1;
+                let (key, prompt) = question.prompts.iter().next().unwrap();
+                let protocol::Prompt::Url { url, .. } = prompt else {
+                    panic!("URL question expected")
+                };
+                let uri: http::Uri = url.parse().unwrap();
+                let decline = self.decline_write
+                    && form_urlencoded::parse(uri.query().unwrap().as_bytes())
+                        .any(|(k, v)| k == "scope" && v.split_whitespace().any(|s| s == "write"));
+                let browser = (!decline).then(|| {
+                    let url = url.clone();
+                    std::thread::spawn(move || {
+                        let response = get(&url);
+                        let redirect = response
+                            .lines()
+                            .find_map(|line| line.strip_prefix("Location: "))
+                            .unwrap();
+                        assert!(get(redirect).starts_with("HTTP/1.1 200"));
+                    })
+                });
+                if let Some(browser) = browser {
+                    browser.join().unwrap();
+                }
+                let answer = protocol::QuestionAnswer {
+                    question: id,
+                    responses: BTreeMap::from([(
+                        key.clone(),
+                        if decline {
+                            protocol::Response::Decline
+                        } else {
+                            protocol::Response::accept()
+                        },
+                    )]),
+                };
+                write_frame(
+                    &mut self.writer,
+                    &ClientMsg::answer(protocol::CallId(id), answer),
+                )
+                .unwrap();
+            }
+            for item in &self.view.items {
+                if let protocol::view::Item::Tool {
+                    call,
+                    tool,
+                    outcome: Some(outcome),
+                    ..
+                } = item
+                    && call.0.get() > since
+                    && tool == "mcp_list"
+                {
+                    return (
+                        match outcome {
+                            Outcome::Done {
+                                output: protocol::Payload::Inline(output),
+                            } => output.parse().unwrap(),
+                            Outcome::Interrupted { .. } => json!({"interrupted":true}),
+                            other => panic!("{other:?}"),
+                        },
+                        authorizations,
+                    );
+                }
             }
         }
     }
@@ -1087,7 +1171,7 @@ fn engine_readiness_owns_the_daemon_record_before_client_discovery() {
 
 #[test]
 fn interrupting_the_authorization_presenter_leaves_its_card_answerable_for_other_callers() {
-    use protocol::{Body, ClientMsg, DaemonMsg, read_frame, write_frame};
+    use protocol::{ClientMsg, write_frame};
     let mut engine = Engine::new("rotating");
     let mut presenter = Client::attach(&engine.root.dir);
     write_frame(
@@ -1101,11 +1185,14 @@ fn interrupting_the_authorization_presenter_leaves_its_card_answerable_for_other
     )
     .unwrap();
     let (id, question) = loop {
-        if let Some(DaemonMsg::Entry(entry)) =
-            read_frame::<DaemonMsg>(&mut presenter.reader).unwrap()
-            && let Body::Question { question } = entry.body
+        presenter.receive();
+        if let Some(question) = presenter
+            .view
+            .state
+            .inbox()
+            .find_map(|call| presenter.view.state.question(call))
         {
-            break (entry.seq, question);
+            break question;
         }
     };
     write_frame(
@@ -1114,13 +1201,15 @@ fn interrupting_the_authorization_presenter_leaves_its_card_answerable_for_other
     )
     .unwrap();
     loop {
-        if let Some(DaemonMsg::Entry(entry)) =
-            read_frame::<DaemonMsg>(&mut presenter.reader).unwrap()
-            && matches!(entry.body, Body::ToolResult { .. })
-        {
+        presenter.receive();
+        if presenter.view.items.iter().any(|item| {
+            matches!(item,
+            protocol::view::Item::Tool { tool, outcome: Some(_), .. } if tool == "mcp_list")
+        }) {
             break;
         }
     }
+
     let home = engine.root.dir.clone();
     let waiter = std::thread::spawn(move || Client::attach(&home).list());
     let (key, protocol::Prompt::Url { url, .. }) = question.prompts.iter().next().unwrap() else {
@@ -1158,7 +1247,7 @@ fn interrupting_the_authorization_presenter_leaves_its_card_answerable_for_other
 
 #[test]
 fn declining_after_the_browser_callback_discards_the_authorization_code() {
-    use protocol::{Body, ClientMsg, DaemonMsg, read_frame, write_frame};
+    use protocol::{ClientMsg, write_frame};
     let mut engine = Engine::new("rotating");
     let mut client = Client::attach(&engine.root.dir);
     write_frame(
@@ -1172,10 +1261,14 @@ fn declining_after_the_browser_callback_discards_the_authorization_code() {
     )
     .unwrap();
     let (id, question) = loop {
-        if let Some(DaemonMsg::Entry(entry)) = read_frame::<DaemonMsg>(&mut client.reader).unwrap()
-            && let Body::Question { question } = entry.body
+        client.receive();
+        if let Some(question) = client
+            .view
+            .state
+            .inbox()
+            .find_map(|call| client.view.state.question(call))
         {
-            break (entry.seq, question);
+            break question;
         }
     };
     let (key, protocol::Prompt::Url { url, .. }) = question.prompts.iter().next().unwrap() else {
@@ -1200,15 +1293,18 @@ fn declining_after_the_browser_callback_discards_the_authorization_code() {
     )
     .unwrap();
     loop {
-        if let Some(DaemonMsg::Entry(entry)) = read_frame::<DaemonMsg>(&mut client.reader).unwrap()
-            && let Body::ToolResult {
+        client.receive();
+        if let Some(output) = client.view.items.iter().find_map(|item| match item {
+            protocol::view::Item::Tool {
+                tool,
                 outcome:
-                    protocol::Outcome::Done {
+                    Some(protocol::Outcome::Done {
                         output: protocol::Payload::Inline(output),
-                    },
+                    }),
                 ..
-            } = entry.body
-        {
+            } if tool == "mcp_list" => Some(output),
+            _ => None,
+        }) {
             assert!(
                 output
                     .parse::<serde_json::Value>()
@@ -1219,6 +1315,7 @@ fn declining_after_the_browser_callback_discards_the_authorization_code() {
             break;
         }
     }
+
     assert!(!engine.root.dir.join("endpoint.tokens").exists());
     engine.stop();
 }

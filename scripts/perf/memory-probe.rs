@@ -1,6 +1,7 @@
 //! Protocol clients for memory workloads; the parent samples at each boundary.
 
-use protocol::{ClientMsg, DaemonMsg, Target};
+use protocol::{ClientMsg, DaemonMsg, Decode, Target};
+use std::collections::BTreeMap;
 use std::io::{BufReader, Write};
 use std::time::{Duration, Instant};
 
@@ -77,11 +78,16 @@ pub fn run(args: &[String]) {
                 _ => {}
             }
         }
+        let mut heads = protocol::history::Heads::default();
+        let mut head = None;
+        let mut pages = BTreeMap::<u64, Vec<u8>>::new();
+        let mut request_id = 0;
         marker("before");
         let started = Instant::now();
         for i in 1..=count {
             let text = format!("message {i}: {}", "x".repeat(128));
             let mut answered = false;
+            let mut idle = false;
             protocol::write_frame(
                 &mut stream,
                 &ClientMsg::Input {
@@ -93,21 +99,63 @@ pub fn run(args: &[String]) {
             )
             .unwrap();
             loop {
-                match protocol::read_frame::<DaemonMsg>(&mut reader)
+                let message = protocol::read_frame::<DaemonMsg>(&mut reader)
                     .unwrap()
-                    .unwrap()
-                {
-                    DaemonMsg::Entry(entry) => {
-                        if let protocol::Body::Assistant { text: reply } = entry.body {
-                            answered |= reply == text;
+                    .unwrap();
+                if let Some(next) = public_head(&message, &mut heads) {
+                    request_id += 1;
+                    pages.insert(request_id, Vec::new());
+                    protocol::write_frame(
+                        &mut stream,
+                        &ClientMsg::History {
+                            id: request_id,
+                            range: protocol::history::Request {
+                                cut: next.cut,
+                                anchor: next.count.saturating_sub(1),
+                                text_offset: None,
+                                direction: protocol::history::Direction::After,
+                                bytes: usize::MAX,
+                                filter: protocol::history::Filter::Transcript,
+                            },
+                        },
+                    )
+                    .unwrap();
+                    head = Some(next);
+                    idle = false;
+                }
+                match message {
+                    DaemonMsg::HistoryPart {
+                        id,
+                        offset,
+                        text: part,
+                        done,
+                    } => {
+                        let bytes = pages.get_mut(&id).expect("requested range");
+                        assert_eq!(offset, bytes.len() as u64);
+                        bytes.extend_from_slice(part.as_bytes());
+                        if done {
+                            let page =
+                                protocol::history::Page::from_json(&pages.remove(&id).unwrap())
+                                    .unwrap();
+                            answered |= page.items.iter().any(|located| match &located.item {
+                                protocol::view::Item::Assistant { text: reply, .. }
+                                | protocol::view::Item::Reply { text: reply, .. } => *reply == text,
+                                _ => false,
+                            });
                         }
                     }
                     DaemonMsg::Activity {
+                        seq,
                         activity: protocol::Activity::Idle,
-                        ..
-                    } if answered => break,
+                    } if head.as_ref().is_some_and(|head| head.cut.seq == seq) => idle = true,
                     DaemonMsg::Error { message } => panic!("{message}"),
+                    DaemonMsg::Entry(_) | DaemonMsg::Snapshot(_) => {
+                        panic!("private history on the public stream")
+                    }
                     _ => {}
+                }
+                if answered && idle {
+                    break;
                 }
             }
             if i == count {
@@ -177,8 +225,8 @@ pub fn run(args: &[String]) {
                     .unwrap()
                     .unwrap()
                 {
-                    DaemonMsg::Entry(entry) => {
-                        let bytes = protocol::Frame::entry(&entry).unwrap().as_bytes().len();
+                    message @ (DaemonMsg::Head { .. } | DaemonMsg::HeadPart { .. }) => {
+                        let bytes = protocol::Frame::new(&message).unwrap().as_bytes().len();
                         replay_bytes += bytes;
                         largest = largest.max(bytes);
                     }
@@ -211,4 +259,20 @@ pub fn run(args: &[String]) {
     }
     drop(held);
     marker("detached");
+}
+
+fn public_head(
+    message: &DaemonMsg,
+    parts: &mut protocol::history::Heads,
+) -> Option<protocol::history::Head> {
+    match message {
+        DaemonMsg::Head { head } => Some(head.as_ref().clone()),
+        DaemonMsg::HeadPart {
+            seq,
+            offset,
+            text,
+            done,
+        } => parts.part(*seq, *offset, text, *done).unwrap(),
+        _ => None,
+    }
 }
