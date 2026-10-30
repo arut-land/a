@@ -30,14 +30,20 @@ indefinitely stalled consumer.
 The public catalog must have exactly the requested population, idle activity,
 and the expected resident/client counts. Hibernation requires every session
 to report `hibernated` with zero clients, bounded by a failure deadline.
-**The public summary also represents the internal stopping state as
-hibernated.** Twelve additional seconds allow blocking workers to retire;
-this is a settling interval, not proof that an internal weak owner expired.
-The existing real-engine `hibernating_frees_the_session` invariant separately
-checks that owner. Successful reattachment also crosses the prior actor-exit
-barrier, verified by its existing engine invariant. A stronger per-sample actor-exit acknowledgement needs an
-engine/protocol interface outside this branch's ownership. Do not infer a leak
-or prove its absence from the public summary alone.
+The engine keeps a stopping actor publicly `loaded` until the actor has
+finished teardown and the residency transition releases its live state. The
+`hibernated` acknowledgement therefore crosses the actor-exit barrier before
+measurement. Twelve additional seconds allow blocking workers to retire; this
+settling interval serves a separate purpose. The real-engine
+`a_stopping_actor_is_never_published_as_hibernated` invariant holds teardown,
+checks both direct and published summaries, then verifies actor release and
+successful reattachment. `hibernating_frees_the_session` separately checks
+that no live owner remains after hibernation.
+
+The historical tables below predate this publication fix: their public
+hibernation acknowledgement also covered stopping actors. Their settling
+interval does not retroactively prove actor exit. Do not infer a leak or prove
+its absence from those public summaries alone.
 
 Every initial attach, second-wave attach and final reopen decodes with the
 real protocol crate and compares the entire replay, including the synced
@@ -49,6 +55,12 @@ The generated probe's invariant rejects incomplete or prematurely synced
 replay as a sample. The Python integration invariant runs two real sessions
 through both waves, verifies the slow follower pins only its session, and
 checks complete history on reopen.
+
+The current paged `Head` protocol no longer sends the `Entry` replay expected
+by this generated probe. On the actor-exit validation host, the unchanged
+replay assertion fails before hibernation on both the baseline and candidate.
+Full residency-wave measurements remain blocked pending a probe migration
+and agreement on the equivalent history invariant; the assertion is retained.
 
 ## Accounting and interpretation
 
@@ -79,8 +91,8 @@ Context-graph owns inherited context representation; turn-residency stage B
 owns client transcript paging. This workload uses the echo fixture and
 protocol clients, so it neither measures inherited model contexts nor claims
 TUI/web/FFI paging savings. Interpret their live-history evidence separately;
-no files in either product lane are changed here. No product fix, allocator
-trim, history cap, new dependency, log change or wire change is included.
+no files in either product lane are changed here. The actor-exit publication
+fix adds no allocator trim, history cap, dependency, log change or wire change.
 
 ## Reproduction
 

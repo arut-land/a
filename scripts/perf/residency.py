@@ -324,10 +324,12 @@ def catalog(probe, stored, live=0):
 
 
 def hibernate(probe, stored):
+    """Wait for actor exit; zero clients alone still permits resident teardown."""
     started = time.monotonic()
     while time.monotonic() - started < 60:
         rows = probe.call("catalog")
-        if len(rows) == stored and all(row["residency"] == "hibernated" and row["clients"] == 0 for row in rows):
+        assert len(rows) == stored, rows
+        if all(row["residency"] == "hibernated" and row["clients"] == 0 for row in rows):
             return dict(ms=(time.monotonic() - started) * 1000, catalog=rows)
         time.sleep(.05)
     raise TimeoutError(f"hibernation not acknowledged: {rows}")
