@@ -552,7 +552,7 @@ fn every_ephemeral_prefix_chunk_keeps_registry_system_instructions() {
 #[test]
 fn an_ephemeral_timeout_keeps_its_attempts_metrics() {
     struct Deadline {
-        runtime: rt::Threads,
+        runtime: Arc<rt::Threads>,
         started: Instant,
         expired: Flag,
     }
@@ -577,24 +577,31 @@ fn an_ephemeral_timeout_keeps_its_attempts_metrics() {
         fn reactor(&self) -> rt::Reactor {
             self.runtime.reactor()
         }
+        // Later journal timers must retain their delays after budget expiry.
         fn now(&self) -> Instant {
-            self.started
-                + if self.expired.is_set() {
-                    PROBE_TIMEOUT
-                } else {
-                    Duration::ZERO
-                }
+            if self.expired.is_set() {
+                Instant::now() + PROBE_TIMEOUT
+            } else {
+                self.started
+            }
         }
-        fn sleep(&self, _: Duration) -> rt::BoxFuture<'static, ()> {
+        fn sleep(&self, duration: Duration) -> rt::BoxFuture<'static, ()> {
+            let deadline = self.now() + duration;
             let expired = self.expired.clone();
-            Box::pin(async move { expired.wait().await })
+            let runtime = Arc::clone(&self.runtime);
+            Box::pin(async move {
+                expired.wait().await;
+                runtime
+                    .sleep(deadline.saturating_duration_since(Instant::now() + PROBE_TIMEOUT))
+                    .await;
+            })
         }
     }
     let expired = Flag::default();
     let http = Flaky::new([Reply::Hang(String::new())]);
     let fixture = probes(&http, Registry::default()).configure(|shared| {
         shared.rt = Arc::new(Deadline {
-            runtime: rt::Threads::new(1),
+            runtime: Arc::new(rt::Threads::new(1)),
             started: Instant::now(),
             expired: expired.clone(),
         });
