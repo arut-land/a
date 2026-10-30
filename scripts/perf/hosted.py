@@ -380,10 +380,10 @@ def instrument_census(source, output):
     if not module.exists():
         for name, (old, new) in changes.items():
             path = source / name
-            text = path.read_text()
+            text = path.read_text(encoding="utf-8")
             if text.count(old) != 1:
                 raise ValueError(f"cannot instrument {name}: expected one fixture hook insertion point")
-            path.write_text(text.replace(old, new))
+            path.write_text(text.replace(old, new), encoding="utf-8", newline="\n")
     if source != ROOT:
         shutil.copy2(ROOT / "crates/sys/src/census.rs", module)
     (output / "census-instrumentation.patch").write_bytes(

@@ -262,7 +262,7 @@ def cargo_run(command, **kwargs):
             with (Path(kwargs["cwd"]) / "rust-toolchain.toml").open("rb") as stream:
                 toolchain = tomllib.load(stream)["toolchain"]["channel"]
         command = ["mise", "exec", *(["cargo:cargo-nextest@0.9.150"] if command[1] == "nextest" else []),
-                   "--", "cargo", f"+{toolchain}", *command[1:]]
+                   "--", "rustup", "run", toolchain, "cargo", *command[1:]]
     return subprocess.run(command, **kwargs)
 
 
@@ -270,7 +270,7 @@ def build_probe(source, output, target):
     root = target / "residency-probe-source"
     root.mkdir(parents=True, exist_ok=True)
     (root / "main.rs").write_text(PROBE)
-    dependencies = tomllib.loads((source / "Cargo.toml").read_text())["workspace"]["dependencies"]
+    dependencies = tomllib.loads((source / "Cargo.toml").read_text(encoding="utf-8"))["workspace"]["dependencies"]
     manifest = '[workspace]\n[package]\nname="residency-probe"\nversion="0.0.0"\nedition="2024"\n[[bin]]\nname="residency-probe"\npath="main.rs"\n[dependencies]\n'
     for name in ("protocol", "sys", "serde_json"):
         value = dependencies[name]
@@ -597,7 +597,8 @@ def main():
             "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMDATA", "NUMBER_OF_PROCESSORS",
             "RUNNER_TEMP", "GITHUB_STEP_SUMMARY"}
     clean = {key: value for key, value in os.environ.items()
-             if key.upper() in keep or key.startswith(("CARGO_", "RUST", "MISE_", "MBX_"))}
+             if "PROXY" not in key.upper()
+             and (key.upper() in keep or key.startswith(("CARGO_", "RUST", "MISE_", "MBX_")))}
     os.environ.clear()
     os.environ.update(clean, OPENAI_API_KEY="loopback-dummy", OPENAI_BASE_URL="http://127.0.0.1:1/v1",
                       NO_PROXY="127.0.0.1,localhost", CARGO_BUILD_JOBS="2")
