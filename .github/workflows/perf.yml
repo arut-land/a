@@ -16,7 +16,7 @@ on:
         default: ''
         type: string
       alloc_census:
-        description: "Native census of published residency source (override with source_ref)"
+        description: "Native census of the selected residency source"
         default: false
         type: boolean
       residency:
@@ -134,7 +134,7 @@ jobs:
           path: harness
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.source_ref || (inputs.alloc_census || inputs.census_vmmap) && 'b1d6f9c0d18110854d701057dac7bc584985f69a' || github.sha }}
+          ref: ${{ inputs.source_ref || github.sha }}
           path: measured
       - uses: actions/setup-python@v6
         with:

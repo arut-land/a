@@ -449,14 +449,15 @@ dispatched; phase 2 awaits independent review.
 ### Opt-in Linux and Windows allocator census
 
 The `perf` workflow's `alloc_census=true` input selects an instrumented
-residency cohort. By default this reproduces the published source revision
-`b1d6f9c0d18110854d701057dac7bc584985f69a` (protocol 37), rather than the
-current demand-paged transcript protocol. The hook is applied to the four
-approved feature/module/startup wiring files, with its module copied from
-the harness revision. Artifacts include the exact wiring patch and module.
-`source_ref` can override the measured source; the workload must match that
-source's protocol, so the published entry-stream probe is not suitable for
-current control-head/demand-loaded transcript revisions. With `runner=all`, it runs on native Ubuntu x64/ARM64 and
+residency cohort. The source defaults to the workflow revision; `source_ref`
+can override it. The probe and measured source must use the same protocol.
+The historical protocol-37 census below pins source
+`b1d6f9c0d18110854d701057dac7bc584985f69a` and its recorded harness revisions;
+reproducing it requires both pins. The current probe uses protocol-43
+Head/History. The hook is applied to the four approved feature/module/startup
+wiring files when absent, with its module copied from the harness revision.
+Artifacts include the exact wiring patch and module. With `runner=all`, it
+runs on native Ubuntu x64/ARM64 and
 Windows x64/ARM64 runners. Five alternating A/A rounds remain the minimum;
 the lifecycle, equal stored histories, slow follower assertions and reopen
 checks are unchanged. This cohort must not be used for latency, idle CPU or
@@ -596,8 +597,8 @@ allocations and other workloads still need their own ownership evidence.
 
 No allocator policy, trim timer or reclamation call was added. A possible
 follow-up is an A/B measurement of the existing `sys::release` primitive at
-a settled hibernation boundary, after updating the workload for current
-protocol-42 demand-loaded history. It needs an engine boundary hook outside
+a settled hibernation boundary using the current protocol-43 demand-loaded
+history workload. It needs an engine boundary hook outside
 this branch's ownership, a lifecycle invariant, and at least five native
 release-build round pairs measuring both charge and reopen cost. Expected
 costs include heap synchronization and more page faults on reuse; no saving
