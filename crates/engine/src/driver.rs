@@ -1525,8 +1525,9 @@ impl Actor {
 
     async fn run(self, mail: channel::Receiver<Msg>, first: StepPlan) {
         let (ended, session) = {
-            let (mut actor, mail) = (self, mail);
-            actor.run_actor(&mail, first).await
+            let mut running = (self, mail);
+            let (actor, mail) = &mut running;
+            actor.run_actor(mail, first).await
         };
         ended.set();
         session.changed.notify();
