@@ -317,6 +317,8 @@ fn tool_card<'a>(p: &'a Presented<'a>) -> impl Renderable {
                                         @if let Some(description) = &field.description { p { (description) } }
                                         @if field.sensitive {
                                             p role="alert" { "Warning: " (question.source) " is requesting sensitive information. Secrets belong in a secure browser flow; you can decline." }
+                                        }
+                                        @if field.sensitive && !matches!(field.kind, protocol::FieldKind::Choice { .. }) {
                                             input id=(format!("field_{}_{}_{}",id.get(),pi,fi)) name=(format!("f{pi}_{fi}")) data-field type="password" autocomplete="off" value=(field.default_text().unwrap_or_default());
                                         } @else {
                                             @match &field.kind {
@@ -325,12 +327,7 @@ fn tool_card<'a>(p: &'a Presented<'a>) -> impl Renderable {
                                                         option value="" { "Choose…" } option value="true" selected[field.default.as_ref().is_some_and(|v| v.raw()=="true")] { "Yes" } option value="false" selected[field.default.as_ref().is_some_and(|v| v.raw()=="false")] { "No" }
                                                     }
                                                 }
-                                                protocol::FieldKind::Choice { options, selection } => {
-                                                    select id=(format!("field_{}_{}_{}",id.get(),pi,fi)) name=(format!("f{pi}_{fi}")) data-field multiple[matches!(selection,protocol::Selection::Many { .. })] {
-                                                        @if matches!(selection, protocol::Selection::One) { option value="" disabled selected[field.default.is_none()] { "Choose…" } }
-                                                        @for option in options { option value=(option.value) selected[field.default.as_ref().is_some_and(|v| v.parse::<serde_json::Value>().is_ok_and(|v| v.as_str()==Some(option.value.as_str()) || v.as_array().is_some_and(|vs| vs.iter().any(|v| v.as_str()==Some(option.value.as_str())))))] { (option.title) } }
-                                                    }
-                                                }
+                                                protocol::FieldKind::Choice { .. } => { (question_choices(field, id, pi, fi)) }
                                                 kind => {
                                                     input id=(format!("field_{}_{}_{}",id.get(),pi,fi)) name=(format!("f{pi}_{fi}")) data-field
                                                         type=(if matches!(kind,protocol::FieldKind::Number { .. }) {"number"} else {"text"}) step="any"
@@ -457,6 +454,36 @@ fn group(text: &str) -> Vec<Group<'_>> {
     groups
 }
 
+#[component]
+fn question_choices(
+    field: &protocol::Field,
+    id: protocol::Seq,
+    pi: usize,
+    fi: usize,
+) -> impl Renderable {
+    let control = maud! {
+        @if let protocol::FieldKind::Choice { options, selection } = &field.kind {
+            select id=(format!("field_{}_{}_{}", id.get(), pi, fi)) name=(format!("f{pi}_{fi}")) data-field
+                multiple[matches!(selection, protocol::Selection::Many { .. })]
+                onblur="const d=this.closest('details');if(d)d.open=false"
+                onchange="const d=this.closest('details');if(d){d.querySelector('summary').textContent=Array.from(this.selectedOptions).some(o=>!o.disabled)?'••••':'Choose options';if(!this.multiple)d.open=false;}" {
+                @if matches!(selection, protocol::Selection::One) { option value="" disabled selected[field.default.is_none()] { "Choose…" } }
+                @for option in options {
+                    option value=(option.value) selected[field.default.as_ref().is_some_and(|v| v.parse::<serde_json::Value>().is_ok_and(|v| v.as_str()==Some(option.value.as_str()) || v.as_array().is_some_and(|vs| vs.iter().any(|v| v.as_str()==Some(option.value.as_str())))))] { (option.title) }
+                }
+            }
+        }
+    };
+    maud! {
+        @if field.sensitive {
+            details {
+                summary { @if field.default.is_some() { "••••" } @else { "Choose options" } }
+                (control)
+            }
+        } @else { (control) }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,6 +557,51 @@ mod tests {
             }
         }
         assert!(seen);
+    }
+
+    #[test]
+    fn sensitive_choices_keep_opaque_values_and_titles_behind_a_masked_summary() {
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../crates/protocol/tests/vectors/view.json"
+        ))
+        .unwrap();
+        let vector = vectors
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == "sensitive choices retain titled options")
+            .unwrap();
+        let mut view = SessionView::default();
+        for message in vector["frames"].as_array().unwrap() {
+            view.fold(&DaemonMsg::from_json(message.as_str().unwrap().as_bytes()).unwrap());
+        }
+        let rendered = html(ItemRow {
+            item: &view.items[0],
+            view: &view,
+        });
+        assert_eq!(rendered.matches("<details>").count(), 2);
+        assert_eq!(
+            rendered
+                .matches("<summary>Choose options</summary>")
+                .count(),
+            2
+        );
+        assert_eq!(
+            rendered
+                .matches("value=\"opaque-read\">Read access</option>")
+                .count(),
+            2
+        );
+        assert_eq!(
+            rendered
+                .matches("value=\"opaque-write\">Write access</option>")
+                .count(),
+            2
+        );
+        assert!(rendered.contains("name=\"f0_0\""));
+        assert!(rendered.contains("name=\"f0_1\" data-field multiple"));
+        assert!(!rendered.contains("type=\"password\""));
+        assert!(rendered.contains("'••••'"));
     }
 
     #[test]

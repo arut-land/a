@@ -225,7 +225,9 @@ when a question arrives.
 The same boundary marks fields whose names, titles, descriptions or formats
 indicate credentials (including passwords, tokens, API keys and one-time codes).
 Clients read that marker, mask the input and show the asking server beside the
-warning. Sensitive format hints such as `password` become masked strings rather
+warning. Sensitive single- and multiple-choice fields retain their titled options
+and opaque value mappings. Web and macOS show a masked summary outside explicit
+option selection; the TUI lists the available mappings and masks the input. Sensitive format hints such as `password` become masked strings rather
 than unsupported validation formats. Users can still decline or cancel. This is
 mitigation for a misleading server: MCP prohibits requesting credentials through
 forms and directs legitimate credential collection to URL mode.

@@ -2322,3 +2322,50 @@ fn suspicious_destination_spellings_are_visible_before_explicit_navigation() {
     };
     assert_eq!(url, "https://xn--pple-43d.com/consent");
 }
+
+#[test]
+fn sensitive_choices_expose_the_available_mapping_and_mask_both_selection_inputs() {
+    let vectors: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../crates/protocol/tests/vectors/view.json"
+    ))
+    .unwrap();
+    let vector = vectors
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["name"] == "sensitive choices retain titled options")
+        .unwrap();
+    let message = <DaemonMsg as protocol::Decode>::from_json(
+        vector["frames"][1].as_str().unwrap().as_bytes(),
+    )
+    .unwrap();
+    let (mut app, _) = app(Viewport::Full, &[message]);
+    keys(&mut app, "opaque-read");
+    let (_, rows) = frame(&mut app, 160, 40);
+    for label in ["Read access", "Write access", "opaque-read", "opaque-write"] {
+        assert!(rows.join("\n").contains(label));
+    }
+    let input = rows.iter().find(|row| row.contains("❯ ")).unwrap();
+    assert!(input.contains("••••"));
+    assert!(!input.contains("opaque-read"));
+    press(&mut app, Key::Tab);
+    keys(&mut app, "[\"opaque-read\",\"opaque-write\"]");
+    let (_, rows) = frame(&mut app, 160, 40);
+    let input = rows.iter().find(|row| row.contains("❯ ")).unwrap();
+    assert!(input.contains("••••"));
+    assert!(!input.contains("opaque-write"));
+    let Some(Effect::Cmd(Cmd::Answer { answer, .. })) = press(&mut app, Key::Ctrl('s')) else {
+        panic!("choice answer")
+    };
+    let protocol::Response::Submit(values) = &answer.responses["permissions"] else {
+        panic!("submitted")
+    };
+    assert_eq!(
+        values["permissions0"].parse::<String>().unwrap(),
+        "opaque-read"
+    );
+    assert_eq!(
+        values["permissions1"].parse::<Vec<String>>().unwrap(),
+        ["opaque-read", "opaque-write"]
+    );
+}

@@ -227,10 +227,13 @@ fn sensitive(value: &str) -> bool {
             .any(|word| {
                 matches!(
                     word.to_ascii_lowercase().as_str(),
-                    "otp" | "pin" | "cvv" | "cvc"
+                    "otp" | "totp" | "mfa" | "2fa" | "pin" | "cvv" | "cvc"
                 )
             })
-        || matches!(normalized.as_str(), "otpcode" | "pincode")
+        || matches!(
+            normalized.as_str(),
+            "otpcode" | "totpcode" | "mfacode" | "2facode" | "pincode"
+        )
 }
 
 fn decode(server: &ServerName, value: &Value) -> Result<(Question, Option<String>), Failure> {
@@ -609,6 +612,15 @@ mod tests {
             ("value", json!({"description":"One-time verification code"})),
             ("value", json!({"format":"password"})),
             ("OTP", json!({})),
+            ("TOTP", json!({})),
+            ("MFA code", json!({})),
+            ("2FA code", json!({})),
+            ("mfaCode", json!({})),
+            ("totpCode", json!({})),
+            ("2fa_code", json!({})),
+            ("value", json!({"title":"TOTP"})),
+            ("value", json!({"title":"MFA code"})),
+            ("value", json!({"description":"2FA code"})),
             ("payment", json!({"description":"CVV"})),
         ] {
             let mut schema = json!({"type":"string"});
@@ -630,6 +642,38 @@ mod tests {
                     .unwrap()
                     .sensitive
             );
+        }
+    }
+    #[test]
+    fn sensitive_classification_preserves_single_and_multiple_choice_schemas() {
+        for schema in [
+            json!({"type":"string","title":"API key permissions","oneOf":[{"const":"opaque-read","title":"Read access"},{"const":"opaque-write","title":"Write access"}]}),
+            json!({"type":"array","title":"API key permissions","items":{"anyOf":[{"const":"opaque-read","title":"Read access"},{"const":"opaque-write","title":"Write access"}]}}),
+        ] {
+            let field = field("permissions", &schema, true).unwrap();
+            assert!(field.sensitive);
+            let FieldKind::Choice { options, selection } = &field.kind else {
+                panic!("choice kind retained")
+            };
+            assert_eq!(
+                options[0],
+                Choice {
+                    value: "opaque-read".into(),
+                    title: "Read access".into()
+                }
+            );
+            assert_eq!(
+                options[1],
+                Choice {
+                    value: "opaque-write".into(),
+                    title: "Write access".into()
+                }
+            );
+            let value = match selection {
+                Selection::One => Json::encode("opaque-read").unwrap(),
+                Selection::Many { .. } => Json::encode(&["opaque-read", "opaque-write"]).unwrap(),
+            };
+            field.validate(&value).unwrap();
         }
     }
 }

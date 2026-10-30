@@ -13977,5 +13977,363 @@
         "seq": 2
       }
     ]
+  },
+  {
+    "frames": [
+      "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
+      "{\"epoch\":0,\"kind\":\"question\",\"question\":{\"prompts\":{\"permissions\":{\"form\":{\"fields\":[{\"default\":null,\"description\":null,\"kind\":{\"choice\":{\"options\":[{\"title\":\"Read access\",\"value\":\"opaque-read\"},{\"title\":\"Write access\",\"value\":\"opaque-write\"}],\"selection\":\"one\"}},\"name\":\"permissions0\",\"required\":true,\"sensitive\":true,\"title\":\"API key permissions\"},{\"default\":null,\"description\":null,\"kind\":{\"choice\":{\"options\":[{\"title\":\"Read access\",\"value\":\"opaque-read\"},{\"title\":\"Write access\",\"value\":\"opaque-write\"}],\"selection\":{\"many\":{\"max\":null,\"min\":1}}}},\"name\":\"permissions1\",\"required\":true,\"sensitive\":true,\"title\":\"API key permissions\"}],\"message\":\"Choose API key permissions\"}}},\"source\":\"credential fixture\"},\"seq\":1,\"t\":\"entry\"}",
+      "{\"seq\":1,\"t\":\"synced\"}"
+    ],
+    "hash": "d60dd63635cbf55b",
+    "messages": [
+      {
+        "session": "00000000-0000-0000-0000-00000000000a",
+        "t": "attached",
+        "workspace": "/w"
+      },
+      {
+        "epoch": 0,
+        "kind": "question",
+        "question": {
+          "prompts": {
+            "permissions": {
+              "form": {
+                "fields": [
+                  {
+                    "default": null,
+                    "description": null,
+                    "kind": {
+                      "choice": {
+                        "options": [
+                          {
+                            "title": "Read access",
+                            "value": "opaque-read"
+                          },
+                          {
+                            "title": "Write access",
+                            "value": "opaque-write"
+                          }
+                        ],
+                        "selection": "one"
+                      }
+                    },
+                    "name": "permissions0",
+                    "required": true,
+                    "sensitive": true,
+                    "title": "API key permissions"
+                  },
+                  {
+                    "default": null,
+                    "description": null,
+                    "kind": {
+                      "choice": {
+                        "options": [
+                          {
+                            "title": "Read access",
+                            "value": "opaque-read"
+                          },
+                          {
+                            "title": "Write access",
+                            "value": "opaque-write"
+                          }
+                        ],
+                        "selection": {
+                          "many": {
+                            "max": null,
+                            "min": 1
+                          }
+                        }
+                      }
+                    },
+                    "name": "permissions1",
+                    "required": true,
+                    "sensitive": true,
+                    "title": "API key permissions"
+                  }
+                ],
+                "message": "Choose API key permissions"
+              }
+            }
+          },
+          "source": "credential fixture"
+        },
+        "seq": 1,
+        "t": "entry"
+      },
+      {
+        "seq": 1,
+        "t": "synced"
+      }
+    ],
+    "name": "sensitive choices retain titled options",
+    "state": {
+      "items": [
+        {
+          "by": "plugin",
+          "call": 1,
+          "input": null,
+          "outcome": null,
+          "phase": {
+            "waiting": {
+              "on": "question",
+              "question": {
+                "prompts": {
+                  "permissions": {
+                    "form": {
+                      "fields": [
+                        {
+                          "default": null,
+                          "description": null,
+                          "kind": {
+                            "choice": {
+                              "options": [
+                                {
+                                  "title": "Read access",
+                                  "value": "opaque-read"
+                                },
+                                {
+                                  "title": "Write access",
+                                  "value": "opaque-write"
+                                }
+                              ],
+                              "selection": "one"
+                            }
+                          },
+                          "name": "permissions0",
+                          "required": true,
+                          "sensitive": true,
+                          "title": "API key permissions"
+                        },
+                        {
+                          "default": null,
+                          "description": null,
+                          "kind": {
+                            "choice": {
+                              "options": [
+                                {
+                                  "title": "Read access",
+                                  "value": "opaque-read"
+                                },
+                                {
+                                  "title": "Write access",
+                                  "value": "opaque-write"
+                                }
+                              ],
+                              "selection": {
+                                "many": {
+                                  "max": null,
+                                  "min": 1
+                                }
+                              }
+                            }
+                          },
+                          "name": "permissions1",
+                          "required": true,
+                          "sensitive": true,
+                          "title": "API key permissions"
+                        }
+                      ],
+                      "message": "Choose API key permissions"
+                    }
+                  }
+                },
+                "source": "credential fixture"
+              }
+            }
+          },
+          "tool": "credential fixture",
+          "type": "tool"
+        }
+      ],
+      "seq": 1,
+      "session": "00000000-0000-0000-0000-00000000000a",
+      "state": {
+        "calls": [
+          [
+            1,
+            {
+              "independent": true,
+              "phase": {
+                "waiting": {
+                  "on": "question",
+                  "question": {
+                    "prompts": {
+                      "permissions": {
+                        "form": {
+                          "fields": [
+                            {
+                              "default": null,
+                              "description": null,
+                              "kind": {
+                                "choice": {
+                                  "options": [
+                                    {
+                                      "title": "Read access",
+                                      "value": "opaque-read"
+                                    },
+                                    {
+                                      "title": "Write access",
+                                      "value": "opaque-write"
+                                    }
+                                  ],
+                                  "selection": "one"
+                                }
+                              },
+                              "name": "permissions0",
+                              "required": true,
+                              "sensitive": true,
+                              "title": "API key permissions"
+                            },
+                            {
+                              "default": null,
+                              "description": null,
+                              "kind": {
+                                "choice": {
+                                  "options": [
+                                    {
+                                      "title": "Read access",
+                                      "value": "opaque-read"
+                                    },
+                                    {
+                                      "title": "Write access",
+                                      "value": "opaque-write"
+                                    }
+                                  ],
+                                  "selection": {
+                                    "many": {
+                                      "max": null,
+                                      "min": 1
+                                    }
+                                  }
+                                }
+                              },
+                              "name": "permissions1",
+                              "required": true,
+                              "sensitive": true,
+                              "title": "API key permissions"
+                            }
+                          ],
+                          "message": "Choose API key permissions"
+                        }
+                      }
+                    },
+                    "source": "credential fixture"
+                  }
+                }
+              },
+              "progress": null,
+              "question_seq": 1
+            }
+          ]
+        ],
+        "queued": [],
+        "taken": [],
+        "turn": 0
+      },
+      "workspace": "/w"
+    },
+    "updates": [
+      {
+        "change": {
+          "change": "attached",
+          "reset": true,
+          "session": "00000000-0000-0000-0000-00000000000a",
+          "workspace": "/w"
+        },
+        "rev": 1,
+        "seq": 0
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 0,
+          "item": {
+            "by": "plugin",
+            "call": 1,
+            "input": null,
+            "outcome": null,
+            "phase": {
+              "waiting": {
+                "on": "question",
+                "question": {
+                  "prompts": {
+                    "permissions": {
+                      "form": {
+                        "fields": [
+                          {
+                            "default": null,
+                            "description": null,
+                            "kind": {
+                              "choice": {
+                                "options": [
+                                  {
+                                    "title": "Read access",
+                                    "value": "opaque-read"
+                                  },
+                                  {
+                                    "title": "Write access",
+                                    "value": "opaque-write"
+                                  }
+                                ],
+                                "selection": "one"
+                              }
+                            },
+                            "name": "permissions0",
+                            "required": true,
+                            "sensitive": true,
+                            "title": "API key permissions"
+                          },
+                          {
+                            "default": null,
+                            "description": null,
+                            "kind": {
+                              "choice": {
+                                "options": [
+                                  {
+                                    "title": "Read access",
+                                    "value": "opaque-read"
+                                  },
+                                  {
+                                    "title": "Write access",
+                                    "value": "opaque-write"
+                                  }
+                                ],
+                                "selection": {
+                                  "many": {
+                                    "max": null,
+                                    "min": 1
+                                  }
+                                }
+                              }
+                            },
+                            "name": "permissions1",
+                            "required": true,
+                            "sensitive": true,
+                            "title": "API key permissions"
+                          }
+                        ],
+                        "message": "Choose API key permissions"
+                      }
+                    }
+                  },
+                  "source": "credential fixture"
+                }
+              }
+            },
+            "tool": "credential fixture",
+            "type": "tool"
+          }
+        },
+        "rev": 2,
+        "seq": 1
+      },
+      {
+        "change": {
+          "change": "synced"
+        },
+        "rev": 3,
+        "seq": 1
+      }
+    ]
   }
 ]

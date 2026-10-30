@@ -127,9 +127,7 @@ pub fn question_text(question: &Question) -> String {
                         text.push_str(": ");
                         text.push_str(description);
                     }
-                    if let FieldKind::Choice { options, .. } = &field.kind
-                        && !field.sensitive
-                    {
+                    if let FieldKind::Choice { options, .. } = &field.kind {
                         let _ = write!(
                             text,
                             " {:?}",
@@ -232,5 +230,71 @@ mod tests {
             panic!("form answer");
         };
         assert_eq!(fields["choice"].parse::<String>().unwrap(), "");
+    }
+
+    #[test]
+    fn sensitive_choices_keep_available_titles_and_submit_opaque_values() {
+        for (selection, input, expected) in [
+            (
+                protocol::Selection::One,
+                "opaque-read",
+                serde_json::json!("opaque-read"),
+            ),
+            (
+                protocol::Selection::Many {
+                    min: Some(1),
+                    max: None,
+                },
+                "[\"opaque-read\",\"opaque-write\"]",
+                serde_json::json!(["opaque-read", "opaque-write"]),
+            ),
+        ] {
+            let question = Question {
+                source: "fixture".into(),
+                prompts: BTreeMap::from([(
+                    "permissions".into(),
+                    Prompt::Form {
+                        message: "Choose permissions".into(),
+                        fields: vec![protocol::Field {
+                            name: "permissions".into(),
+                            title: Some("API key permissions".into()),
+                            description: None,
+                            required: true,
+                            sensitive: true,
+                            default: None,
+                            kind: FieldKind::Choice {
+                                options: vec![
+                                    protocol::Choice {
+                                        value: "opaque-read".into(),
+                                        title: "Read access".into(),
+                                    },
+                                    protocol::Choice {
+                                        value: "opaque-write".into(),
+                                        title: "Write access".into(),
+                                    },
+                                ],
+                                selection,
+                            },
+                        }],
+                    },
+                )]),
+            };
+            let shown = question_text(&question);
+            for label in ["Read access", "Write access", "opaque-read", "opaque-write"] {
+                assert!(shown.contains(label), "{shown}");
+            }
+            let mut draft = QuestionDraft::new(&question);
+            draft.values.insert("f0_0".into(), input.into());
+            let answer = draft
+                .answer(Seq::new(1).unwrap(), &question, "accept")
+                .unwrap();
+            let Response::Submit(values) = &answer.responses["permissions"] else {
+                panic!("submitted choices")
+            };
+            assert_eq!(
+                values["permissions"].parse::<serde_json::Value>().unwrap(),
+                expected
+            );
+        }
     }
 }

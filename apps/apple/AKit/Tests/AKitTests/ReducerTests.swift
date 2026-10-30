@@ -462,3 +462,16 @@ private func inputFrame(seq: UInt64, text: String) throws -> String {
     #expect(seen)
     #expect(reducer.snapshot().items.first?.presentation.question == nil)
 }
+
+@Test func sensitiveChoicesKeepTheirKindsAndTitledOpaqueValues() throws {
+    let vector = Vector.all.first { $0.name == "sensitive choices retain titled options" }!
+    let (reducer, _) = try vector.fold()
+    let fields = reducer.snapshot().items.first!.presentation.question!.prompts[0].fields
+    #expect(fields.map(\.kind) == [.choice, .multipleChoice])
+    for field in fields {
+        #expect(field.sensitive)
+        #expect(field.initial == nil)
+        #expect(field.options.map(\.title) == ["Read access", "Write access"])
+        #expect(field.options.map(\.value) == ["opaque-read", "opaque-write"])
+    }
+}

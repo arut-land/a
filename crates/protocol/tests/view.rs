@@ -1372,6 +1372,54 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
             ),
         ],
     ));
+    let question = protocol::Question {
+        source: "credential fixture".into(),
+        prompts: std::collections::BTreeMap::from([(
+            "permissions".into(),
+            protocol::Prompt::Form {
+                message: "Choose API key permissions".into(),
+                fields: [
+                    protocol::Selection::One,
+                    protocol::Selection::Many {
+                        min: Some(1),
+                        max: None,
+                    },
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(i, selection)| protocol::Field {
+                    name: format!("permissions{i}"),
+                    title: Some("API key permissions".into()),
+                    description: None,
+                    required: true,
+                    sensitive: true,
+                    default: None,
+                    kind: protocol::FieldKind::Choice {
+                        options: vec![
+                            protocol::Choice {
+                                value: "opaque-read".into(),
+                                title: "Read access".into(),
+                            },
+                            protocol::Choice {
+                                value: "opaque-write".into(),
+                                title: "Write access".into(),
+                            },
+                        ],
+                        selection,
+                    },
+                })
+                .collect(),
+            },
+        )]),
+    };
+    scenarios.push((
+        "sensitive choices retain titled options",
+        vec![
+            attached(),
+            entry(1, Body::Question { question }),
+            msg(DaemonMsg::Synced { seq: 1 }),
+        ],
+    ));
     scenarios
 }
 

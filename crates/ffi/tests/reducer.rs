@@ -234,3 +234,40 @@ fn sensitive_answers_are_absent_from_snapshots_and_updates_but_warnings_survive(
     assert!(seen);
     assert!(reducer.snapshot().items[0].presentation.question.is_none());
 }
+
+#[test]
+fn sensitive_choices_keep_their_selection_kind_and_title_to_value_mapping() {
+    let vector = vectors()
+        .into_iter()
+        .find(|v| v["name"] == "sensitive choices retain titled options")
+        .unwrap();
+    let reducer = Reducer::new();
+    for frame in vector["frames"].as_array().unwrap() {
+        reducer.fold(frame.as_str().unwrap()).unwrap();
+    }
+    let snapshot = reducer.snapshot();
+    let fields = &snapshot.items[0]
+        .presentation
+        .question
+        .as_ref()
+        .unwrap()
+        .prompts[0]
+        .fields;
+    assert_eq!(fields[0].kind, a_ffi::QuestionFieldKind::Choice);
+    assert_eq!(fields[1].kind, a_ffi::QuestionFieldKind::MultipleChoice);
+    for field in fields {
+        assert!(field.sensitive);
+        assert!(field.initial.is_none());
+        assert_eq!(
+            field
+                .options
+                .iter()
+                .map(|o| (o.title.as_str(), o.value.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("Read access", "opaque-read"),
+                ("Write access", "opaque-write")
+            ]
+        );
+    }
+}
