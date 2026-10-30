@@ -107,13 +107,6 @@ impl Daemon {
                 false
             },
         ));
-        if !held {
-            eprintln!(
-                "diagnostic {:?} never {what}; events: {:#?}",
-                std::time::SystemTime::now(),
-                super::lock(&super::EVENTS.0)
-            );
-        }
         assert!(held, "never {what}");
     }
 }
@@ -2317,55 +2310,25 @@ mod inheritance {
 
     #[test]
     fn session_and_fast_roles_use_kind_seeded_settings() {
-        let started = Instant::now();
-        eprintln!(
-            "diagnostic {:?} inheritance start",
-            std::time::SystemTime::now()
-        );
         let config = Config {
             extensions: registry,
             ..echo()
         };
         let (root, home) = home("kind-seeded-roles");
         let daemon = Daemon::load(&home, &config).unwrap();
-        eprintln!(
-            "diagnostic {:?} {:?} loaded",
-            std::time::SystemTime::now(),
-            started.elapsed()
-        );
         let parent = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
         parent
             .session()
             .submit("call model {\"args\":\"test:parent\"}")
             .unwrap();
-        eprintln!(
-            "diagnostic {:?} {:?} settling parent",
-            std::time::SystemTime::now(),
-            started.elapsed()
-        );
         settle(&daemon);
-        eprintln!(
-            "diagnostic {:?} {:?} parent settled",
-            std::time::SystemTime::now(),
-            started.elapsed()
-        );
         for kind in [Seeded::NAME, FreshSeeded::NAME] {
             for role in ["session", "fast"] {
                 parent
                     .session()
                     .submit(&format!("call role_task {{\"args\":\"{kind} {role}\"}}"))
                     .unwrap();
-                eprintln!(
-                    "diagnostic {:?} {:?} settling {kind} {role}",
-                    std::time::SystemTime::now(),
-                    started.elapsed()
-                );
                 settle(&daemon);
-                eprintln!(
-                    "diagnostic {:?} {:?} settled {kind} {role}",
-                    std::time::SystemTime::now(),
-                    started.elapsed()
-                );
             }
         }
         let mut checked = 0;
