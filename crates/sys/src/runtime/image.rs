@@ -219,50 +219,9 @@ pub(super) fn collect(dir: &Path) {
     for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
         let path = entry.path();
         if path.is_dir() {
-            #[cfg(not(test))]
-            let result = discard(&path.join(".retired"));
-            #[cfg(test)]
-            let result =
-                if std::env::var("A_TEST_IMAGE_HANDLE_PROBE").as_deref() == Ok("posix-file") {
-                    probe_discard(&path.join(".retired"))
-                } else {
-                    discard(&path.join(".retired"))
-                };
-            #[cfg(test)]
-            if std::env::var_os("A_TEST_IMAGE_HANDLE_PROBE").is_some() {
-                eprintln!("collect {path:?}: {result:?}");
-            }
-            let _ = result;
+            let _ = discard(&path.join(".retired"));
         }
     }
-}
-
-#[cfg(all(test, windows))]
-fn probe_discard(image: &Path) -> io::Result<()> {
-    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
-    use windows_sys::Win32::Storage::FileSystem::{
-        DELETE, FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
-        FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX,
-        FILE_FLAG_OPEN_REPARSE_POINT, FileDispositionInfoEx, SetFileInformationByHandle,
-    };
-    let file = File::options()
-        .access_mode(DELETE)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(image)?;
-    let info = FILE_DISPOSITION_INFO_EX {
-        Flags: FILE_DISPOSITION_FLAG_DELETE
-            | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
-            | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
-    };
-    // SAFETY: the owned handle and correctly sized info structure outlive the call.
-    crate::windows::ok(unsafe {
-        SetFileInformationByHandle(
-            file.as_raw_handle(),
-            FileDispositionInfoEx,
-            (&raw const info).cast(),
-            u32::try_from(size_of::<FILE_DISPOSITION_INFO_EX>()).expect("fixed structure size"),
-        )
-    })
 }
 
 #[cfg(test)]
@@ -325,14 +284,8 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "temporary native lifetime experiment"
-    )]
-    fn retiring_a_running_image_allows_updates_and_reclamation_after_exit() {
+    fn retired_images_are_reclaimed_after_the_last_mapping_is_released() {
         use std::io::{BufRead, Read, Write};
-        use std::os::windows::io::AsHandle;
-        use std::os::windows::process::ChildExt;
         use std::process::{Command, Stdio};
 
         const CHILD: &str = "A_TEST_INSTALLED_IMAGE_CHILD";
@@ -347,44 +300,21 @@ mod tests {
         std::fs::create_dir(&build).unwrap();
         let exe = build.join(super::super::EXE);
         super::copy(&std::env::current_exe().unwrap(), &exe).unwrap();
-        let mode = std::env::var("A_TEST_IMAGE_HANDLE_PROBE").unwrap_or_else(|_| "held".into());
-        let mut image_view = matches!(mode.as_str(), "mapped" | "unmapped" | "unmapped-held")
-            .then(|| ImageMapping::new(&exe));
-        let mut image_reader = matches!(mode.as_str(), "file" | "file-dropped" | "posix-file")
-            .then(|| std::fs::File::open(&exe).unwrap());
-        let mut child = Some(Command::new(&exe)
+        // The owned view makes the last unmap an explicit collection boundary.
+        let mapping = ImageMapping::new(&exe);
+        let mut child = Command::new(&exe)
             .args([
                 "--exact",
-                "runtime::image::tests::retiring_a_running_image_allows_updates_and_reclamation_after_exit",
+                "runtime::image::tests::retired_images_are_reclaimed_after_the_last_mapping_is_released",
                 "--nocapture",
             ])
             .env(CHILD, "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
-            .unwrap());
-        let retained = match mode.as_str() {
-            "duplicate" => Some(
-                child
-                    .as_ref()
-                    .unwrap()
-                    .as_handle()
-                    .try_clone_to_owned()
-                    .unwrap(),
-            ),
-            "thread" => Some(
-                child
-                    .as_ref()
-                    .unwrap()
-                    .main_thread_handle()
-                    .try_clone_to_owned()
-                    .unwrap(),
-            ),
-            _ => None,
-        };
+            .unwrap();
         let result = (|| {
-            let mut output =
-                std::io::BufReader::new(child.as_mut().unwrap().stdout.take().unwrap());
+            let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
             assert!(
                 (&mut output)
                     .lines()
@@ -393,53 +323,22 @@ mod tests {
             super::retire(&exe)?;
             assert!(!exe.exists());
             super::collect(dir.path());
-            assert!(child.as_mut().unwrap().try_wait()?.is_none());
-            child
-                .as_mut()
-                .unwrap()
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(&[0])?;
-            assert!(child.as_mut().unwrap().wait()?.success());
-            if mode != "held" && mode != "unmapped-held" {
-                drop(child.take());
-            }
-            if matches!(mode.as_str(), "unmapped" | "unmapped-held") {
-                drop(image_view.take());
-            }
-            eprintln!("image_view_owned={}", image_view.is_some());
-            if mode == "file-dropped" {
-                drop(image_reader.take());
-            }
-            eprintln!(
-                "before collection: mode={mode} image_reader={} readonly={:?}",
-                image_reader.is_some(),
-                std::fs::metadata(build.join(".retired")).map(|m| m.permissions().readonly())
-            );
+            assert!(build.join(".retired").is_file());
+            assert!(child.try_wait()?.is_none());
+            child.stdin.take().unwrap().write_all(&[0])?;
+            assert!(child.wait()?.success());
             super::collect(dir.path());
-            eprintln!(
-                "probe mode={mode} child_owned={} extra_handle_owned={} entries={:?}",
-                child.is_some(),
-                retained.is_some(),
-                std::fs::read_dir(&build)
-                    .unwrap()
-                    .map(|e| e.unwrap().file_name())
-                    .collect::<Vec<_>>()
-            );
-            std::fs::remove_dir(&build)?;
-            assert!(!build.exists());
+            assert!(build.join(".retired").is_file());
             Ok::<_, std::io::Error>(())
         })();
-        if let Some(child) = &mut child {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        let _ = child.kill();
+        let _ = child.wait();
         drop(child);
-        drop(retained);
-        drop(image_reader);
-        drop(image_view);
         result.unwrap();
+        drop(mapping);
+        super::collect(dir.path());
+        std::fs::remove_dir(&build).unwrap();
+        assert!(!build.exists());
     }
 
     #[cfg(windows)]

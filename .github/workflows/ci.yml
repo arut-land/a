@@ -61,23 +61,18 @@ jobs:
               env = dict(clean)
               if mode is not None:
                   env["A_TEST_IMAGE_HANDLE_PROBE"] = mode
-              command = ["mise", "exec", "--", "cargo", "nextest", "run", "-p", "sys", "--features", "test-support", "-E", "test(=runtime::image::tests::retiring_a_running_image_allows_updates_and_reclamation_after_exit)", "--stress-count", str(count), "--no-fail-fast", "--success-output", "immediate", "--failure-output", "immediate"]
+              command = ["mise", "exec", "--", "cargo", "nextest", "run", "-p", "sys", "--features", "test-support", "-E", "test(=runtime::image::tests::retired_images_are_reclaimed_after_the_last_mapping_is_released)", "--stress-count", str(count), "--no-fail-fast", "--success-output", "immediate", "--failure-output", "immediate"]
               result = subprocess.run(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, encoding="utf-8", errors="replace")
               (evidence / f"{label}.log").write_text(result.stdout, encoding="utf-8")
               summaries = [line for line in result.stdout.splitlines() if "Summary" in line or "stress run iterations" in line]
               print(json.dumps({"label": label, "returncode": result.returncode, "summaries": summaries}), flush=True)
               return {"returncode": result.returncode, "summaries": summaries}
 
-          results = {}
-          try:
-              source.write_bytes(pristine)
-              results["pristine"] = run_stress("pristine", 200)
-          finally:
-              source.write_bytes(probed)
-          for mode in ["mapped", "unmapped", "unmapped-held"]:
-              results[mode] = run_stress(mode, 200, mode)
+          results = {"fixed": run_stress("fixed", 500)}
           (evidence / "summary.json").write_text(json.dumps(results, indent=2))
           print(json.dumps(results), flush=True)
+          if results["fixed"]["returncode"]:
+              raise SystemExit(results["fixed"]["returncode"])
           '@ | Set-Content "$env:RUNNER_TEMP/retirement-probe.py"
           python -X utf8 "$env:RUNNER_TEMP/retirement-probe.py"
       - if: always()
