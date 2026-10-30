@@ -1,5 +1,9 @@
 # Demanded client history
 
+The PROTO 42 [metadata follow-up](history-paging-metadata.md) records the later
+requested-side path and its attach/control-head comparison. Measurements below
+remain pinned to the original PROTO 41 artifacts.
+
 Stage B of [turn residency](turn-residency.md) replaces complete client
 transcripts and the daemon's far-attach full-view cache with public controls
 and explicitly requested immutable ranges. PROTO 41 carries stable
