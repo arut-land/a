@@ -13,12 +13,12 @@ use uuid::Uuid;
 
 mod question;
 pub use question::{
-    Choice, ContinueAnswer, Field, FieldKind, Prompt, Question, QuestionAnswer, QuestionWait,
-    Response, Selection,
+    Choice, ContinueAnswer, Destination, Field, FieldKind, Prompt, Question, QuestionAnswer,
+    QuestionWait, Response, Selection,
 };
 
 /// The exact protocol this build speaks.
-pub const PROTO: u32 = 42;
+pub const PROTO: u32 = 43;
 
 /// Ordinary payloads leave 4 KiB per reserved control slot for cancellation.
 #[derive(Clone, Copy)]

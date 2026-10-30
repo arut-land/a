@@ -359,6 +359,9 @@ fn a_session_waiting_for_approval_stays_waiting_through_hibernation_and_a_restar
     settle(&daemon);
     drop(attachment);
     daemon.hibernate(Duration::ZERO);
+    daemon.wait("approval session hibernated", PATIENCE, || {
+        daemon.list()[0].residency == Residency::Hibernated
+    });
     let hibernated = daemon.list().remove(0);
     drop(daemon);
     let marked = marked(&home, id);
@@ -427,7 +430,7 @@ fn a_hibernated_session_reloads_only_after_its_actor_has_exited() {
     let first = attachment.session().ended();
     drop(attachment);
 
-    // Hibernated while its actor still waits for the answer, then wanted
+    // Unloading while its actor still waits for the answer, then wanted
     // at once.
     daemon.hibernate(Duration::ZERO);
     let again = daemon.attach_to(&Target::Id(id), || "/w".into()).unwrap();
@@ -1249,6 +1252,98 @@ fn one_writer_per_session() {
     assert_eq!(inputs.count(), 20);
 }
 
+#[test]
+fn a_stopping_actor_is_never_published_as_hibernated() {
+    use std::sync::{Arc, Mutex, OnceLock, mpsc};
+
+    static TEARDOWN: OnceLock<(ext::Flag, Mutex<mpsc::Receiver<()>>)> = OnceLock::new();
+    struct HeldTeardown;
+    impl ext::Extension for HeldTeardown {
+        const NAME: &'static str = "held-teardown";
+        const VERSION: u32 = 1;
+        fn contribute(&self, r: &mut ext::Registrar) {
+            r.on::<ext::point::SessionEnd>(|_, ()| {
+                let (entered, release) = TEARDOWN.get().unwrap();
+                entered.set();
+                release.lock().unwrap().recv_timeout(PATIENCE).unwrap();
+            });
+        }
+    }
+
+    let (release, receive) = mpsc::channel();
+    assert!(
+        TEARDOWN
+            .set((ext::Flag::default(), Mutex::new(receive)))
+            .is_ok()
+    );
+    let (root, home) = home("held-teardown");
+    let daemon = Daemon::load(
+        &home,
+        &Config {
+            extensions: |c| configured(c)?.with(&HeldTeardown),
+            ..echo()
+        },
+    )
+    .unwrap();
+    let attachment = daemon.attach_to(&Target::New, || root.clone()).unwrap();
+    let id = attachment.session().id;
+    attachment.session().submit("hi").unwrap();
+    settle(&daemon);
+    let live = Arc::downgrade(attachment.session());
+    let ended = attachment.session().ended();
+    drop(attachment);
+    daemon.hibernate(Duration::ZERO);
+    rt::block_on(rt::or(TEARDOWN.get().unwrap().0.wait(), async {
+        rt::Reactor::AsyncIo.sleep(PATIENCE).await;
+        panic!("teardown never entered");
+    }));
+
+    let slot = daemon.slot(id).unwrap();
+    let direct = slot.summary();
+    let listed = daemon.list().remove(0);
+    let watcher = super::Outbox::new();
+    daemon.watch_list(&watcher);
+    let frame = watcher.try_next().unwrap();
+    let Some(protocol::DaemonMsg::Sessions { sessions }) =
+        protocol::read_frame::<protocol::DaemonMsg>(&mut frame.as_bytes()).unwrap()
+    else {
+        panic!("expected the session list");
+    };
+    let still_held = live.upgrade().is_some();
+    let still_stopping = !ended.is_set();
+    let reload_refused = !slot.loading();
+    release.send(()).unwrap();
+    daemon.wait("actor exited and released", PATIENCE, || {
+        daemon.list()[0].residency == Residency::Hibernated
+    });
+    let freed = live.upgrade().is_none();
+    let again = daemon.attach_to(&Target::Id(id), || root.clone()).unwrap();
+    let replayed = bodies(&*daemon.shared.store, id);
+    // The reloaded actor also runs this teardown hook.
+    release.send(()).unwrap();
+    drop((again, daemon));
+    std::fs::remove_dir_all(root).unwrap();
+
+    assert!(
+        still_stopping && still_held,
+        "teardown must still own the actor"
+    );
+    assert!(reload_refused, "loading must wait for actor exit");
+    assert_eq!(direct.residency, Residency::Loaded);
+    assert_eq!(listed.residency, Residency::Loaded);
+    assert_eq!(listed.clients, 0);
+    assert_eq!(sessions[0].residency, Residency::Loaded);
+    assert!(
+        ended.is_set() && freed,
+        "hibernated must follow actor release"
+    );
+    assert!(
+        replayed
+            .iter()
+            .any(|b| matches!(b, Body::Assistant { text } if text == "hi"))
+    );
+}
+
 /// #16: once hibernated, nothing of a loaded session is held: its frames,
 /// transcript and actor go with it.
 #[test]
@@ -1259,16 +1354,11 @@ fn hibernating_frees_the_session() {
     attachment.session().submit("hi").unwrap();
     settle(&daemon);
     let live = std::sync::Arc::downgrade(attachment.session());
-    let slot = daemon.slot(attachment.session().id).unwrap();
     drop(attachment);
     daemon.hibernate(Duration::ZERO);
-    // The actor's end closes its writer before the daemon releases the
-    // stopping slot; even then, the slot already lists as hibernated.
+    // Public hibernation must certify the same release as the internal state.
     daemon.wait("session unloaded", PATIENCE, || {
-        matches!(
-            *super::lock(&slot.residency),
-            super::Residency::Hibernated { .. }
-        )
+        daemon.list()[0].residency == Residency::Hibernated
     });
     let listed = daemon.list().remove(0);
     let freed = live.upgrade().is_none();

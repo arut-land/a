@@ -151,7 +151,15 @@ impl App {
         out.extend(working);
         out.extend(self.menu_rows(width));
         out.push(rule.clone());
-        let (rows, (cx, cy)) = self.editor.lines(width, USER);
+        let (rows, (cx, cy)) = if self.question_edit.as_ref().is_some_and(|edit| {
+            edit.fields
+                .get(edit.field)
+                .is_some_and(|field| field.sensitive)
+        }) {
+            self.editor.masked_lines(width, USER)
+        } else {
+            self.editor.lines(width, USER)
+        };
         // The caret's row stays in view.
         let skip = usize::from(cy).saturating_sub(INPUT_ROWS - 1);
         let caret_row = out.len() + usize::from(cy) - skip;

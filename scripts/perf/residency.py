@@ -8,12 +8,14 @@ from pathlib import Path
 import platform
 import queue
 import shutil
+import socket
 import subprocess
 import sys
 import threading
 import time
 import tomllib
 import unittest
+import xml.etree.ElementTree as ET
 
 from build import SUFFIX, environment, executable, release_arguments, stage
 from lifecycle import checked, daemon
@@ -25,14 +27,12 @@ ROOT = Path(__file__).resolve().parents[2]
 # Generated only under CARGO_TARGET_DIR. Protocol encoding and native endpoints
 # stay in their owning Rust crates, including Windows named pipes.
 PROBE = r'''
-use protocol::{Activity, ClientMsg, DaemonMsg, Decode, Entry, SessionId, Target};
+use protocol::history::{Direction, Filter, Head, Heads, Located, Page, Request};
+use protocol::view::{Item, SessionView};
+use protocol::{Activity, ClientMsg, DaemonMsg, Decode, Entry, HostPath, SessionId, Target};
 use std::io::{BufRead, BufReader, Write};
 use std::time::{Duration, Instant};
 
-fn replay_is_complete(expected: &[Entry], actual: &[Entry], seq: u64) {
-    assert_eq!(actual, expected, "reopen must preserve every durable entry");
-    assert_eq!(seq, expected.last().map_or(0, |e| e.seq.get()));
-}
 fn durable(home: &sys::Home, id: SessionId) -> Vec<Entry> {
     let text = std::fs::read_to_string(home.sessions_dir().join(id.to_string()).join("log.jsonl"))
         .unwrap();
@@ -42,11 +42,105 @@ fn durable(home: &sys::Home, id: SessionId) -> Vec<Entry> {
         .map(|line| Entry::from_json(line.as_bytes()).unwrap())
         .collect()
 }
-fn main() {
-    let home = sys::Home::from(std::path::PathBuf::from(
-        std::env::var_os("A_HOME").unwrap(),
-    ));
-    let connect = || {
+
+fn replay_is_complete(expected: &SessionView, actual: &[Located], head: &Head) {
+    assert_eq!(
+        expected.seq, head.cut.seq,
+        "the head must name a durable log cut"
+    );
+    assert_eq!(
+        expected.items.len(),
+        head.count,
+        "the head must count every durable item"
+    );
+    assert_eq!(
+        actual.len(),
+        head.count,
+        "demanded history must cover the complete head"
+    );
+    for (index, (actual, expected)) in actual.iter().zip(expected.items.iter()).enumerate() {
+        assert_eq!(
+            actual.index, index,
+            "history must contain each index once, in order"
+        );
+        assert_eq!(
+            &actual.item, expected,
+            "history must preserve every durable item"
+        );
+    }
+}
+
+fn text(item: &mut Item) -> &mut String {
+    match item {
+        Item::User { text, .. } | Item::Assistant { text, .. } | Item::Reply { text, .. } => text,
+        _ => panic!("only text items can be fragmented"),
+    }
+}
+
+#[derive(Default)]
+struct Replay {
+    items: Vec<Located>,
+    partial: Option<Item>,
+    offset: Option<usize>,
+}
+
+impl Replay {
+    fn append(&mut self, page: Page, head: &Head) {
+        assert_eq!(page.cut, head.cut, "a page must belong to the demanded cut");
+        assert_eq!(page.total, head.count);
+        assert_eq!(page.start, self.items.len());
+        assert!(!page.items.is_empty(), "a demanded page must advance");
+        for mut located in page.items {
+            assert_eq!(
+                located.index,
+                self.items.len(),
+                "a range skipped or repeated an item"
+            );
+            if let Some(span) = page.fragment.as_ref().filter(|s| s.index == located.index) {
+                assert_eq!(span.key, located.item.key());
+                assert_eq!(span.start, self.offset.unwrap_or(0));
+                assert!(span.end > span.start && span.end <= span.total);
+                assert_eq!(text(&mut located.item).len(), span.end - span.start);
+                if let Some(mut previous) = self.partial.take() {
+                    let suffix = std::mem::take(text(&mut located.item));
+                    let prefix = std::mem::take(text(&mut previous));
+                    assert_eq!(
+                        previous, located.item,
+                        "fragment metadata changed within a cut"
+                    );
+                    *text(&mut located.item) = prefix + &suffix;
+                }
+                if span.end < span.total {
+                    self.partial = Some(located.item);
+                    self.offset = Some(span.end);
+                    continue;
+                }
+                assert_eq!(text(&mut located.item).len(), span.total);
+                self.offset = None;
+            } else {
+                assert!(self.partial.is_none(), "a fragment was left incomplete");
+            }
+            self.items.push(located);
+        }
+        assert_eq!(
+            page.end,
+            self.items.len() + usize::from(self.partial.is_some())
+        );
+    }
+}
+
+struct Client {
+    stream: sys::OwnedConnection,
+    reader: BufReader<sys::OwnedConnection>,
+    session: Option<(SessionId, HostPath)>,
+    heads: Heads,
+    head: Option<Head>,
+    activity: Option<(u64, Activity)>,
+    request: u64,
+}
+
+impl Client {
+    fn connect(home: &sys::Home) -> Self {
         let mut stream = home.endpoint().connect().unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(60)))
@@ -67,13 +161,57 @@ fn main() {
             protocol::read_frame(&mut reader).unwrap(),
             Some(DaemonMsg::Welcome { .. })
         ));
-        (stream, reader)
-    };
-    let attach = |target| {
-        let (mut stream, mut reader) = connect();
+        Self {
+            stream,
+            reader,
+            session: None,
+            heads: Heads::default(),
+            head: None,
+            activity: None,
+            request: 0,
+        }
+    }
+
+    fn receive(&mut self) -> DaemonMsg {
+        let msg = protocol::read_frame::<DaemonMsg>(&mut self.reader)
+            .unwrap()
+            .expect("daemon disconnected");
+        match &msg {
+            DaemonMsg::Attached { session, workspace } => {
+                self.session = Some((*session, workspace.clone()))
+            }
+            DaemonMsg::Head { head } => self.head = Some((**head).clone()),
+            DaemonMsg::HeadPart {
+                seq,
+                offset,
+                text,
+                done,
+            } => {
+                if let Some(head) = self.heads.part(*seq, *offset, text, *done).unwrap() {
+                    self.head = Some(head);
+                }
+            }
+            DaemonMsg::Activity { seq, activity } => self.activity = Some((*seq, *activity)),
+            DaemonMsg::Error { message } => panic!("{message}"),
+            DaemonMsg::Reply { outcome, .. } => assert!(
+                matches!(outcome, protocol::Outcome::Done { .. }),
+                "history request failed: {outcome:?}"
+            ),
+            _ => {}
+        }
+        msg
+    }
+
+    fn attach(home: &sys::Home, target: Target) -> (Self, f64, usize) {
+        let committed = if let Target::Id(id) = &target {
+            durable(home, *id).last().map_or(0, |e| e.seq.get())
+        } else {
+            0
+        };
+        let mut client = Self::connect(home);
         let started = Instant::now();
         protocol::write_frame(
-            &mut stream,
+            &mut client.stream,
             &ClientMsg::Attach {
                 target,
                 workspace: Some(std::env::current_dir().unwrap().try_into().unwrap()),
@@ -83,66 +221,161 @@ fn main() {
             },
         )
         .unwrap();
-        let mut id = None;
-        let mut entries = Vec::new();
         let seq = loop {
-            match protocol::read_frame::<DaemonMsg>(&mut reader)
-                .unwrap()
-                .unwrap()
-            {
-                DaemonMsg::Attached { session, .. } => id = Some(session),
-                DaemonMsg::Entry(entry) => entries.push(entry),
-                DaemonMsg::Synced { seq } => break seq,
-                DaemonMsg::Error { message } => panic!("{message}"),
-                _ => {}
+            if let DaemonMsg::Synced { seq } = client.receive() {
+                break seq;
             }
         };
+        let head = client
+            .head
+            .clone()
+            .expect("attach must publish a head before Synced");
+        assert_eq!(head.cut.seq, seq);
+        assert!(
+            seq >= committed,
+            "attach omitted facts already durable before its head"
+        );
+        let items = client.replay(home, &head);
         let ms = started.elapsed().as_secs_f64() * 1000.;
-        let id = id.unwrap();
-        let expected = durable(&home, id);
-        replay_is_complete(&expected, &entries, seq);
-        (stream, reader, id, ms, entries.len(), seq)
-    };
-    let mut held = Vec::new();
+        (client, ms, items.len())
+    }
+
+    fn replay(&mut self, home: &sys::Home, head: &Head) -> Vec<Located> {
+        let (id, workspace) = self.session.as_ref().unwrap();
+        assert_eq!(head.cut.session, *id);
+        let expected = SessionView::from_log(
+            *id,
+            workspace.clone(),
+            durable(home, *id)
+                .into_iter()
+                .filter(|e| e.seq.get() <= head.cut.seq),
+        );
+        let mut replay = Replay::default();
+        while replay.items.len() < head.count {
+            self.request += 1;
+            protocol::write_frame(
+                &mut self.stream,
+                &ClientMsg::History {
+                    id: self.request,
+                    range: Request {
+                        cut: head.cut,
+                        anchor: replay.items.len(),
+                        text_offset: replay.offset,
+                        direction: Direction::After,
+                        bytes: 64 << 10,
+                        filter: Filter::Transcript,
+                    },
+                },
+            )
+            .unwrap();
+            let mut bytes = String::new();
+            loop {
+                if let DaemonMsg::HistoryPart {
+                    id,
+                    offset,
+                    text,
+                    done,
+                } = self.receive()
+                {
+                    assert_eq!(id, self.request);
+                    assert_eq!(
+                        offset,
+                        bytes.len() as u64,
+                        "history chunks must be contiguous"
+                    );
+                    bytes.push_str(&text);
+                    if done {
+                        break;
+                    }
+                }
+            }
+            replay.append(Page::from_json(bytes.as_bytes()).unwrap(), head);
+        }
+        assert!(replay.partial.is_none(), "the final item must be complete");
+        replay_is_complete(&expected, &replay.items, head);
+        replay.items
+    }
+
+    fn reply(&mut self, home: &sys::Home, since: u64, last: &str) -> Vec<Located> {
+        let mut checked = since;
+        loop {
+            if let Some((seq, Activity::Idle)) = self.activity
+                && seq > checked
+                && let Some(head) = self.head.clone().filter(|h| h.cut.seq == seq)
+            {
+                checked = seq;
+                let items = self.replay(home, &head);
+                if items.iter().rev().find_map(|i| match &i.item {
+                    Item::Assistant { text, .. } => Some(text.as_str()),
+                    _ => None,
+                }) == Some(last)
+                {
+                    return items;
+                }
+                continue;
+            }
+            self.receive();
+        }
+    }
+
+    fn detach(mut self) {
+        protocol::write_frame(&mut self.stream, &ClientMsg::Detach).unwrap();
+        while protocol::read_frame::<DaemonMsg>(&mut self.reader)
+            .unwrap()
+            .is_some()
+        {}
+    }
+}
+
+fn main() {
+    let home = sys::Home::from(std::path::PathBuf::from(
+        std::env::var_os("A_HOME").unwrap(),
+    ));
+    let mut held: Vec<Client> = Vec::new();
     let mut slow = None;
     let mut last = String::new();
     for line in std::io::stdin().lock().lines() {
         let value: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
         let result = match value["op"].as_str().unwrap() {
             "catalog" => {
-                let (mut stream, mut reader) = connect();
-                protocol::write_frame(&mut stream, &ClientMsg::List).unwrap();
-                let Some(DaemonMsg::Sessions { sessions }) =
-                    protocol::read_frame(&mut reader).unwrap()
-                else {
+                let mut client = Client::connect(&home);
+                protocol::write_frame(&mut client.stream, &ClientMsg::List).unwrap();
+                let DaemonMsg::Sessions { sessions } = client.receive() else {
                     panic!("expected catalog")
                 };
                 serde_json::to_value(sessions).unwrap()
             }
             "new" => {
-                let (_, _, id, _, _, _) = attach(Target::New);
+                let (client, _, _) = Client::attach(&home, Target::New);
+                let id = client.session.as_ref().unwrap().0;
+                client.detach();
                 serde_json::json!(id)
             }
             "attach" | "slow" => {
                 let id: SessionId = serde_json::from_value(value["id"].clone()).unwrap();
-                let (stream, reader, actual, ms, entries, seq) = attach(Target::Id(id));
-                assert_eq!(actual, id);
+                let (mut client, ms, items) = Client::attach(&home, Target::Id(id));
+                assert_eq!(client.session.as_ref().unwrap().0, id);
                 if value["op"] == "slow" {
-                    slow = Some((stream, reader, id, seq));
+                    let head = client.head.clone().unwrap();
+                    let before = client.replay(&home, &head);
+                    slow = Some((client, head, before));
                 } else {
-                    held.push((stream, reader));
+                    held.push(client);
                 }
-                serde_json::json!({"ms": ms, "entries": entries})
+                serde_json::json!({"ms": ms, "items": items})
             }
             "turns" => {
                 let count = value["count"].as_u64().unwrap();
                 let bytes = value["bytes"].as_u64().unwrap() as usize;
-                // Send to every active session before awaiting any reply.
                 for turn in 0..count {
                     last = format!("wave {} turn {turn}: {}", value["wave"], "x".repeat(bytes));
-                    for (stream, _) in &mut held {
+                    let since: Vec<_> = held
+                        .iter()
+                        .map(|c| c.head.as_ref().unwrap().cut.seq)
+                        .collect();
+                    for client in &mut held {
                         protocol::write_frame(
-                            stream,
+                            &mut client.stream,
                             &ClientMsg::Input {
                                 segments: last.clone().into(),
                                 mode: Default::default(),
@@ -152,74 +385,35 @@ fn main() {
                         )
                         .unwrap();
                     }
-                    for (_, reader) in &mut held {
-                        let mut answered = false;
-                        loop {
-                            match protocol::read_frame::<DaemonMsg>(reader).unwrap().unwrap() {
-                                DaemonMsg::Entry(entry) => {
-                                    if let protocol::Body::Assistant { text } = entry.body {
-                                        answered |= text == last;
-                                    }
-                                }
-                                DaemonMsg::Activity {
-                                    activity: Activity::Idle,
-                                    ..
-                                } if answered => break,
-                                DaemonMsg::Error { message } => panic!("{message}"),
-                                _ => {}
-                            }
-                        }
+                    for (client, since) in held.iter_mut().zip(since) {
+                        client.reply(&home, since, &last);
                     }
                 }
                 serde_json::json!({"completed": count * held.len() as u64})
             }
             "detach" => {
-                for (mut stream, mut reader) in held.drain(..) {
-                    protocol::write_frame(&mut stream, &ClientMsg::Detach).unwrap();
-                    while protocol::read_frame::<DaemonMsg>(&mut reader)
-                        .unwrap()
-                        .is_some()
-                    {}
+                for client in held.drain(..) {
+                    client.detach();
                 }
                 serde_json::Value::Null
             }
             "drain" => {
-                let (mut stream, mut reader, id, since) = slow.take().unwrap();
-                let mut entries = Vec::new();
-                let mut answered = false;
-                loop {
-                    match protocol::read_frame::<DaemonMsg>(&mut reader)
-                        .unwrap()
-                        .unwrap()
-                    {
-                        DaemonMsg::Entry(entry) => {
-                            if let protocol::Body::Assistant { text } = &entry.body {
-                                answered |= text == &last;
-                            }
-                            entries.push(entry);
-                        }
-                        DaemonMsg::Activity {
-                            activity: Activity::Idle,
-                            ..
-                        } if answered => break,
-                        DaemonMsg::Error { message } => panic!("slow follower: {message}"),
-                        _ => {}
-                    }
-                }
-                let expected: Vec<_> = durable(&home, id)
-                    .into_iter()
-                    .filter(|entry| entry.seq.get() > since)
-                    .collect();
+                let (mut client, head, before) = slow.take().unwrap();
+                assert_eq!(
+                    client.replay(&home, &head),
+                    before,
+                    "a lagging follower's original cut must remain immutable"
+                );
+                let items = client.reply(&home, head.cut.seq, &last);
                 assert!(
-                    !expected.is_empty(),
+                    items.len() > before.len(),
                     "slow follower must have work to drain"
                 );
-                replay_is_complete(&expected, &entries, entries.last().unwrap().seq.get());
-                protocol::write_frame(&mut stream, &ClientMsg::Detach).unwrap();
-                while protocol::read_frame::<DaemonMsg>(&mut reader)
-                    .unwrap()
-                    .is_some()
-                {}
+                assert!(
+                    items.starts_with(&before),
+                    "slow follower must preserve its complete prior history"
+                );
+                client.detach();
                 serde_json::json!({"complete": true})
             }
             "memory" => serde_json::json!({
@@ -232,32 +426,119 @@ fn main() {
         std::io::stdout().flush().unwrap();
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
-    fn missing_or_prematurely_synced_history_is_never_a_latency_sample() {
-        let entry = Entry::new(
-            protocol::Seq::new(1).unwrap(),
-            protocol::Epoch(1),
-            protocol::Body::Assistant {
-                text: "durable history".into(),
-            },
+    fn missing_duplicate_reordered_or_truncated_history_is_never_a_latency_sample() {
+        let id = SessionId::new();
+        let entries: Vec<_> = (1..=2)
+            .map(|n| {
+                Entry::new(
+                    protocol::Seq::new(n).unwrap(),
+                    protocol::Epoch(1),
+                    protocol::Body::Assistant {
+                        text: format!("durable item {n}"),
+                    },
+                )
+            })
+            .collect();
+        let expected = SessionView::from_log(id, "/fixture".into(), &entries);
+        let mut index = protocol::view::Index::new(id, expected.workspace.clone());
+        for entry in &entries {
+            index.apply(entry);
+        }
+        let head = index.head(protocol::Epoch(1));
+        let actual: Vec<_> = expected
+            .items
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, item)| Located { index, item })
+            .collect();
+        replay_is_complete(&expected, &actual, &head);
+        let rejects = |items: &[Located], head: &Head| {
+            assert!(
+                std::panic::catch_unwind(|| replay_is_complete(&expected, items, head)).is_err()
+            )
+        };
+        rejects(&actual[..1], &head);
+        rejects(&[actual[0].clone(), actual[0].clone()], &head);
+        rejects(&[actual[1].clone(), actual[0].clone()], &head);
+        let mut truncated = actual.clone();
+        text(&mut truncated[1].item).pop();
+        rejects(&truncated, &head);
+        let mut premature = head;
+        premature.cut.seq = 0;
+        rejects(&actual, &premature);
+    }
+
+    #[test]
+    fn demanded_fragments_reconstruct_every_item_once_in_order() {
+        let id = SessionId::new();
+        let entries: Vec<_> = (1..=2)
+            .map(|n| {
+                Entry::new(
+                    protocol::Seq::new(n).unwrap(),
+                    protocol::Epoch(1),
+                    protocol::Body::Assistant {
+                        text: format!("item {n}: {}", "αβγδεζηθ".repeat(8)),
+                    },
+                )
+            })
+            .collect();
+        let expected = SessionView::from_log(id, "/fixture".into(), &entries);
+        let mut index = protocol::view::Index::new(id, expected.workspace.clone());
+        for entry in &entries {
+            index.apply(entry);
+        }
+        let head = index.head(protocol::Epoch(1));
+        let mut replay = Replay::default();
+        let mut pages = 0;
+        while replay.items.len() < head.count {
+            let request = Request {
+                cut: head.cut,
+                anchor: replay.items.len(),
+                text_offset: replay.offset,
+                direction: Direction::After,
+                bytes: 9,
+                filter: Filter::Transcript,
+            };
+            let page = index
+                .page(&request, |seq| Ok(entries[seq.get() as usize - 1].clone()))
+                .unwrap();
+            replay.append(page, &head);
+            pages += 1;
+        }
+        assert!(
+            pages > head.count,
+            "the fixture must exercise multiple fragments per item"
         );
-        let expected = [entry];
-        replay_is_complete(&expected, &expected, 1);
-        assert!(std::panic::catch_unwind(|| replay_is_complete(&expected, &[], 1)).is_err());
-        assert!(std::panic::catch_unwind(|| replay_is_complete(&expected, &expected, 0)).is_err());
+        assert!(replay.partial.is_none());
+        replay_is_complete(&expected, &replay.items, &head);
     }
 }
 '''
+
+
+def cargo_run(command, **kwargs):
+    if command[0] == "cargo":
+        toolchain = os.environ.get("RUSTUP_TOOLCHAIN")
+        if not toolchain:
+            with (Path(kwargs["cwd"]) / "rust-toolchain.toml").open("rb") as stream:
+                toolchain = tomllib.load(stream)["toolchain"]["channel"]
+        command = ["mise", "exec", *(["cargo:cargo-nextest@0.9.150"] if command[1] == "nextest" else []),
+                   "--", "rustup", "run", toolchain, "cargo", *command[1:]]
+    return subprocess.run(command, **kwargs)
 
 
 def build_probe(source, output, target):
     root = target / "residency-probe-source"
     root.mkdir(parents=True, exist_ok=True)
     (root / "main.rs").write_text(PROBE)
-    dependencies = tomllib.loads((source / "Cargo.toml").read_text())["workspace"]["dependencies"]
+    dependencies = tomllib.loads((source / "Cargo.toml").read_text(encoding="utf-8"))["workspace"]["dependencies"]
     manifest = '[workspace]\n[package]\nname="residency-probe"\nversion="0.0.0"\nedition="2024"\n[[bin]]\nname="residency-probe"\npath="main.rs"\n[dependencies]\n'
     for name in ("protocol", "sys", "serde_json"):
         value = dependencies[name]
@@ -274,10 +555,10 @@ def build_probe(source, output, target):
     shutil.copy2(source / "Cargo.lock", root / "Cargo.lock")
     env = environment(target)
     for command in (["cargo", "fmt", "--manifest-path", str(root / "Cargo.toml")],
-                    ["cargo", "test", "--manifest-path", str(root / "Cargo.toml")],
+                    ["cargo", "nextest", "run", "--manifest-path", str(root / "Cargo.toml")],
                     ["cargo", "clippy", "--manifest-path", str(root / "Cargo.toml"), "--all-targets", "--", "-D", "warnings"]):
-        subprocess.run(command, cwd=source, env=env, check=True)
-    result = subprocess.run(["cargo", "build", *release_arguments(), "--manifest-path", str(root / "Cargo.toml"),
+        cargo_run(command, cwd=source, env=env, check=True)
+    result = cargo_run(["cargo", "build", *release_arguments(), "--manifest-path", str(root / "Cargo.toml"),
                              "--message-format=json"], cwd=source, env=env, check=True, capture_output=True, text=True)
     binary = next(Path(r["executable"]) for line in result.stdout.splitlines()
                   if (r := json.loads(line)).get("executable"))
@@ -324,13 +605,55 @@ def catalog(probe, stored, live=0):
 
 
 def hibernate(probe, stored):
+    """Wait for actor exit; zero clients alone still permits resident teardown."""
     started = time.monotonic()
     while time.monotonic() - started < 60:
         rows = probe.call("catalog")
-        if len(rows) == stored and all(row["residency"] == "hibernated" and row["clients"] == 0 for row in rows):
+        assert len(rows) == stored, rows
+        if all(row["residency"] == "hibernated" and row["clients"] == 0 for row in rows):
             return dict(ms=(time.monotonic() - started) * 1000, catalog=rows)
         time.sleep(.05)
     raise TimeoutError(f"hibernation not acknowledged: {rows}")
+
+
+def allocation_census(active):
+    port = active.census / f"{active.pid}.port"
+    deadline = time.monotonic() + 30
+    while not port.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("fixture daemon did not publish census endpoint")
+        time.sleep(.01)
+    with socket.create_connection(("127.0.0.1", int(port.read_text())), timeout=30) as stream:
+        with stream.makefile("r") as reader:
+            value = json.loads(reader.readline())
+    if output := getattr(active, "census_output", None):
+        with (output / "census-native.jsonl").open("a", encoding="utf-8") as raw:
+            raw.write(json.dumps(value) + "\n")
+    if "error" in value:
+        raise RuntimeError(value["error"])
+    if value["allocator"] == "glibc":
+        root = ET.fromstring(value["malloc_info"])
+        arena = int(root.find("./system[@type='current']").attrib["size"])
+        totals = {total.attrib["type"]: int(total.attrib["size"]) for total in root.findall("./total")}
+        free = totals["rest"] + totals.get("fast", 0)
+        mapped = totals["mmap"]
+        value.update(allocated_bytes=arena - free + mapped, retained_free_bytes=free,
+                     allocator_bytes=arena + mapped)
+    else:
+        allocated = sum(row["allocated_bytes"] for row in value["heaps"])
+        committed = sum(row["committed_bytes"] for row in value["heaps"])
+        value.update(allocated_bytes=allocated, retained_free_bytes=committed - allocated,
+                     allocator_bytes=committed)
+    assert value["pid"] == active.pid, value
+    value["observed_at_ns"] = time.time_ns()
+    value["maps"] = memory_maps(active.pid)
+    if getattr(active, "vmmap", None):
+        active.census_index += 1
+        filename = f"vmmap-{active.pid}-{active.census_index:02}.csv"
+        subprocess.run([str(active.vmmap), "-accepteula", "-p", str(active.pid),
+                        str(active.census_output / filename)], check=True, timeout=60)
+        value["vmmap"] = filename
+    return value
 
 
 def observe(probe, active, idle_seconds):
@@ -341,12 +664,14 @@ def observe(probe, active, idle_seconds):
     started = time.monotonic()
     time.sleep(idle_seconds)
     after = snapshot(active.pid, threads=True)
-    return dict(**charge, **active.peaks, before=before, after=after, seconds=time.monotonic() - started,
+    elapsed = time.monotonic() - started
+    census = dict(census=allocation_census(active)) if hasattr(active, "census") else {}
+    return dict(**charge, **census, **active.peaks, before=before, after=after, seconds=elapsed,
                 cpu_ms=(after["cpu_seconds"] - before["cpu_seconds"]) * 1000,
                 switches=after["ctx_switches"] - before["ctx_switches"])
 
 
-def sample(binary, probe_binary, output, stored, count, turns, size, idle_seconds):
+def sample(binary, probe_binary, output, stored, count, turns, size, idle_seconds, census=False, vmmap=None):
     with daemon(str(binary), output) as active:
         # lifecycle owns startup/teardown; restart applies this benchmark's
         # hibernation interval without changing the shared helper or product.
@@ -354,8 +679,15 @@ def sample(binary, probe_binary, output, stored, count, turns, size, idle_second
         active.client.wait(timeout=30)
         stop_daemon(binary, active.env, active.home)
         (active.home / "config.toml").write_text('[daemon]\nagent="echo"\nidle_secs=600\nhibernate_secs=1\n')
+        if census:
+            active.census = active.home / "alloc-census"
+            active.census_output = output
+            active.vmmap, active.census_index = vmmap, 0
+            active.census.mkdir()
         checked([str(binary), "ls"], env=active.env, cwd=active.home, timeout=60)
         active.pid = int((active.home / "run/daemon.pid").read_text().splitlines()[0])
+        if census:
+            allocation_census(active)  # warm diagnostic buffers before catalog seeding
         probe = Probe(probe_binary, active)
         with contextlib.ExitStack() as stack:
             stack.enter_context(contextlib.closing(probe))
@@ -427,6 +759,9 @@ def summarize(records):
             for key in ("peak_rss_kib", "peak_footprint_kib"):
                 if key in s["after"]:
                     values[key] = s["after"][key]
+            if "census" in s:
+                values.update({metric.removesuffix("_bytes") + "_kib": s["census"][metric] / 1024 for metric in
+                               ("allocated_bytes", "retained_free_bytes", "allocator_bytes")})
             if s.get("attach"):
                 values["reattach_ms"] = max(a["ms"] for a in s["attach"])
             key = f'{r["label"]}/stored={r["stored"]}/active={r["active"]}/{name}'
@@ -436,6 +771,10 @@ def summarize(records):
                                ("wave2_hibernated", "wave1_hibernated")):
             key = f'{r["label"]}/stored={r["stored"]}/active={r["active"]}/{later}-minus-{earlier}'
             group = groups.setdefault(key, {})
+            if "census" in r["stages"][later]:
+                for metric in ("allocated_bytes", "retained_free_bytes", "allocator_bytes"):
+                    group.setdefault(metric.removesuffix("_bytes") + "_kib", []).append((r["stages"][later]["census"][metric] -
+                                                         r["stages"][earlier]["census"][metric]) / 1024)
             for metric, value in dict(
                 charged_kib=(r["stages"][later]["charged_bytes"] - r["stages"][earlier]["charged_bytes"]) / 1024,
                 rss_kib=r["stages"][later]["before"]["rss_kib"] - r["stages"][earlier]["before"]["rss_kib"],
@@ -445,6 +784,26 @@ def summarize(records):
 
 
 class ResidencyTests(unittest.TestCase):
+    def test_census_is_available_only_after_isolated_daemon_opt_in(self):
+        if not (binary := os.environ.get("RESIDENCY_BINARY")):
+            self.skipTest("set RESIDENCY_BINARY to a release fixture executable")
+        with daemon(binary) as active:
+            active.census = active.home / "alloc-census"
+            assert not active.census.exists()
+            active.client.stdin.close()
+            active.client.wait(timeout=30)
+            stop_daemon(binary, active.env, active.home)
+            active.census.mkdir()
+            checked([binary, "ls"], env=active.env, cwd=active.home, timeout=60)
+            active.pid = int((active.home / "run/daemon.pid").read_text().splitlines()[0])
+            if sys.platform == "darwin":
+                with self.assertRaisesRegex(RuntimeError, "native census requires glibc or Windows"):
+                    allocation_census(active)
+            else:
+                value = allocation_census(active)
+                self.assertGreater(value["allocated_bytes"], 0)
+                self.assertGreaterEqual(value["allocator_bytes"], value["allocated_bytes"])
+
     def test_full_lifecycle_preserves_history_and_slow_followers_own_only_their_session(self):
         binary, probe = os.environ.get("RESIDENCY_BINARY"), os.environ.get("RESIDENCY_PROBE")
         if not binary or not probe:
@@ -462,6 +821,10 @@ def paired(records):
         for stage, value in r["stages"].items():
             key = f"stored={stored}/active={active}/{stage}"
             group = groups.setdefault(key, {})
+            if "census" in value:
+                for metric in ("allocated_bytes", "retained_free_bytes", "allocator_bytes"):
+                    group.setdefault(metric.removesuffix("_bytes") + "_kib", []).append(
+                        (value["census"][metric] - other["stages"][stage]["census"][metric]) / 1024)
             for metric, difference in dict(
                 charged_kib=(value["charged_bytes"] - other["stages"][stage]["charged_bytes"]) / 1024,
                 cpu_ms=value["cpu_ms"] - other["stages"][stage]["cpu_ms"],
@@ -482,6 +845,15 @@ def table(summary):
             value = row.get(metric)
             cells.append("" if value is None else "{median:.3f} [{min:.3f}, {max:.3f}]".format(**value))
         lines.append("| " + key + " | " + " | ".join(cells) + " |")
+    census = {key: row for key, row in summary.items() if "allocated_kib" in row}
+    if census:
+        lines.extend(["", "Instrumented native allocator observations; timings above are diagnostic only.", "",
+                      "| case/stage | allocator allocated KiB | allocator free capacity KiB | allocator total KiB |",
+                      "| --- | ---: | ---: | ---: |"])
+        for key, row in census.items():
+            cells = [f"{row[metric]['median']:.3f} [{row[metric]['min']:.3f}, {row[metric]['max']:.3f}]"
+                     for metric in ("allocated_kib", "retained_free_kib", "allocator_kib")]
+            lines.append("| " + " | ".join([key, *cells]) + " |")
     return "\n".join(lines) + "\n"
 
 
@@ -493,6 +865,9 @@ def main():
     parser.add_argument("--binary", type=Path)
     parser.add_argument("--probe", type=Path)
     parser.add_argument("--build-only", action="store_true")
+    parser.add_argument("--cases", help="explicit stored:active pairs for a focused diagnostic cohort")
+    parser.add_argument("--vmmap", type=Path, help="native VMMap executable; census diagnostics only")
+    parser.add_argument("--census", action="store_true", help="instrumented native allocator cohort; excluded from timing claims")
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--stored", default="1,8,32")
     parser.add_argument("--active", default="1,4,8")
@@ -500,16 +875,42 @@ def main():
     parser.add_argument("--bytes", type=int, default=65536)
     parser.add_argument("--idle-seconds", type=float, default=1)
     args = parser.parse_args()
+    # Do not inherit provider credentials or proxy routing into fixture processes.
+    keep = {"PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TMP", "TEMP", "LANG",
+            "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
+            "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMDATA", "NUMBER_OF_PROCESSORS",
+            "RUNNER_TEMP", "GITHUB_STEP_SUMMARY"}
+    clean = {key: value for key, value in os.environ.items()
+             if "PROXY" not in key.upper()
+             and (key.upper() in keep or key.startswith(("CARGO_", "RUST", "MISE_", "MBX_")))}
+    os.environ.clear()
+    os.environ.update(clean, OPENAI_API_KEY="loopback-dummy", OPENAI_BASE_URL="http://127.0.0.1:1/v1",
+                      NO_PROXY="127.0.0.1,localhost", CARGO_BUILD_JOBS="2")
+    if args.census and sys.platform not in ("linux", "win32"):
+        parser.error("native census cohort requires glibc Linux or Windows")
+    if args.vmmap and (not args.census or sys.platform != "win32"):
+        parser.error("VMMap requires a native Windows census cohort")
     if args.rounds < 5:
         parser.error("at least five interleaved rounds are required")
     stored, counts = [int(n) for n in args.stored.split(",")], [int(n) for n in args.active.split(",")]
     if min(stored + counts) < 1 or max(counts) > max(stored) or args.turns < 1 or args.bytes < 1 or args.idle_seconds <= 0:
         parser.error("positive populations/work required, with active <= maximum stored")
+    cases = list(dict.fromkeys([(1, 0), *((n, 1) for n in stored), *((max(stored), n) for n in counts)]))
+    if args.cases:
+        try:
+            cases = [tuple(map(int, pair.split(":"))) for pair in args.cases.split(",")]
+            if any(len(pair) != 2 or pair[0] < 1 or pair[1] < 0 or pair[1] > pair[0] for pair in cases):
+                raise ValueError("invalid populations")
+        except ValueError:
+            parser.error("cases must be stored:active pairs with 0 <= active <= stored")
     output, target, source = args.output.resolve(), args.target.resolve(), args.source.resolve()
     if (output / "residency.jsonl").exists() or (output / "residency-failures.jsonl").exists():
         parser.error("select a fresh output directory; existing samples must not be mixed")
     output.mkdir(parents=True, exist_ok=True)
-    binary = args.binary.resolve() if args.binary else stage(executable(source, environment(target), ["--features", "fixtures"]), output / ("a-fixtures" + SUFFIX))
+    if args.census:
+        cargo_run(["cargo", "nextest", "run", "-p", "sys", "--features", "fixtures"],
+                  cwd=source, env=environment(target), check=True)
+    binary = args.binary.resolve() if args.binary else stage(executable(source, environment(target), ["--features", "fixtures"], run=cargo_run), output / ("a-fixtures" + SUFFIX))
     probe = args.probe.resolve() if args.probe else build_probe(source, output, target)
     from hosted import hardware
     metadata = dict(hardware=hardware(), platform=platform.platform(), machine=platform.machine(),
@@ -517,11 +918,10 @@ def main():
                     working_tree=subprocess.check_output(["git", "status", "--short"], cwd=source, text=True),
                     workload_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                     binaries={str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in (binary, probe)},
-                    parameters=dict(stored=stored, active=counts, turns=args.turns, bytes=args.bytes, idle_seconds=args.idle_seconds))
+                    parameters=dict(census=args.census, cases=cases, vmmap=str(args.vmmap) if args.vmmap else None, stored=stored, active=counts, turns=args.turns, bytes=args.bytes, idle_seconds=args.idle_seconds))
     (output / "residency-host.json").write_text(json.dumps(metadata, indent=2) + "\n")
     if args.build_only:
         return
-    cases = list(dict.fromkeys([(1, 0), *((n, 1) for n in stored), *((max(stored), n) for n in counts)]))
     records = []
     for round in range(args.rounds):
         for total, active in (cases if round % 2 == 0 else list(reversed(cases))):
@@ -529,7 +929,7 @@ def main():
                 print(f"round={round} {label} stored={total} active={active}", flush=True)
                 record = dict(round=round, label=label, stored=total, active=active)
                 try:
-                    record["stages"] = sample(binary, probe, output, total, active, args.turns, args.bytes, args.idle_seconds)
+                    record["stages"] = sample(binary, probe, output, total, active, args.turns, args.bytes, args.idle_seconds, args.census, args.vmmap)
                 except Exception as error:
                     record["failure"] = repr(error)
                     with (output / "residency-failures.jsonl").open("a") as stream:

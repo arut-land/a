@@ -13,6 +13,8 @@
 
 pub mod autostart;
 mod awake;
+#[cfg(feature = "fixtures")]
+pub mod census;
 pub mod config;
 pub mod console;
 pub mod crash;

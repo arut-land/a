@@ -2025,6 +2025,7 @@ fn question_paste_stays_literal_and_its_draft_survives_until_the_answer_is_commi
                     title: None,
                     description: None,
                     required: true,
+                    sensitive: false,
                     default: None,
                     kind: protocol::FieldKind::String {
                         min: None,
@@ -2073,6 +2074,11 @@ fn every_url_in_a_question_requires_an_explicit_open_action() {
                     index.to_string(),
                     protocol::Prompt::Url {
                         message: "Open".into(),
+                        destination: protocol::Destination {
+                            origin: "https://example.com".into(),
+                            raw_origin: None,
+                            suspicious: false,
+                        },
                         url: url.into(),
                     },
                 )
@@ -2230,4 +2236,136 @@ fn inline_history_prints_every_large_item_continuation_once_across_resize() {
         text.matches("residency-marker").count()
     );
     assert!(app.unprinted_history().is_none());
+}
+
+#[test]
+fn sensitive_question_input_is_masked_and_restored_only_as_an_answer_fact() {
+    let question = protocol::Question {
+        source: "misleading fixture".into(),
+        prompts: std::collections::BTreeMap::from([(
+            "credentials".into(),
+            protocol::Prompt::Form {
+                message: "Sign in".into(),
+                fields: vec![protocol::Field {
+                    name: "password".into(),
+                    title: None,
+                    description: None,
+                    required: true,
+                    sensitive: true,
+                    default: None,
+                    kind: protocol::FieldKind::String {
+                        min: None,
+                        max: None,
+                        format: None,
+                    },
+                }],
+            },
+        )]),
+    };
+    let (mut app, _) = app(Viewport::Full, &[]);
+    keys(&mut app, "saved draft");
+    app.fold(&entry(1, Body::Question { question }));
+    keys(&mut app, "fixture-secret");
+    let (_, rows) = frame(&mut app, 160, 40);
+    let shown = rows.join("\n");
+    assert!(!shown.contains("fixture-secret"));
+    assert!(shown.contains("••••"));
+    assert!(shown.contains("misleading fixture"));
+    assert!(shown.contains("sensitive information"));
+    let Some(Effect::Cmd(Cmd::Answer { answer, .. })) = press(&mut app, Key::Ctrl('s')) else {
+        panic!("answer")
+    };
+    let protocol::Response::Submit(values) = &answer.responses["credentials"] else {
+        panic!("submitted")
+    };
+    assert_eq!(
+        values["password"].parse::<String>().unwrap(),
+        "fixture-secret"
+    );
+    app.fold(&entry(
+        2,
+        Body::Answer {
+            call: CallId::new(1).unwrap(),
+            value: Json::encode(&answer).unwrap(),
+            origin: None,
+        },
+    ));
+    let (_, rows) = frame(&mut app, 160, 40);
+    assert!(!rows.join("\n").contains("fixture-secret"));
+    assert_eq!(app.editor.text(), "saved draft");
+}
+
+#[test]
+fn suspicious_destination_spellings_are_visible_before_explicit_navigation() {
+    let vectors: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../crates/protocol/tests/vectors/view.json"
+    ))
+    .unwrap();
+    let vector = vectors
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["name"] == "sensitive answers never enter client history")
+        .unwrap();
+    let message = <DaemonMsg as protocol::Decode>::from_json(
+        vector["frames"][1].as_str().unwrap().as_bytes(),
+    )
+    .unwrap();
+    let (mut app, _) = app(Viewport::Full, &[message]);
+    let (_, rows) = frame(&mut app, 160, 40);
+    let shown = rows.join("\n");
+    assert!(shown.contains("https://аpple.com"));
+    assert!(shown.contains("https://xn--pple-43d.com"));
+    assert!(shown.contains("confusable host"));
+    let Some(Effect::OpenUrl(url)) = press(&mut app, Key::Ctrl('o')) else {
+        panic!("explicit navigation")
+    };
+    assert_eq!(url, "https://xn--pple-43d.com/consent");
+}
+
+#[test]
+fn sensitive_choices_expose_the_available_mapping_and_mask_both_selection_inputs() {
+    let vectors: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../crates/protocol/tests/vectors/view.json"
+    ))
+    .unwrap();
+    let vector = vectors
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["name"] == "sensitive choices retain titled options")
+        .unwrap();
+    let message = <DaemonMsg as protocol::Decode>::from_json(
+        vector["frames"][1].as_str().unwrap().as_bytes(),
+    )
+    .unwrap();
+    let (mut app, _) = app(Viewport::Full, &[message]);
+    keys(&mut app, "opaque-read");
+    let (_, rows) = frame(&mut app, 160, 40);
+    for label in ["Read access", "Write access", "opaque-read", "opaque-write"] {
+        assert!(rows.join("\n").contains(label));
+    }
+    let input = rows.iter().find(|row| row.contains("❯ ")).unwrap();
+    assert!(input.contains("••••"));
+    assert!(!input.contains("opaque-read"));
+    press(&mut app, Key::Tab);
+    keys(&mut app, "[\"opaque-read\",\"opaque-write\"]");
+    let (_, rows) = frame(&mut app, 160, 40);
+    let input = rows.iter().find(|row| row.contains("❯ ")).unwrap();
+    assert!(input.contains("••••"));
+    assert!(!input.contains("opaque-write"));
+    let Some(Effect::Cmd(Cmd::Answer { answer, .. })) = press(&mut app, Key::Ctrl('s')) else {
+        panic!("choice answer")
+    };
+    let protocol::Response::Submit(values) = &answer.responses["permissions"] else {
+        panic!("submitted")
+    };
+    assert_eq!(
+        values["permissions0"].parse::<String>().unwrap(),
+        "opaque-read"
+    );
+    assert_eq!(
+        values["permissions1"].parse::<Vec<String>>().unwrap(),
+        ["opaque-read", "opaque-write"]
+    );
 }
