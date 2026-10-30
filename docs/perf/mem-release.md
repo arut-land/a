@@ -5,7 +5,8 @@ Current paged-protocol measurements do not establish a consistent charged-memory
 benefit across the required platforms. The final production code does not trim
 at hibernation. Part B keeps the behavior-preserving ownership changes below.
 
-Timing reference: `8d2b9e8d`; census reference: `455a92e7`. Both use paged
+Local component and uninstrumented M3 reference: `8d2b9e8d`. Corrected hosted
+comparisons and all census cohorts use reference `455a92e7`. Both use paged
 protocol 43. Main `52809dde` and then `b574d6e8` were merged. Their intervening
 changes are tests, CI settings and a rustdoc-link correction; the measured
 release production paths are unchanged. Measurements retain their actual pinned
