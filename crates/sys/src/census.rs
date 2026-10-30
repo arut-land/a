@@ -52,6 +52,24 @@ fn snapshot() -> io::Result<serde_json::Value> {
     Ok(value)
 }
 
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+struct MallocBuffer(*mut libc::c_char);
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+impl Drop for MallocBuffer {
+    fn drop(&mut self) {
+        // SAFETY: fclose transfers the open_memstream malloc allocation; null is allowed.
+        unsafe { libc::free(self.0.cast()) };
+    }
+}
+
+#[cfg_attr(
+    target_os = "macos",
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "other native allocators expose fallible snapshots"
+    )
+)]
 fn native_snapshot() -> io::Result<serde_json::Value> {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
@@ -68,9 +86,10 @@ fn native_snapshot() -> io::Result<serde_json::Value> {
         let status = unsafe { libc::malloc_info(0, stream) };
         // SAFETY: stream is open and is closed exactly once here.
         let closed = unsafe { libc::fclose(stream) };
-        let result = if status == 0 && closed == 0 {
+        let buffer = MallocBuffer(buffer);
+        if status == 0 && closed == 0 {
             // SAFETY: successful fclose publishes a NUL-terminated buffer.
-            let xml = unsafe { CStr::from_ptr(buffer) }
+            let xml = unsafe { CStr::from_ptr(buffer.0) }
                 .to_string_lossy()
                 .into_owned();
             // SAFETY: mallinfo2 takes no pointers and snapshots allocator counters.
@@ -80,10 +99,7 @@ fn native_snapshot() -> io::Result<serde_json::Value> {
                 "mallinfo2_free_bytes": info.fordblks}))
         } else {
             Err(io::Error::last_os_error())
-        };
-        // SAFETY: open_memstream allocates the buffer with malloc; null is allowed.
-        unsafe { libc::free(buffer.cast()) };
-        result
+        }
     }
     #[cfg(windows)]
     {
@@ -115,10 +131,39 @@ fn native_snapshot() -> io::Result<serde_json::Value> {
         }
         Ok(serde_json::json!({"allocator": "windows-heaps", "heaps": rows}))
     }
-    #[cfg(not(any(windows, all(target_os = "linux", target_env = "gnu"))))]
+    #[cfg(target_os = "macos")]
+    {
+        #[repr(C)]
+        struct Statistics {
+            blocks_in_use: u32,
+            size_in_use: usize,
+            max_size_in_use: usize,
+            size_allocated: usize,
+        }
+        unsafe extern "C" {
+            fn malloc_zone_statistics(zone: *mut std::ffi::c_void, stats: *mut Statistics);
+        }
+        let mut stats = std::mem::MaybeUninit::<Statistics>::uninit();
+        // SAFETY: null sums every zone; the SDK ABI fills all fields of this output.
+        let stats = unsafe {
+            malloc_zone_statistics(std::ptr::null_mut(), stats.as_mut_ptr());
+            stats.assume_init()
+        };
+        Ok(
+            serde_json::json!({"allocator": "apple-malloc", "statistics": {
+                "blocks_in_use": stats.blocks_in_use, "size_in_use": stats.size_in_use,
+                "max_size_in_use": stats.max_size_in_use, "size_allocated": stats.size_allocated,
+            }}),
+        )
+    }
+    #[cfg(not(any(
+        windows,
+        target_os = "macos",
+        all(target_os = "linux", target_env = "gnu")
+    )))]
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "native census requires glibc or Windows",
+        "native census requires glibc, macOS or Windows",
     ))
 }
 
@@ -126,13 +171,19 @@ fn native_snapshot() -> io::Result<serde_json::Value> {
 mod tests {
     use super::*;
 
-    #[cfg(any(windows, all(target_os = "linux", target_env = "gnu")))]
+    #[cfg(any(
+        windows,
+        target_os = "macos",
+        all(target_os = "linux", target_env = "gnu")
+    ))]
     #[test]
     fn freed_large_allocation_is_no_longer_counted_as_allocated() {
         fn allocated() -> u64 {
             let value = snapshot().unwrap();
             if value["allocator"] == "glibc" {
                 value["mallinfo2_allocated_bytes"].as_u64().unwrap()
+            } else if value["allocator"] == "apple-malloc" {
+                value["statistics"]["size_in_use"].as_u64().unwrap()
             } else {
                 value["heaps"]
                     .as_array()

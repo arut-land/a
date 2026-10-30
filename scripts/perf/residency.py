@@ -29,7 +29,8 @@ def cargo_run(command, **kwargs):
     cargo = subprocess.check_output(["rustup", "which", "cargo"], cwd=kwargs.get("cwd"),
                                     env=kwargs.get("env"), text=True).strip()
     try:
-        return subprocess.run(["mise", "exec", "--", cargo, *command[1:]], **kwargs)
+        return subprocess.run(["mise", "exec", *(["cargo:cargo-nextest@0.9.150"] if command[1] == "nextest" else []),
+                               "--", cargo, *command[1:]], **kwargs)
     except subprocess.CalledProcessError as error:
         if error.stdout:
             print(error.stdout, file=sys.stderr)
@@ -539,17 +540,6 @@ mod tests {
 '''
 
 
-def cargo_run(command, **kwargs):
-    if command[0] == "cargo":
-        toolchain = os.environ.get("RUSTUP_TOOLCHAIN")
-        if not toolchain:
-            with (Path(kwargs["cwd"]) / "rust-toolchain.toml").open("rb") as stream:
-                toolchain = tomllib.load(stream)["toolchain"]["channel"]
-        command = ["mise", "exec", *(["cargo:cargo-nextest@0.9.150"] if command[1] == "nextest" else []),
-                   "--", "rustup", "run", toolchain, "cargo", *command[1:]]
-    return subprocess.run(command, **kwargs)
-
-
 def build_probe(source, output, target):
     root = target / "residency-probe-source"
     root.mkdir(parents=True, exist_ok=True)
@@ -655,6 +645,11 @@ def allocation_census(active):
         mapped = totals["mmap"]
         value.update(allocated_bytes=arena - free + mapped, retained_free_bytes=free,
                      allocator_bytes=arena + mapped)
+    elif value["allocator"] == "apple-malloc":
+        stats = value["statistics"]
+        value.update(allocated_bytes=stats["size_in_use"],
+                     retained_free_bytes=stats["size_allocated"] - stats["size_in_use"],
+                     allocator_bytes=stats["size_allocated"])
     else:
         allocated = sum(row["allocated_bytes"] for row in value["heaps"])
         committed = sum(row["committed_bytes"] for row in value["heaps"])
@@ -821,13 +816,9 @@ class ResidencyTests(unittest.TestCase):
             active.census.mkdir()
             checked([binary, "ls"], env=active.env, cwd=active.home, timeout=60)
             active.pid = int((active.home / "run/daemon.pid").read_text().splitlines()[0])
-            if sys.platform == "darwin":
-                with self.assertRaisesRegex(RuntimeError, "native census requires glibc or Windows"):
-                    allocation_census(active)
-            else:
-                value = allocation_census(active)
-                self.assertGreater(value["allocated_bytes"], 0)
-                self.assertGreaterEqual(value["allocator_bytes"], value["allocated_bytes"])
+            value = allocation_census(active)
+            self.assertGreater(value["allocated_bytes"], 0)
+            self.assertGreaterEqual(value["allocator_bytes"], value["allocated_bytes"])
 
     def test_full_lifecycle_preserves_history_and_slow_followers_own_only_their_session(self):
         binary, probe = os.environ.get("RESIDENCY_BINARY"), os.environ.get("RESIDENCY_PROBE")
@@ -899,6 +890,7 @@ def main():
         "RUSTUP_HOME", "RUSTUP_TOOLCHAIN", "CARGO_HOME", "CARGO_TARGET_DIR",
         "CARGO_PROFILE_DEV_CODEGEN_BACKEND", "RUSTFLAGS", "RUSTC_WRAPPER",
         "MISE_DATA_DIR", "MISE_CACHE_DIR", "MISE_CONFIG_DIR", "MISE_AUTO_INSTALL",
+        "MISE_IGNORED_CONFIG_PATHS", "MISE_CARGO_BINSTALL_NATIVE",
         "RUNNER_TEMP", "RUNNER_OS", "RUNNER_ARCH", "GITHUB_STEP_SUMMARY",
     }
     clean = {key: value for key, value in os.environ.items() if key.upper() in keep}
@@ -926,8 +918,8 @@ def main():
     parser.add_argument("--bytes", type=int, default=65536)
     parser.add_argument("--idle-seconds", type=float, default=1)
     args = parser.parse_args()
-    if args.census and sys.platform not in ("linux", "win32"):
-        parser.error("native census cohort requires glibc Linux or Windows")
+    if args.census and sys.platform not in ("linux", "win32", "darwin"):
+        parser.error("native census cohort requires glibc Linux, macOS or Windows")
     if args.vmmap and (not args.census or sys.platform != "win32"):
         parser.error("VMMap requires a native Windows census cohort")
     if args.rounds < 5:
@@ -963,6 +955,9 @@ def main():
                     revision=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip(),
                     working_tree=subprocess.check_output(["git", "status", "--short"], cwd=source, text=True),
                     workload_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                    reference_revision=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=args.reference_source, text=True).strip() if args.reference_source else None,
+                    reference_working_tree=subprocess.check_output(["git", "status", "--short"], cwd=args.reference_source, text=True) if args.reference_source else None,
+                    census_module_sha256=hashlib.sha256((source / "crates/sys/src/census.rs").read_bytes()).hexdigest() if args.census else None,
                     binaries={str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in (binary, reference, probe)},
                     labels=dict(A=str(reference), A2=str(binary)),
                     parameters=dict(census=args.census, cases=cases, vmmap=str(args.vmmap) if args.vmmap else None, stored=stored, active=counts, turns=args.turns, bytes=args.bytes, idle_seconds=args.idle_seconds))

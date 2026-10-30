@@ -112,7 +112,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: ${{ fromJSON(inputs.census_vmmap && inputs.runner == 'all' && '["windows-latest", "windows-11-arm"]' || inputs.alloc_census && inputs.runner == 'all' && '["ubuntu-latest", "ubuntu-24.04-arm", "windows-latest", "windows-11-arm"]' || inputs.runner == 'linux-windows' && '["ubuntu-latest", "windows-latest"]' || inputs.runner && inputs.runner != 'all' && format('["{0}"]', inputs.runner) || '["ubuntu-latest", "ubuntu-24.04-arm", "windows-latest", "windows-11-arm", "macos-latest", "macos-15-intel"]') }}
+        runner: ${{ fromJSON(inputs.census_vmmap && inputs.runner == 'all' && '["windows-latest", "windows-11-arm"]' || inputs.alloc_census && inputs.runner == 'all' && '["ubuntu-latest", "ubuntu-24.04-arm", "windows-latest", "windows-11-arm", "macos-latest", "macos-15-intel"]' || inputs.runner == 'linux-windows' && '["ubuntu-latest", "windows-latest"]' || inputs.runner && inputs.runner != 'all' && format('["{0}"]', inputs.runner) || '["ubuntu-latest", "ubuntu-24.04-arm", "windows-latest", "windows-11-arm", "macos-latest", "macos-15-intel"]') }}
     defaults:
       run:
         shell: bash
@@ -200,6 +200,25 @@ jobs:
           with open(os.environ['GITHUB_ENV'], 'a') as env:
               env.write(f'PERF_VMMAP={executable}\n')
           PYTHON
+      - name: Share identical fixture instrumentation between paired sources
+        if: inputs.alloc_census || inputs.census_vmmap
+        env:
+          REFERENCE: ${{ inputs.paired_ref }}
+        run: |
+          python - <<'PYTHON'
+          import hashlib, json, os, pathlib, subprocess
+          module = pathlib.Path('measured/crates/sys/src/census.rs').read_bytes()
+          output = pathlib.Path(os.environ['RUNNER_TEMP']) / 'residency-output'
+          output.mkdir(exist_ok=True)
+          (output / 'census-module.rs').write_bytes(module)
+          if os.environ['REFERENCE']:
+              pathlib.Path('reference/crates/sys/src/census.rs').write_bytes(module)
+              patch = subprocess.check_output(['git', '-C', 'reference', 'diff', '--', 'crates/sys/src/census.rs'])
+              (output / 'census-instrumentation.patch').write_bytes(patch)
+          (output / 'census-instrumentation.json').write_text(json.dumps(dict(
+              module_sha256=hashlib.sha256(module).hexdigest(),
+              reference=os.environ['REFERENCE']), indent=2))
+          PYTHON
       - name: Build and measure complete ownership waves
         if: runner.os != 'Windows'
         working-directory: harness
@@ -208,6 +227,9 @@ jobs:
         run: |
           reference=()
           if [[ -n "$REFERENCE" ]]; then reference+=(--reference-source ../reference); fi
+          if [[ "$PERF_ALLOC_CENSUS" == true ]]; then reference+=(--census); fi
+          if [[ -n "$PERF_RESIDENCY_CASES" ]]; then reference+=(--cases "$PERF_RESIDENCY_CASES"); fi
+          if [[ -n "${PERF_VMMAP:-}" ]]; then reference+=(--vmmap "$PERF_VMMAP"); fi
           python scripts/perf/residency.py --source ../measured --target "$CARGO_TARGET_DIR" --output "$RUNNER_TEMP/residency-output" --rounds "$PERF_PAIRED_ROUNDS" "${reference[@]}"
       - name: Build and measure complete ownership waves with MSVC
         if: runner.os == 'Windows'
@@ -217,7 +239,10 @@ jobs:
           REFERENCE: ${{ inputs.paired_ref }}
         run: |
           $reference = @()
-          if ($env:REFERENCE) { $reference = @('--reference-source', '../reference') }
+          if ($env:REFERENCE) { $reference += @('--reference-source', '../reference') }
+          if ($env:PERF_ALLOC_CENSUS -eq 'true') { $reference += '--census' }
+          if ($env:PERF_RESIDENCY_CASES) { $reference += @('--cases', $env:PERF_RESIDENCY_CASES) }
+          if ($env:PERF_VMMAP) { $reference += @('--vmmap', $env:PERF_VMMAP) }
           python scripts/perf/residency.py --source ../measured --target $env:CARGO_TARGET_DIR --output "$env:RUNNER_TEMP/residency-output" --rounds $env:PERF_PAIRED_ROUNDS @reference
       - uses: actions/upload-artifact@v5
         if: always()
