@@ -71,7 +71,7 @@ pub struct ClientHandle(Arc<Handle>);
 
 #[derive(Clone)]
 enum Purpose {
-    Session(Attach),
+    Session(Box<Attach>),
     Watch(ClientId),
 }
 
@@ -143,13 +143,12 @@ impl Outbox {
                 _ => 0,
             },
             Request::Connect {
-                purpose:
-                    Purpose::Session(Attach {
-                        env: crate::Env::Given(env),
-                        ..
-                    }),
+                purpose: Purpose::Session(attach),
                 ..
-            } => env.retained_bytes(),
+            } => match &attach.env {
+                crate::Env::Given(env) => env.retained_bytes(),
+                _ => 0,
+            },
             Request::Connect { .. } | Request::Flush(_) => 0,
         };
         let mutation = request.mutation();
@@ -565,7 +564,7 @@ impl ClientHandle {
                 restart,
             } => Request::Connect {
                 conn,
-                purpose: Purpose::Session(attach),
+                purpose: Purpose::Session(Box::new(attach)),
                 restart,
             },
             io => Request::Io(Box::new(io)),
@@ -1119,7 +1118,10 @@ mod tests {
         assert_eq!(
             queue.send(Request::Connect {
                 conn: ConnId(2),
-                purpose: Purpose::Session(Attach::new(Target::New, crate::Env::Given(oversized))),
+                purpose: Purpose::Session(Box::new(Attach::new(
+                    Target::New,
+                    crate::Env::Given(oversized)
+                ))),
                 restart: false
             }),
             Err(Error::Busy)

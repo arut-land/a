@@ -108,6 +108,8 @@ pub struct Attach {
     /// The directory the daemon finds the workspace from; `None` is the
     /// environment's.
     pub workspace: Option<protocol::HostPath>,
+    /// Renderer declarations sent when this connection attaches.
+    pub decl: protocol::ClientDecl,
 }
 
 impl Attach {
@@ -118,6 +120,7 @@ impl Attach {
             since: 0,
             env,
             workspace: None,
+            decl: protocol::ClientDecl::default(),
         }
     }
 }
@@ -278,6 +281,7 @@ pub struct SessionClient {
     history: crate::history::History,
     heads: protocol::history::Heads,
     readers: std::collections::BTreeMap<u64, crate::history::History>,
+    sides: std::collections::BTreeMap<String, crate::history::Side>,
     view_current: bool,
     sessions: SessionList,
     /// The daemon's slash commands.
@@ -307,6 +311,7 @@ impl SessionClient {
             history: crate::history::History::default(),
             heads: protocol::history::Heads::default(),
             readers: std::collections::BTreeMap::default(),
+            sides: std::collections::BTreeMap::default(),
             view_current: false,
             sessions: SessionList::default(),
             commands: Vec::new(),
@@ -326,6 +331,45 @@ impl SessionClient {
 
     pub const fn view(&self) -> &SessionView {
         &self.view
+    }
+
+    /// Declares the side purposes whose completed values this UI needs.
+    pub fn demand_sides(&mut self, purposes: impl IntoIterator<Item = String>) -> Vec<Effect> {
+        let wanted: std::collections::BTreeSet<_> = purposes.into_iter().collect();
+        if self.sides.keys().eq(wanted.iter()) {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        self.sides.retain(|purpose, side| {
+            if wanted.contains(purpose) {
+                return true;
+            }
+            if let Some(cancel) = side.history.close() {
+                out.push(Effect::Io(Io::Send(cancel)));
+            }
+            false
+        });
+        let removed: Vec<_> = self
+            .view
+            .sides
+            .keys()
+            .filter(|purpose| !wanted.contains(*purpose))
+            .cloned()
+            .collect();
+        for purpose in removed {
+            out.push(Effect::Show(Show::View(
+                self.view
+                    .side_range(purpose, protocol::view::Items::default()),
+            )));
+        }
+        for purpose in &wanted {
+            self.sides.entry(purpose.clone()).or_default();
+        }
+        self.opened.decl.sides = wanted.into_iter().collect();
+        if self.link.up() {
+            out.extend(self.send(ClientMsg::Declare(self.opened.decl.clone())));
+        }
+        out
     }
 
     /// Changes this renderer's demanded history range, preserving drafts and controls.
@@ -480,6 +524,7 @@ impl SessionClient {
             self.submission = None;
         }
         let mut attach = attach;
+        attach.decl.sides = self.sides.keys().cloned().collect();
         attach.client = self.opened.client;
         self.opened = attach.clone();
         self.connect(attach, false, Link::Connecting, &mut out);
@@ -542,7 +587,7 @@ impl SessionClient {
                             workspace: None,
                             since: 0,
                             env: None,
-                            decl: protocol::ClientDecl::default(),
+                            decl: offer.0.opened.decl.clone(),
                         })
                         .into_iter()
                         .collect()
@@ -650,6 +695,28 @@ impl SessionClient {
         done: bool,
         out: &mut Vec<Effect>,
     ) {
+        if let Some((purpose, side)) = self
+            .sides
+            .iter_mut()
+            .find(|(_, side)| side.history.owns(id))
+        {
+            match side.history.part(id, offset, text, done) {
+                Ok((loaded, messages)) => {
+                    out.extend(
+                        messages
+                            .into_iter()
+                            .map(|message| Effect::Io(Io::Send(message))),
+                    );
+                    if let Some(loaded) = loaded {
+                        out.push(Effect::Show(Show::View(
+                            self.view.side_range(purpose.clone(), loaded.items),
+                        )));
+                    }
+                }
+                Err(error) => out.push(Effect::Show(Show::Notice(Notice::NotSent(error.into())))),
+            }
+            return;
+        }
         if let Some((&reader, history)) = self
             .readers
             .iter_mut()
@@ -719,7 +786,8 @@ impl SessionClient {
                 id,
                 outcome: protocol::Outcome::Failed { error },
             } => {
-                if self.history.failed(*id)
+                if self.failed_side(*id)
+                    || self.history.failed(*id)
                     || self.readers.values_mut().any(|history| history.failed(*id))
                 {
                     out.push(Effect::Show(Show::Notice(Notice::NotSent(
@@ -735,6 +803,14 @@ impl SessionClient {
                 return;
             }
             DaemonMsg::Attached { session, .. } => {
+                if self.view.session != Some(*session) {
+                    for side in self.sides.values_mut() {
+                        side.reference = None;
+                        if let Some(cancel) = side.history.close() {
+                            out.push(Effect::Io(Io::Send(cancel)));
+                        }
+                    }
+                }
                 self.opened.target = Target::Id(*session);
                 self.view_current = true;
             }
@@ -779,7 +855,61 @@ impl SessionClient {
         self.publish(msg, out);
     }
 
+    fn failed_side(&mut self, id: u64) -> bool {
+        self.sides.values_mut().any(|side| {
+            if !side.history.failed(id) {
+                return false;
+            }
+            side.reference = None;
+            true
+        })
+    }
+
     fn accept_head(&mut self, head: &protocol::history::Head, out: &mut Vec<Effect>) {
+        for (purpose, side) in &mut self.sides {
+            let reference = head.sides.get(purpose).map(|reference| {
+                (
+                    protocol::history::Cut {
+                        seq: reference.revision,
+                        ..head.cut
+                    },
+                    reference.index,
+                )
+            });
+            if !side.history.same_generation(head.cut)
+                || (reference.is_none() && side.reference.is_some())
+            {
+                out.push(Effect::Show(Show::View(
+                    self.view
+                        .side_range(purpose.clone(), protocol::view::Items::default()),
+                )));
+            }
+            if side.reference == reference {
+                continue;
+            }
+            side.reference = reference;
+            let messages = if let Some((cut, index)) = reference {
+                side.history.at(
+                    cut,
+                    head.count,
+                    crate::HistoryDemand {
+                        anchor: crate::HistoryAnchor::TextAfter {
+                            item: index,
+                            offset: 0,
+                        },
+                        bytes: usize::MAX,
+                        ..Default::default()
+                    },
+                )
+            } else {
+                side.history.release().into_iter().collect()
+            };
+            out.extend(
+                messages
+                    .into_iter()
+                    .map(|message| Effect::Io(Io::Send(message))),
+            );
+        }
         self.readers.retain(|&reader, history| {
             if history.same_generation(head.cut) {
                 return true;
@@ -854,11 +984,16 @@ impl SessionClient {
             },
             env: Env::Keep,
             workspace: self.opened.workspace.clone(),
+            decl: self.opened.decl.clone(),
         })
     }
 
     fn connect(&mut self, attach: Attach, restart: bool, link: Link, out: &mut Vec<Effect>) {
         self.conn.0 += 1;
+        for side in self.sides.values_mut() {
+            side.reference = None;
+            side.history.close();
+        }
         out.push(Effect::Io(Io::Connect {
             conn: self.conn,
             attach,
@@ -1087,6 +1222,158 @@ mod tests {
             conn: ConnId(conn),
             kind: EventKind::Closed(Error::Closed),
         }
+    }
+
+    fn side_entries() -> Vec<Entry> {
+        let mut entries = Vec::new();
+        for (purpose, text) in [("caption", "first"), ("internal-note", "private payload")] {
+            let call = CallId::new(entries.len() as u64 + 1).unwrap();
+            entries.push(Entry::new(
+                call.0,
+                Epoch(1),
+                Body::ModelCall {
+                    model: "m".into(),
+                    purpose: Some(purpose.into()),
+                    r#for: None,
+                    attempt: 0,
+                    choice: protocol::ToolChoice::None,
+                    request: None,
+                },
+            ));
+            entries.push(Entry::new(Seq::new(entries.len() as u64 + 1).unwrap(), Epoch(1), Body::ModelResult {
+                call,r#for:None,failure:None,
+                outcome:protocol::Outcome::Done {output:Json::encode(&serde_json::json!({"message":{"content":[{"type":"text","text":text}]}})).unwrap()},
+            }));
+        }
+        entries.push(Entry::new(
+            Seq::new(5).unwrap(),
+            Epoch(1),
+            Body::Assistant {
+                text: "visible tail".into(),
+            },
+        ));
+        entries
+    }
+
+    fn deliver_side_requests(
+        client: &mut SessionClient,
+        index: &protocol::view::Index,
+        entries: &[Entry],
+        effects: &[Effect],
+    ) -> Vec<Effect> {
+        let mut out = Vec::new();
+        for message in sends(effects) {
+            if let ClientMsg::History { id, range } = message {
+                let page = index
+                    .page(range, |seq| {
+                        Ok(entries[usize::try_from(seq.get()).unwrap() - 1].clone())
+                    })
+                    .unwrap();
+                out.extend(client.step(msg(
+                    1,
+                    DaemonMsg::HistoryPart {
+                        id: *id,
+                        offset: 0,
+                        text: serde_json::to_string(&page).unwrap(),
+                        done: true,
+                    },
+                )));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn requested_sides_share_pages_outside_the_presentation_window_and_release_them() {
+        let entries = side_entries();
+        let mut index = protocol::view::Index::new(SessionId::new(), "/w".into());
+        for entry in &entries {
+            index.apply(entry);
+        }
+        let head = index.head_for(Epoch(1), 0, &["caption".into()]);
+        let mut clients = Vec::new();
+        for _ in 0..2 {
+            let mut client = SessionClient::new(Env::Keep);
+            client.demand_sides(["caption".into()]);
+            client.open(Target::New);
+            client.step(live(1, Caps::ALL));
+            client.demand(crate::HistoryDemand {
+                anchor: crate::HistoryAnchor::After(2),
+                ..Default::default()
+            });
+            let effects = client.step(controls(head.clone()));
+            deliver_side_requests(&mut client, &index, &entries, &effects);
+            assert!(
+                matches!(&client.view().items[..], [protocol::view::Item::Assistant {text,..}] if text=="visible tail")
+            );
+            assert_eq!(client.view().side("caption"), Some("first"));
+            assert!(client.view().side("internal-note").is_none());
+            assert_eq!(client.view().sides.len(), 1);
+            clients.push(client);
+        }
+        let weak = clients[0].view().sides["caption"].downgrade();
+        assert!(std::ptr::eq(
+            std::ptr::from_ref(&clients[0].view().sides["caption"][0]),
+            std::ptr::from_ref(&clients[1].view().sides["caption"][0])
+        ));
+        let effects = clients[0].demand_sides([]);
+        assert!(
+            sends(&effects)
+                .iter()
+                .any(|msg| matches!(msg, ClientMsg::Declare(decl) if decl.sides.is_empty()))
+        );
+        assert!(clients[0].view().side("caption").is_none());
+        drop(clients.remove(0));
+        assert!(weak.upgrade().is_some());
+        drop(clients);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn side_replacements_wait_for_their_page_and_old_generations_cannot_publish() {
+        let mut entries = side_entries();
+        let mut index = protocol::view::Index::new(SessionId::new(), "/w".into());
+        for entry in &entries {
+            index.apply(entry);
+        }
+        let mut client = SessionClient::new(Env::Keep);
+        client.release_history();
+        client.demand_sides(["caption".into()]);
+        client.open(Target::New);
+        client.step(live(1, Caps::ALL));
+        let effects = client.step(controls(index.head_for(Epoch(1), 0, &["caption".into()])));
+        deliver_side_requests(&mut client, &index, &entries, &effects);
+        assert_eq!(client.view().side("caption"), Some("first"));
+        entries.extend([
+            Entry::new(Seq::new(6).unwrap(),Epoch(1),Body::ModelCall {
+                model:"m".into(),purpose:Some("caption".into()),r#for:None,
+                attempt:0,choice:protocol::ToolChoice::None,request:None,
+            }),
+            Entry::new(Seq::new(7).unwrap(),Epoch(1),Body::ModelResult {
+                call:CallId::new(6).unwrap(),r#for:None,failure:None,
+                outcome:protocol::Outcome::Done {output:Json::encode(&serde_json::json!({"message":{"content":[{"type":"text","text":"replacement"}]}})).unwrap()},
+            }),
+        ]);
+        for entry in &entries[5..] {
+            index.apply(entry);
+        }
+        let old = client.step(controls(index.head_for(Epoch(1), 5, &["caption".into()])));
+        assert_eq!(client.view().side("caption"), Some("first"));
+        let replacement = client.step(controls(index.head_for(Epoch(2), 0, &["caption".into()])));
+        assert!(
+            sends(&replacement)
+                .iter()
+                .any(|message| matches!(message, ClientMsg::Cancel { .. }))
+        );
+        assert!(client.view().side("caption").is_none());
+        deliver_side_requests(&mut client, &index, &entries, &old);
+        assert!(client.view().side("caption").is_none());
+        let effects = deliver_side_requests(&mut client, &index, &entries, &replacement);
+        assert!(effects.iter().any(|effect|matches!(effect, Effect::Show(Show::View(Update {change:Change::Metadata {purpose},..})) if purpose=="caption")));
+        assert_eq!(client.view().side("caption"), Some("replacement"));
+        assert!(client.view().items.is_empty());
+        client.demand_sides([]);
+        assert!(client.view().side("caption").is_none());
     }
 
     #[test]

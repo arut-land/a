@@ -899,3 +899,113 @@ fn attaching_history_does_not_materialize_unrequested_text_and_continuations_are
     }
     assert_eq!(recovered, text);
 }
+
+#[test]
+fn side_declarations_publish_only_selected_coordinates_and_ranges() {
+    let id = SessionId::new();
+    let fixture = Fixture::with("side-declarations", |home| seed_side_replies(home, id));
+    let mut peer = fixture.connect();
+    peer.send(&hello(Caps::ALL));
+    peer.send(&attach(Target::Id(id), 0, ClientDecl::default()));
+    let initial = peer.until(|msg| matches!(msg, DaemonMsg::Synced { .. }));
+    assert!(
+        initial
+            .iter()
+            .any(|msg| matches!(msg, DaemonMsg::Head {head} if head.sides.is_empty()))
+    );
+    peer.send(&ClientMsg::Declare(ClientDecl {
+        sides: vec!["caption".into()],
+        ..Default::default()
+    }));
+    let selected = peer.until(|msg| matches!(msg, DaemonMsg::Synced { .. }));
+    let DaemonMsg::Head { head } = selected
+        .iter()
+        .find(|msg| matches!(msg, DaemonMsg::Head { .. }))
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        head.sides.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["caption"]
+    );
+    let encoded = serde_json::to_string(&selected).unwrap();
+    assert!(!encoded.contains("payload"));
+    assert!(!encoded.contains("private-note"));
+    let reference = head.sides["caption"];
+    peer.send(&ClientMsg::History {
+        id: 81,
+        range: protocol::history::Request {
+            cut: protocol::history::Cut {
+                seq: reference.revision,
+                ..head.cut
+            },
+            anchor: reference.index,
+            text_offset: Some(0),
+            direction: protocol::history::Direction::After,
+            bytes: usize::MAX,
+            filter: protocol::history::Filter::Transcript,
+        },
+    });
+    let mut text = String::new();
+    for msg in peer.until(|msg| {
+        matches!(
+            msg,
+            DaemonMsg::HistoryPart {
+                id: 81,
+                done: true,
+                ..
+            }
+        )
+    }) {
+        if let DaemonMsg::HistoryPart {
+            id: 81, text: part, ..
+        } = msg
+        {
+            text.push_str(&part);
+        }
+    }
+    let page: protocol::history::Page = serde_json::from_str(&text).unwrap();
+    assert!(
+        matches!(page.items.as_slice(), [protocol::history::Located {item:protocol::view::Item::Reply {text,..},..}] if text=="caption payload")
+    );
+    peer.send(&ClientMsg::Declare(ClientDecl::default()));
+    let removed = peer.until(|msg| matches!(msg, DaemonMsg::Synced { .. }));
+    assert!(
+        removed
+            .iter()
+            .any(|msg| matches!(msg, DaemonMsg::Head {head} if head.sides.is_empty()))
+    );
+}
+
+fn seed_side_replies(home: &Home, id: SessionId) {
+    let store = Jsonl::open(home.sessions_dir()).unwrap();
+    let mut created = store
+        .create(&Header {
+            id,
+            workspace: "/w".into(),
+            parent: None,
+        })
+        .unwrap();
+    let mut entries = Vec::new();
+    for purpose in ["caption", "private-note"] {
+        let call = CallId::new(entries.len() as u64 + 1).unwrap();
+        entries.push(Entry::new(
+            call.0,
+            Epoch(created.writer.epoch()),
+            Body::ModelCall {
+                model: "m".into(),
+                purpose: Some(purpose.into()),
+                r#for: None,
+                attempt: 0,
+                choice: protocol::ToolChoice::None,
+                request: None,
+            },
+        ));
+        entries.push(Entry::new(Seq::new(entries.len() as u64 + 1).unwrap(), Epoch(created.writer.epoch()), Body::ModelResult {
+                call, r#for: None, failure: None,
+                outcome: protocol::Outcome::Done { output: protocol::Json::encode(&serde_json::json!({"message":{"content":[{"type":"text","text":format!("{purpose} payload")}]}})).unwrap() },
+            }));
+    }
+    created.writer.append_raw(&entries).unwrap();
+}

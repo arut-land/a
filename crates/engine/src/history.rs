@@ -66,7 +66,17 @@ impl History {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn head(&self, frames: &FrameLog, since: u64) -> io::Result<Head> {
+        self.head_for(frames, since, &[])
+    }
+
+    pub(crate) fn head_for(
+        &self,
+        frames: &FrameLog,
+        since: u64,
+        purposes: &[String],
+    ) -> io::Result<Head> {
         let index = self.index();
         let mut index = lock(&index);
         for batch in frames.batches_after(index.through()) {
@@ -74,7 +84,11 @@ impl History {
                 index.apply(&entry);
             }
         }
-        Ok(index.head_after(Epoch(self.generation.load(Ordering::Acquire)), since))
+        Ok(index.head_for(
+            Epoch(self.generation.load(Ordering::Acquire)),
+            since,
+            purposes,
+        ))
     }
 
     pub(crate) fn page(&self, frames: &FrameLog, request: &Request) -> io::Result<Page> {

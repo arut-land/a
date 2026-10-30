@@ -206,6 +206,7 @@ const HELP: &[(&str, &str)] = &[
 impl App {
     pub fn new(viewport: Viewport, target: &Target) -> Self {
         let mut client = SessionClient::new(Env::Origin);
+        client.demand_sides(["title".to_owned()]);
         if viewport == Viewport::Inline {
             client.demand(client::HistoryDemand {
                 anchor: client::HistoryAnchor::After(0),
@@ -401,7 +402,10 @@ impl App {
             }
             Change::Snapshot => self.install_range(len),
             // A streaming reply's rows catch up with its text when drawn.
-            Change::Delta { .. } | Change::Activity | Change::Draining => {}
+            Change::Delta { .. }
+            | Change::Metadata { .. }
+            | Change::Activity
+            | Change::Draining => {}
             Change::Batch { .. } => unreachable!(),
         }
         Vec::new()

@@ -23,7 +23,7 @@ pub struct Head {
     pub changed: Vec<usize>,
     pub answers: Vec<Answer>,
     pub state: ViewState,
-    pub title: Option<String>,
+    pub sides: std::collections::BTreeMap<String, SideRef>,
     pub model: Option<String>,
     pub usage: Usage,
     pub recap: Option<Recap>,
@@ -52,6 +52,13 @@ impl Head {
         }
         Ok(frames)
     }
+}
+
+/// A completed side result; its payload is obtained through a demanded range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SideRef {
+    pub index: usize,
+    pub revision: u64,
 }
 
 /// The control image being received; released in full once decoded.
@@ -175,7 +182,6 @@ pub struct Position {
     pub fragment: Option<TextSpan>,
     pub start: usize,
     pub end: usize,
-    pub title: Option<String>,
     pub model: Option<String>,
     pub usage: Usage,
 }

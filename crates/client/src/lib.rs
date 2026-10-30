@@ -54,8 +54,8 @@ use std::time::Duration;
 
 use protocol::view::SessionList;
 use protocol::{
-    Caps, ClientDecl, ClientId, ClientMsg, CommandInfo, DaemonMsg, Environment, HomeSettings,
-    MachineId, QueryInfo, SessionId, SessionSummary, SettingsChange, write_frame,
+    Caps, ClientId, ClientMsg, CommandInfo, DaemonMsg, Environment, HomeSettings, MachineId,
+    QueryInfo, SessionId, SessionSummary, SettingsChange, write_frame,
 };
 use sys::crash::{Crashes, Record};
 use sys::{Home, OwnedConnection, Signal, Staged};
@@ -308,7 +308,7 @@ fn attaching(
         workspace,
         since: attach.since,
         env,
-        decl: ClientDecl::default(),
+        decl: attach.decl.clone(),
     })
 }
 

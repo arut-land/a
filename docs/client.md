@@ -40,6 +40,16 @@ requested items at the requested cut. Public heads replace the former full-view
 far-attach cache. `Synced` certifies controls; a renderer can wait separately for
 `history_pending()` when it needs the requested range before acting.
 
+`demand_sides(purposes)` declares completed side values the renderer needs as
+metadata, independently of its transcript window. The thin daemon index keeps
+only each purpose's latest completed ordinal and revision. A public head includes
+coordinates only for declared purposes; the SDK resolves them through the same
+range lane and weak page cache. The previous value stays visible until its
+replacement page arrives. A new generation cancels outstanding pages and clears
+old metadata; withdrawing a purpose releases its page. `SessionView::side(purpose)`
+reads requested metadata, and `Change::Metadata` updates headers without replacing
+presentation rows. The UI selects purposes; core layers do not name plugins.
+
 ## Layers
 
 ```

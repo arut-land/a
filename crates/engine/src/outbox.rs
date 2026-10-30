@@ -242,13 +242,13 @@ impl FrameLog {
         .map_err(io::Error::other)
     }
 
-    fn read_after(&self, after: u64, ahead: &mut VecDeque<io::Result<Frame>>) {
+    fn read_after(&self, after: u64, sides: &[String], ahead: &mut VecDeque<io::Result<Frame>>) {
         if after >= self.seq() {
             return;
         }
         match self
             .history
-            .head(self, after)
+            .head_for(self, after, sides)
             .and_then(|head| head.frames())
         {
             Ok(frames) => ahead.extend(frames.into_iter().map(Ok)),
@@ -277,6 +277,7 @@ fn lines(run: &[u8]) -> impl Iterator<Item = &[u8]> {
 #[derive(Clone)]
 pub struct Outbox {
     shared: Arc<Shared>,
+    sides: Arc<[String]>,
     /// The number of the session it follows; 0 for the connection's own.
     following: u64,
 }
@@ -289,6 +290,7 @@ pub(crate) struct Subscribers(Arc<Mutex<Vec<Subscriber>>>);
 #[derive(Clone)]
 struct Subscriber {
     shared: Weak<Shared>,
+    sides: Arc<[String]>,
     following: u64,
 }
 
@@ -326,6 +328,7 @@ impl Subscribers {
         let subscriber = Subscriber {
             shared: Arc::downgrade(&outbox.shared),
             following: outbox.following,
+            sides: outbox.sides(),
         };
         lock(&self.0).push(subscriber.clone());
         *registration = Some(Registration {
@@ -343,6 +346,7 @@ impl Subscribers {
                 Some(Outbox {
                     shared: subscriber.shared.upgrade()?,
                     following: subscriber.following,
+                    sides: Arc::clone(&subscriber.sides),
                 })
             })
             .collect();
@@ -351,6 +355,7 @@ impl Subscribers {
                 Subscriber {
                     shared: Arc::downgrade(&outbox.shared),
                     following: outbox.following,
+                    sides: outbox.sides(),
                 }
                 .unregister(&self.0);
             }
@@ -410,7 +415,15 @@ enum Queued {
 }
 
 /// The session a client follows, and how far it has read its entries.
+struct FollowStart {
+    log: Arc<FrameLog>,
+    cursor: u64,
+    ahead: VecDeque<io::Result<Frame>>,
+    sides: Arc<[String]>,
+}
+
 struct Follow {
+    sides: Arc<[String]>,
     generation: u64,
     log: Arc<FrameLog>,
     /// The seq of the last entry written.
@@ -434,7 +447,19 @@ impl Outbox {
                 room: rt::Notify::new(),
             }),
             following: 0,
+            sides: Arc::default(),
         }
+    }
+
+    pub(crate) fn with_sides(&self, sides: &[String]) -> Self {
+        Self {
+            sides: sides.into(),
+            ..self.clone()
+        }
+    }
+
+    pub(crate) fn sides(&self) -> Arc<[String]> {
+        Arc::clone(&self.sides)
     }
 
     fn queue(&self) -> std::sync::MutexGuard<'_, Queue> {
@@ -584,7 +609,12 @@ impl Outbox {
         let mut registrations = lock(&self.shared.registrations);
         drop(registrations.following.take());
         let mut q = self.queue();
-        q.switch(Some((log, cursor, ahead)));
+        q.switch(Some(FollowStart {
+            log,
+            cursor,
+            ahead,
+            sides: self.sides(),
+        }));
         for (after, frame) in frames {
             if self.push(&mut q, after, frame).is_err() {
                 break;
@@ -595,6 +625,7 @@ impl Outbox {
         Self {
             shared: Arc::clone(&self.shared),
             following: q.follows,
+            sides: self.sides(),
         }
     }
 
@@ -617,14 +648,14 @@ impl Outbox {
             }
             let step = self.queue().step();
             match step {
-                Step::Read(log, cursor, follows) if cursor < log.seq() => {
+                Step::Read(log, cursor, follows, sides) if cursor < log.seq() => {
                     let ahead = rt::try_unblock_with(
                         rt,
                         rt::BlockingClass::Storage,
                         rt::STORAGE_BYTES,
                         move || {
                             let mut ahead = VecDeque::new();
-                            log.read_after(cursor, &mut ahead);
+                            log.read_after(cursor, &sides, &mut ahead);
                             ahead
                         },
                     )
@@ -667,9 +698,9 @@ impl Outbox {
                     self.shared.room.notify();
                     return Some(frame);
                 }
-                Step::Read(log, cursor, follows) if cursor < log.seq() => {
+                Step::Read(log, cursor, follows, sides) if cursor < log.seq() => {
                     let mut ahead = VecDeque::new();
-                    log.read_after(cursor, &mut ahead);
+                    log.read_after(cursor, &sides, &mut ahead);
                     self.accept_read(cursor, follows, ahead);
                 }
                 _ => return None,
@@ -718,7 +749,7 @@ enum Step {
     Nothing,
     /// The next entries of the session followed, read from its log after
     /// this cursor; `.2` is the follow they are for.
-    Read(Arc<FrameLog>, u64, u64),
+    Read(Arc<FrameLog>, u64, u64, Arc<[String]>),
 }
 
 impl Queue {
@@ -741,7 +772,12 @@ impl Queue {
             return Step::Nothing;
         };
         match follow.ahead.pop_front() {
-            None => Step::Read(Arc::clone(&follow.log), follow.cursor, follow.generation),
+            None => Step::Read(
+                Arc::clone(&follow.log),
+                follow.cursor,
+                follow.generation,
+                Arc::clone(&follow.sides),
+            ),
             Some(Ok(frame)) => {
                 follow.cursor = frame.seq.unwrap_or(follow.cursor);
                 Step::Frame(frame)
@@ -760,7 +796,7 @@ impl Queue {
 
     /// Retires the producer now; the writer changes logs only after every
     /// queued frame and its entry dependencies have drained.
-    fn switch(&mut self, next: Option<(Arc<FrameLog>, u64, VecDeque<io::Result<Frame>>)>) {
+    fn switch(&mut self, next: Option<FollowStart>) {
         self.follows += 1;
         if self.closed {
             return;
@@ -773,13 +809,21 @@ impl Queue {
             self.bytes = 0;
             return;
         }
-        self.target = next.as_ref().map(|(log, _, _)| Arc::clone(log));
-        let follow = next.map(|(log, cursor, ahead)| Follow {
-            generation: self.follows,
-            log,
-            cursor,
-            ahead,
-        });
+        self.target = next.as_ref().map(|next| Arc::clone(&next.log));
+        let follow = next.map(
+            |FollowStart {
+                 log,
+                 cursor,
+                 ahead,
+                 sides,
+             }| Follow {
+                sides,
+                generation: self.follows,
+                log,
+                cursor,
+                ahead,
+            },
+        );
         if self.frames.is_empty() {
             self.follow = follow;
         } else if let Some(Queued::Switch(queued)) = self.frames.back_mut() {

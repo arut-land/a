@@ -1,5 +1,8 @@
 //! The daemon: owns every session, accepts clients, runs the agents.
 
+// The generic history metadata deepens the actor call graph's auto-trait proof.
+#![recursion_limit = "256"]
+
 mod catalog;
 pub mod config;
 mod context;

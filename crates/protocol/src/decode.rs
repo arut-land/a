@@ -560,6 +560,7 @@ pub(crate) struct MsgFields {
     pub(crate) env: Option<Environment>,
     pub(crate) decl: Option<ClientDecl>,
     pub(crate) sites: Option<Vec<String>>,
+    pub(crate) sides: Option<Vec<String>>,
     pub(crate) client_seq: Option<u64>,
     pub(crate) answer: Option<crate::QuestionAnswer>,
     pub(crate) change: Option<SettingsChange>,
@@ -702,6 +703,7 @@ pub(crate) fn declare_msg(f: &mut MsgFields) -> Result<ClientMsg> {
     Ok(ClientMsg::Declare(ClientDecl {
         tools: f.tools.take().unwrap_or_default(),
         sites: f.sites.take().unwrap_or_default(),
+        sides: f.sides.take().unwrap_or_default(),
     }))
 }
 

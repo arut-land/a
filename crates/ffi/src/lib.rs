@@ -1015,7 +1015,7 @@ impl ViewChange {
                 call: call.get(),
                 text: text.clone(),
             },
-            Change::Activity => Self::Activity,
+            Change::Activity | Change::Metadata { .. } => Self::Activity,
             Change::Synced => Self::Synced {
                 recap: view.recap.as_ref().map(Into::into),
             },

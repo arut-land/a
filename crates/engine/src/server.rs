@@ -506,7 +506,16 @@ impl Conn<'_> {
                 } => {
                     self.attach(target, workspace, since, env, decl).await;
                 }
-                ClientMsg::Declare(decl) => self.decl = decl,
+                ClientMsg::Declare(decl) => {
+                    let changed = self.decl.sides != decl.sides;
+                    self.decl = decl;
+                    if changed && let Some(attached) = &self.attached {
+                        attached
+                            .session()
+                            .attach(self.outbox.with_sides(&self.decl.sides), 0)
+                            .await;
+                    }
+                }
                 ClientMsg::Environment(env) => match &self.attached {
                     Some(s) => s
                         .session()
@@ -611,7 +620,9 @@ impl Conn<'_> {
                     self.error(error.to_string());
                     return;
                 }
-                s.session().attach(self.outbox.clone(), since).await;
+                s.session()
+                    .attach(self.outbox.with_sides(&self.decl.sides), since)
+                    .await;
                 session_event("attach", s.session().id, || {
                     format!("since {since} from {}", self.machine)
                 });

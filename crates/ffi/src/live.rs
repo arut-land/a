@@ -524,7 +524,9 @@ type BeforePump = Box<dyn FnOnce() + Send>;
 #[export]
 impl Session {
     pub fn new(client: &Client) -> Self {
-        let feed = Arc::new(Mutex::new(Feed::new(SessionClient::new(Env::Keep))));
+        let mut session = SessionClient::new(Env::Keep);
+        session.demand_sides([crate::TITLE.to_owned()]);
+        let feed = Arc::new(Mutex::new(Feed::new(session)));
         let shared = Arc::clone(&feed);
         #[cfg(test)]
         let before_replay = Arc::new(Mutex::new(None::<BeforePump>));

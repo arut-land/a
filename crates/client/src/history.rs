@@ -156,6 +156,12 @@ struct Pending {
     bytes: Vec<u8>,
 }
 
+#[derive(Default)]
+pub(crate) struct Side {
+    pub history: History,
+    pub reference: Option<(Cut, usize)>,
+}
+
 pub(crate) struct History {
     pub(crate) demand: Option<Demand>,
     cut: Option<Cut>,

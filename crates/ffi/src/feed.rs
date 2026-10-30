@@ -614,6 +614,72 @@ impl Reducer {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn requested_metadata_updates_native_headers_outside_the_rendered_window() {
+        let reducer = Reducer::new();
+        {
+            let mut feed = lock(&reducer.feed);
+            feed.client.release_history();
+            feed.client.demand_sides([TITLE.into()]);
+        }
+        let entries = [
+            protocol::Entry::new(protocol::Seq::new(1).unwrap(), protocol::Epoch(0), protocol::Body::ModelCall {
+                model: "m".into(), purpose: Some(TITLE.into()), r#for: None, attempt: 0,
+                choice: protocol::ToolChoice::None, request: None,
+            }),
+            protocol::Entry::new(protocol::Seq::new(2).unwrap(), protocol::Epoch(0), protocol::Body::ModelResult {
+                call: protocol::CallId::new(1).unwrap(), r#for: None, failure: None,
+                outcome: protocol::Outcome::Done { output: protocol::Json::encode(&serde_json::json!({"message":{"content":[{"type":"text","text":"requested label"}]}})).unwrap() },
+            }),
+        ];
+        let mut index = protocol::view::Index::new(protocol::SessionId::new(), "/w".into());
+        for entry in &entries {
+            index.apply(entry);
+        }
+        let head = index.head_for(protocol::Epoch(0), 0, &[TITLE.into()]);
+        let effects = lock(&reducer.feed).step(Event {
+            conn: ConnId(1),
+            kind: EventKind::Msg(DaemonMsg::Head {
+                head: Box::new(head),
+            }),
+        });
+        let (id, range) = effects
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::Io(client::Io::Send(protocol::ClientMsg::History { id, range })) => {
+                    Some((id, range))
+                }
+                _ => None,
+            })
+            .expect("metadata must demand its page");
+        let page = index
+            .page(&range, |seq| {
+                Ok(entries[usize::try_from(seq.get()).unwrap() - 1].clone())
+            })
+            .unwrap();
+        let update = reducer
+            .fold(
+                &serde_json::to_string(&DaemonMsg::HistoryPart {
+                    id,
+                    offset: 0,
+                    text: serde_json::to_string(&page).unwrap(),
+                    done: true,
+                })
+                .unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(update.title.as_deref(), Some("requested label"));
+        assert!(
+            update
+                .changes
+                .iter()
+                .any(|change| matches!(change, ViewChange::Activity))
+        );
+        assert_eq!(reducer.snapshot().items, [] as [crate::DisplayItem; 0]);
+        assert_eq!(reducer.snapshot().title.as_deref(), Some("requested label"));
+    }
+
     use super::*;
 
     #[test]

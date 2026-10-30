@@ -18,7 +18,7 @@ pub use question::{
 };
 
 /// The exact protocol this build speaks.
-pub const PROTO: u32 = 41;
+pub const PROTO: u32 = 42;
 
 /// Ordinary payloads leave 4 KiB per reserved control slot for cancellation.
 #[derive(Clone, Copy)]
@@ -1591,6 +1591,9 @@ pub struct ClientDecl {
     /// UI sites it renders, such as `dialog` or `status`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sites: Vec<String>,
+    /// Side-result purposes this client explicitly requests as metadata.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sides: Vec<String>,
 }
 
 /// A slash command the daemon runs: input `/name args`.

@@ -669,7 +669,10 @@ impl Screen {
             }
             Change::Mismatch { supported } => eprintln!("[{}]", mismatch_line(*supported)),
             Change::Error { message } => eprintln!("[error: {}]", client::sanitize(message)),
-            Change::Delta { .. } | Change::Activity | Change::Draining => {}
+            Change::Delta { .. }
+            | Change::Activity
+            | Change::Metadata { .. }
+            | Change::Draining => {}
         }
     }
 

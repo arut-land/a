@@ -106,6 +106,7 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
         tty: true,
     };
     let decl = ClientDecl {
+        sides: vec!["caption".into()],
         tools: vec!["pick_file".into()],
         sites: vec!["dialog".into()],
     };
@@ -1329,6 +1330,14 @@ fn history_samples() -> Vec<Sample<DaemonMsg>> {
     let mut index = protocol::view::Index::new(SESSION, "/w".into());
     index.apply(&entry);
     let head = index.head(Epoch(0));
+    let mut selected = head.clone();
+    selected.sides.insert(
+        "caption".into(),
+        protocol::history::SideRef {
+            index: 0,
+            revision: 1,
+        },
+    );
     let request = protocol::history::Request {
         cut: head.cut,
         anchor: 0,
@@ -1339,6 +1348,12 @@ fn history_samples() -> Vec<Sample<DaemonMsg>> {
     };
     let page = index.page(&request, |_| Ok(entry.clone())).unwrap();
     vec![
+        sample(
+            "head_sides",
+            DaemonMsg::Head {
+                head: Box::new(selected),
+            },
+        ),
         sample(
             "head",
             DaemonMsg::Head {

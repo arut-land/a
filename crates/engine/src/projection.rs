@@ -431,12 +431,13 @@ impl Actor {
     pub(super) async fn attach(&mut self, client: &Outbox, since: u64) {
         let live = Arc::clone(&self.live);
         let frames = Arc::clone(&live.frames);
+        let sides = client.sides();
         let head = rt::try_unblock_with(
             &*live.session.shared.rt,
             Cpu,
             rt::STORAGE_BYTES,
             move || {
-                let head = frames.history.head(&frames, since)?;
+                let head = frames.history.head_for(&frames, since, &sides)?;
                 let seq = head.cut.seq;
                 head.frames().map(|frames| (seq, frames))
             },

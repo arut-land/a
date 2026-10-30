@@ -332,6 +332,9 @@ pub struct SessionView {
     /// it.
     #[serde(skip)]
     pub streaming: Option<Stream>,
+    /// Explicitly requested side pages, independent of the presentation range.
+    #[serde(skip)]
+    pub sides: std::collections::BTreeMap<String, Items>,
     /// Counts the updates [`SessionView::fold`] returned. An update whose
     /// `rev` is not one more than the last seen means some were dropped (an
     /// FFI stream's buffer was full): take a fresh snapshot of the view.
@@ -549,6 +552,10 @@ pub enum Change {
     },
     /// The replay is in; [`SessionView::recap`] tells what it held.
     Synced,
+    /// A requested side-result page changed, independently of visible history.
+    Metadata {
+        purpose: String,
+    },
     /// The kernel published activity for the entries folded so far.
     Activity,
     /// The daemon sent the whole view: the items are these now.
@@ -661,6 +668,21 @@ impl SessionView {
         }
     }
 
+    /// Replaces one explicitly requested metadata page without moving history.
+    pub fn side_range(&mut self, purpose: String, items: Items) -> Update {
+        if items.is_empty() {
+            self.sides.remove(&purpose);
+        } else {
+            self.sides.insert(purpose.clone(), items);
+        }
+        self.rev += 1;
+        Update {
+            rev: self.rev,
+            seq: self.seq,
+            change: Change::Metadata { purpose },
+        }
+    }
+
     /// A call's live output comes from the ledger until its final outcome
     /// replaces it, so attaching mid-call shows the same output as watching.
     pub fn present<'a>(&'a self, item: &'a Item) -> Presented<'a> {
@@ -704,25 +726,22 @@ impl SessionView {
     /// say), trimmed and bare of the quotes a model wraps a short answer
     /// in; `None` until there is one.
     pub fn side(&self, purpose: &str) -> Option<&str> {
-        if purpose == "title"
-            && let Some(title) = self
-                .history
-                .as_ref()
-                .and_then(|position| position.title.as_deref())
-        {
-            return Some(title.trim().trim_matches('"').trim()).filter(|title| !title.is_empty());
-        }
-        self.items.iter().rev().find_map(|item| match item {
-            Item::Reply {
-                text,
-                status: Status::Done,
-                purpose: Some(p),
-                ..
-            } if p == purpose => {
-                Some(text.trim().trim_matches('"').trim()).filter(|t| !t.is_empty())
-            }
-            _ => None,
-        })
+        self.sides
+            .get(purpose)
+            .into_iter()
+            .flat_map(|items| items.iter().rev())
+            .chain(self.items.iter().rev())
+            .find_map(|item| match item {
+                Item::Reply {
+                    text,
+                    status: Status::Done,
+                    purpose: Some(p),
+                    ..
+                } if p == purpose => {
+                    Some(text.trim().trim_matches('"').trim()).filter(|t| !t.is_empty())
+                }
+                _ => None,
+            })
     }
 
     /// A hash of the log-derived state (the serialized view): equal on every
@@ -741,6 +760,7 @@ impl SessionView {
         });
         if changed_generation {
             self.items.clear();
+            self.sides.clear();
         }
         let (start, end) = self
             .history
@@ -771,7 +791,6 @@ impl SessionView {
                 .and_then(|h| h.fragment.clone())
                 .filter(|_| !changed_generation),
             changed: head.changed.clone(),
-            title: head.title.clone(),
             model: head.model.clone(),
             usage: head.usage,
         });

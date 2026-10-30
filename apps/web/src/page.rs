@@ -40,6 +40,7 @@ impl Page {
     /// attach it asks the driver for.
     pub fn new(session: SessionId) -> (Self, Vec<Effect>) {
         let mut client = SessionClient::new(Env::Keep);
+        client.demand_sides(["title".to_owned()]);
         client.demand(client::HistoryDemand {
             anchor: client::HistoryAnchor::After(0),
             bytes: HISTORY_BYTES,
@@ -283,6 +284,7 @@ impl Page {
     fn title_changed(&self, change: &Change) -> bool {
         match change {
             Change::Snapshot | Change::Attached { reset: true, .. } => true,
+            Change::Metadata { purpose } => purpose == "title",
             Change::Added { item, .. } => matches!(item,
                 Item::Reply { purpose: Some(purpose), status: Status::Done, .. }
                     if purpose == "title"

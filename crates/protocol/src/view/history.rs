@@ -1,6 +1,6 @@
 //! Seek metadata shares the reducer's decisions, never its settled payloads.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 
 use crate::history::{Cut, Direction, Filter, Head, Located, Page, Request};
@@ -22,7 +22,7 @@ struct Record {
 pub struct Index {
     view: SessionView,
     records: Vec<Record>,
-    title: Option<String>,
+    sides: BTreeMap<String, crate::history::SideRef>,
     usage: Usage,
     recap: super::Recap,
     recap_start: usize,
@@ -33,7 +33,7 @@ impl Index {
         Self {
             view: SessionView::from_log(session, workspace, std::iter::empty::<Entry>()),
             records: Vec::new(),
-            title: None,
+            sides: BTreeMap::new(),
             usage: Usage::default(),
             recap: super::Recap::default(),
             recap_start: 0,
@@ -83,6 +83,7 @@ impl Index {
                     self.records[index].facts.push(input);
                 }
             }
+            self.completed_side(index, entry.seq.get());
             let record = &mut self.records[index];
             if record.facts.last() != Some(&entry.seq) {
                 record.facts.push(entry.seq);
@@ -91,16 +92,6 @@ impl Index {
             let key = item.key();
             if record.keys.last().is_none_or(|(_, old)| *old != key) {
                 record.keys.push((entry.seq.get(), key));
-            }
-            if let Item::Reply {
-                purpose: Some(purpose),
-                text,
-                ..
-            } = item
-                && purpose == "title"
-                && !text.is_empty()
-            {
-                self.title = Some(text.clone());
             }
             if let Item::User { text, .. } = item {
                 self.recap = super::Recap {
@@ -147,11 +138,29 @@ impl Index {
         }
     }
 
+    fn completed_side(&mut self, index: usize, revision: u64) {
+        if let Item::Reply {
+            purpose: Some(purpose),
+            text,
+            status: super::Status::Done,
+            ..
+        } = &self.view.items[index]
+            && !text.trim().trim_matches('"').trim().is_empty()
+        {
+            self.sides
+                .insert(purpose.clone(), crate::history::SideRef { index, revision });
+        }
+    }
+
     pub fn head(&self, generation: Epoch) -> Head {
         self.head_after(generation, 0)
     }
 
     pub fn head_after(&self, generation: Epoch, since: u64) -> Head {
+        self.head_for(generation, since, &[])
+    }
+
+    pub fn head_for(&self, generation: Epoch, since: u64, purposes: &[String]) -> Head {
         Head {
             cut: Cut {
                 session: self.view.session.expect("an index belongs to a session"),
@@ -189,7 +198,14 @@ impl Index {
                 answers
             },
             state: self.view.state.clone(),
-            title: self.title.clone(),
+            sides: purposes
+                .iter()
+                .filter_map(|purpose| {
+                    self.sides
+                        .get(purpose)
+                        .map(|reference| (purpose.clone(), *reference))
+                })
+                .collect(),
             model: self.view.items.iter().rev().find_map(|item| match item {
                 Item::Reply {
                     model,
@@ -804,5 +820,119 @@ mod tests {
             request.text_offset = Some(span.end);
         }
         assert_eq!(recovered, text);
+    }
+    #[test]
+    fn side_heads_contain_only_declared_completed_coordinates_and_no_payloads() {
+        let mut index = Index::new(SessionId::new(), "/w".into());
+        let mut seq = 0;
+        for (purpose, text) in [
+            ("caption", "visible label".to_owned()),
+            ("internal-note", "private-payload-marker".repeat(65_536)),
+        ] {
+            seq += 1;
+            index.apply(&Entry::new(
+                Seq::new(seq).unwrap(),
+                Epoch(1),
+                Body::ModelCall {
+                    model: "m".into(),
+                    purpose: Some(purpose.into()),
+                    r#for: None,
+                    attempt: 0,
+                    choice: crate::ToolChoice::None,
+                    request: None,
+                },
+            ));
+            let call = crate::CallId::new(seq).unwrap();
+            seq += 1;
+            index.apply(&Entry::new(Seq::new(seq).unwrap(), Epoch(1), Body::ModelResult {
+                call, r#for: None, failure: None,
+                outcome: crate::Outcome::Done { output: crate::Json::encode(&serde_json::json!({"message":{"content":[{"type":"text","text":text}]}})).unwrap() },
+            }));
+        }
+        assert!(index.head(Epoch(1)).sides.is_empty());
+        let head = index.head_for(Epoch(1), 0, &["caption".into()]);
+        assert_eq!(
+            head.sides,
+            BTreeMap::from([(
+                "caption".into(),
+                crate::history::SideRef {
+                    index: 0,
+                    revision: 2
+                }
+            )])
+        );
+        let encoded = serde_json::to_string(&head).unwrap();
+        assert!(!encoded.contains("visible label"));
+        assert!(!encoded.contains("private-payload-marker"));
+        assert!(!format!("{index:?}").contains("private-payload-marker"));
+        assert!(
+            index
+                .view
+                .items
+                .iter()
+                .all(|item| matches!(item, Item::Reply { text, .. } if text.is_empty()))
+        );
+        index.apply(&Entry::new(
+            Seq::new(5).unwrap(),
+            Epoch(1),
+            Body::ModelCall {
+                model: "m".into(),
+                purpose: Some("caption".into()),
+                r#for: None,
+                attempt: 0,
+                choice: crate::ToolChoice::None,
+                request: None,
+            },
+        ));
+        assert_eq!(
+            index.head_for(Epoch(1), 2, &["caption".into()]).sides,
+            head.sides
+        );
+        index.apply(&Entry::new(
+            Seq::new(6).unwrap(),
+            Epoch(1),
+            Body::ModelResult {
+                call: crate::CallId::new(5).unwrap(),
+                r#for: None,
+                failure: None,
+                outcome: crate::Outcome::Failed {
+                    error: "failed replacement".into(),
+                },
+            },
+        ));
+        assert_eq!(
+            index.head_for(Epoch(1), 2, &["caption".into()]).sides,
+            head.sides
+        );
+    }
+    #[test]
+    fn blank_side_results_preserve_the_latest_usable_coordinates() {
+        let mut index = Index::new(SessionId::new(), "/w".into());
+        for (at, text) in ["usable value", " \" \" "].into_iter().enumerate() {
+            let call = crate::CallId::new((at as u64) * 2 + 1).unwrap();
+            index.apply(&Entry::new(
+                call.0,
+                Epoch(1),
+                Body::ModelCall {
+                    model: "m".into(),
+                    purpose: Some("caption".into()),
+                    r#for: None,
+                    attempt: 0,
+                    choice: crate::ToolChoice::None,
+                    request: None,
+                },
+            ));
+            index.apply(&Entry::new(Seq::new(call.get()+1).unwrap(),Epoch(1),Body::ModelResult {
+                call,r#for:None,failure:None,
+                outcome:crate::Outcome::Done {output:crate::Json::encode(&serde_json::json!({"message":{"content":[{"type":"text","text":text}]}})).unwrap()},
+            }));
+        }
+        assert_eq!(
+            index.head_for(Epoch(1), 0, &["caption".into()]).sides["caption"],
+            crate::history::SideRef {
+                index: 0,
+                revision: 2
+            }
+        );
     }
 }
