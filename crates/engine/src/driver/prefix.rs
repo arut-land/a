@@ -57,6 +57,7 @@ impl Actor {
         let places = self.live.session.blobs.places();
         let active = self
             .projection
+            .model
             .active
             .as_ref()
             .filter(|active| active.through <= through && active.prefix.scope() == Some(&scope))
@@ -65,7 +66,7 @@ impl Actor {
                 prefix: active.prefix.clone(),
                 tail: active.tail.fork_tail(Arc::clone(&registry)),
             });
-        let kept = self.projection.forks.take();
+        let kept = self.projection.model.forks.take();
         let model = model.clone();
         let (kept, seed) = rt::unblock(&*self.live.session.shared.rt, move || {
             let mut kept = kept;
@@ -119,7 +120,7 @@ impl Actor {
             Ok::<_, io::Error>((Some(projection), seed))
         })
         .await?;
-        self.projection.forks = kept;
+        self.projection.model.forks = kept;
         Ok(seed)
     }
 }

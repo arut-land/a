@@ -51,6 +51,32 @@ pub fn release() {
     }
 }
 
+/// Owns a burst's state and returns free allocator pages after that state drops.
+#[derive(Debug)]
+pub struct AllocationScope<T> {
+    _value: T,
+    // Fields drop in declaration order: the allocator sees the freed state.
+    _release: AllocatorRelease,
+}
+
+#[derive(Debug)]
+struct AllocatorRelease;
+
+impl<T> From<T> for AllocationScope<T> {
+    fn from(value: T) -> Self {
+        Self {
+            _value: value,
+            _release: AllocatorRelease,
+        }
+    }
+}
+
+impl Drop for AllocatorRelease {
+    fn drop(&mut self) {
+        release();
+    }
+}
+
 /// Zeroed words mapped straight from the OS: a page takes memory once it
 /// is first written, and dropping the mapping gives every page back at
 /// once. The allocator would keep a freed block this large for reuse (on

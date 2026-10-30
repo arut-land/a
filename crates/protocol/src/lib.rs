@@ -2011,7 +2011,7 @@ pub enum Replaceable {
 /// a chunk read straight into its frame is never copied again.
 #[derive(Clone, Debug)]
 pub struct Frame {
-    bytes: Arc<Vec<u8>>,
+    bytes: Arc<Box<[u8]>>,
     /// The entry's seq, for an entry.
     pub seq: Option<u64>,
     pub class: Class,
@@ -2076,9 +2076,8 @@ impl Frame {
         prefix(&mut bytes)?;
         // A frame may wait in a queue or a log's tail: it keeps no more
         // than its bytes.
-        bytes.shrink_to_fit();
         Ok(Self {
-            bytes: Arc::new(bytes),
+            bytes: Arc::new(bytes.into_boxed_slice()),
             seq,
             class,
             replaceable: None,
@@ -2671,7 +2670,9 @@ mod tests {
         let msg = DaemonMsg::Synced { seq: 7 };
         written.clear();
         write_frame(&mut written, &msg).unwrap();
-        assert_eq!(Frame::new(&msg).unwrap().as_bytes(), written);
+        let frame = Frame::new(&msg).unwrap();
+        assert_eq!(frame.as_bytes(), written);
+        assert!(Arc::ptr_eq(&frame.bytes, &frame.clone().bytes));
     }
 
     /// A length the peer never sends the bytes for costs it nothing but an

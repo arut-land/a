@@ -212,12 +212,13 @@ impl fmt::Debug for Prefix {
 
 impl From<Prefix> for Resident {
     fn from(prefix: Prefix) -> Self {
-        let (kept, _) = &*prefix.0;
+        let encoding = Arc::unwrap_or_clone(prefix.0);
+        let (kept, _) = &encoding;
         Self {
-            encoding: Arc::new(Mutex::new(Some((*prefix.0).clone()))),
             offset: kept.len,
             mark: kept.mark,
             images: kept.images,
+            encoding: Arc::new(Mutex::new(Some(encoding))),
         }
     }
 }

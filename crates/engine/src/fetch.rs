@@ -34,15 +34,16 @@ pub(crate) async fn answer(
     len: Option<u64>,
 ) -> Result<Json, Ended> {
     let failed = |e: io::Error| Ended::Failed(format!("blob {blob}: {e}"));
-    let Some(slot) = daemon.slot(session) else {
-        return Err(Ended::NotHeld);
-    };
     // Held only for the check: a stream does not keep the session loaded.
-    let live = daemon.live(&slot).await.map_err(failed)?;
-    if !live.references(blob).await.map_err(failed)? {
-        return Err(Ended::NotHeld);
+    {
+        let Some(slot) = daemon.slot(session) else {
+            return Err(Ended::NotHeld);
+        };
+        let live = daemon.live(&slot).await.map_err(failed)?;
+        if !live.references(blob).await.map_err(failed)? {
+            return Err(Ended::NotHeld);
+        }
     }
-    drop((live, slot));
     let rt = Arc::clone(&daemon.shared.rt);
     let store = Arc::clone(&daemon.shared.blobs);
     let opened = rt::unblock(&*rt, move || -> io::Result<_> {

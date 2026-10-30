@@ -341,18 +341,22 @@ impl Slot {
     /// actor's end makes the transition ([`Daemon::ended`]); whoever waits
     /// for it only reads it.
     fn ending(&self) -> Option<Flag> {
-        let mut residency = lock(&self.residency);
-        if let Residency::Loading { finished, .. } = &*residency {
-            return Some(finished.clone());
+        {
+            let _live = sys::AllocationScope::from({
+                let mut residency = lock(&self.residency);
+                if let Residency::Loading { finished, .. } = &*residency {
+                    return Some(finished.clone());
+                }
+                let Residency::Stopping(live) = &*residency else {
+                    return None;
+                };
+                if !live.ended.is_set() {
+                    return Some(live.ended.clone());
+                }
+                let last = hibernated(live.summary());
+                std::mem::replace(&mut *residency, Residency::Hibernated { last })
+            });
         }
-        let Residency::Stopping(live) = &*residency else {
-            return None;
-        };
-        if !live.ended.is_set() {
-            return Some(live.ended.clone());
-        }
-        let last = hibernated(live.summary());
-        *residency = Residency::Hibernated { last };
         if let Some(daemon) = self.daemon.upgrade() {
             lock(&daemon.slots).ended(self.header.id);
             daemon.pulse.notify();

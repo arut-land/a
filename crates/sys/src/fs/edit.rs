@@ -1032,13 +1032,26 @@ fn copy_mac_xattrs(
 }
 
 #[cfg(target_vendor = "apple")]
+struct Acl(*mut std::ffi::c_void);
+
+#[cfg(target_vendor = "apple")]
+impl Drop for Acl {
+    fn drop(&mut self) {
+        unsafe extern "C" {
+            fn acl_free(acl: *mut std::ffi::c_void) -> libc::c_int;
+        }
+        // SAFETY: acl_get_fd or acl_init allocated this owned object.
+        unsafe { acl_free(self.0) };
+    }
+}
+
+#[cfg(target_vendor = "apple")]
 pub(super) fn access_acl(source: Option<&File>, destination: &File) -> io::Result<()> {
     use std::os::fd::AsRawFd;
     unsafe extern "C" {
         fn acl_get_fd(fd: libc::c_int) -> *mut std::ffi::c_void;
         fn acl_init(count: libc::c_int) -> *mut std::ffi::c_void;
         fn acl_set_fd(fd: libc::c_int, acl: *mut std::ffi::c_void) -> libc::c_int;
-        fn acl_free(acl: *mut std::ffi::c_void) -> libc::c_int;
     }
     // copyfile may return success after an ACL failure. Apply the access policy
     // with checked calls, replacing any ACL inherited by the staging file.
@@ -1057,17 +1070,13 @@ pub(super) fn access_acl(source: Option<&File>, destination: &File) -> io::Resul
             return Err(io::Error::last_os_error());
         }
     }
-    // SAFETY: destination owns its descriptor and acl is live until acl_free.
-    let result = if unsafe { acl_set_fd(destination.as_raw_fd(), acl) } == 0 {
+    let acl = Acl(acl);
+    // SAFETY: destination owns its descriptor and acl owns the live ACL.
+    if unsafe { acl_set_fd(destination.as_raw_fd(), acl.0) } == 0 {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
-    };
-    // SAFETY: acl_get_fd or acl_init allocated this object; neither setter owns it.
-    unsafe {
-        acl_free(acl);
     }
-    result
 }
 
 /// Establish the runtime directory policy once; ordinary private publications
@@ -1082,7 +1091,6 @@ pub(super) fn private_directory_acl(file: &File) -> io::Result<()> {
             entry_id: libc::c_int,
             entry: *mut *mut std::ffi::c_void,
         ) -> libc::c_int;
-        fn acl_free(acl: *mut std::ffi::c_void) -> libc::c_int;
     }
     // SAFETY: the descriptor is owned; the ACL is freed after the entry query.
     let acl = unsafe { acl_get_fd(file.as_raw_fd()) };
@@ -1094,16 +1102,15 @@ pub(super) fn private_directory_acl(file: &File) -> io::Result<()> {
             Err(error)
         };
     }
-    let mut entry = std::ptr::null_mut();
     // Darwin returns zero for an entry and -1/EINVAL at the end of a valid ACL.
     // https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/acl_get_entry.3.html
-    // SAFETY: acl is live and entry is a writable output slot.
-    let found = unsafe { acl_get_entry(acl, 0, &raw mut entry) };
-    let error = io::Error::last_os_error();
-    // SAFETY: acl_get_fd returned this allocation; ownership was not transferred.
-    unsafe {
-        acl_free(acl);
-    }
+    let (found, error) = {
+        let acl = Acl(acl);
+        let mut entry = std::ptr::null_mut();
+        // SAFETY: acl owns the live object and entry is a writable output slot.
+        let found = unsafe { acl_get_entry(acl.0, 0, &raw mut entry) };
+        (found, io::Error::last_os_error())
+    };
     if found == 0 {
         access_acl(None, file)
     } else if matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOENT)) {
@@ -1308,7 +1315,6 @@ fn mac_acl(file: &File) -> io::Result<Vec<u8>> {
             acl: *mut std::ffi::c_void,
             size: libc::ssize_t,
         ) -> libc::ssize_t;
-        fn acl_free(acl: *mut std::ffi::c_void) -> libc::c_int;
     }
     // SAFETY: file owns its descriptor; acl is freed after serialization.
     let acl = unsafe { acl_get_fd(file.as_raw_fd()) };
@@ -1320,25 +1326,19 @@ fn mac_acl(file: &File) -> io::Result<Vec<u8>> {
             Err(error)
         };
     }
-    let result = (|| {
-        // SAFETY: acl remains live until acl_free below.
-        let size = mac_count(unsafe { acl_size(acl) })?;
-        // Darwin limits ACLs to 128 entries; cap native serialization defensively.
-        if size > 65536 {
-            return Err(io::ErrorKind::FileTooLarge.into());
-        }
-        let mut bytes = vec![0u8; size];
-        // SAFETY: bytes owns size writable bytes and acl is a valid live object.
-        let copied =
-            mac_count(unsafe { acl_copy_ext(bytes.as_mut_ptr().cast(), acl, size.cast_signed()) })?;
-        bytes.truncate(copied);
-        Ok(bytes)
-    })();
-    // SAFETY: acl_get_fd allocated this object and no call transferred its ownership.
-    unsafe {
-        acl_free(acl);
+    let acl = Acl(acl);
+    // SAFETY: acl owns the live object throughout serialization.
+    let size = mac_count(unsafe { acl_size(acl.0) })?;
+    // Darwin limits ACLs to 128 entries; cap native serialization defensively.
+    if size > 65536 {
+        return Err(io::ErrorKind::FileTooLarge.into());
     }
-    result
+    let mut bytes = vec![0u8; size];
+    // SAFETY: bytes owns size writable bytes and acl is a valid live object.
+    let copied =
+        mac_count(unsafe { acl_copy_ext(bytes.as_mut_ptr().cast(), acl.0, size.cast_signed()) })?;
+    bytes.truncate(copied);
+    Ok(bytes)
 }
 
 #[cfg(windows)]

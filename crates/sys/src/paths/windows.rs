@@ -11,6 +11,18 @@ type KnownFolder = unsafe extern "system" fn(
 ) -> i32;
 type Free = unsafe extern "system" fn(*mut std::ffi::c_void);
 
+struct Folder<'a> {
+    ptr: *mut u16,
+    free: &'a Free,
+}
+
+impl Drop for Folder<'_> {
+    fn drop(&mut self) {
+        // SAFETY: SHGetKnownFolderPath owns this COM allocation; null is accepted.
+        unsafe { (self.free)(self.ptr.cast()) };
+    }
+}
+
 /// A known folder of the current user, as the shell resolves it.
 pub(crate) fn known_folder(id: &windows_sys::core::GUID) -> io::Result<PathBuf> {
     // The API contract preserves redirection without importing Shell32 into every
@@ -45,9 +57,11 @@ pub(crate) fn known_folder(id: &windows_sys::core::GUID) -> io::Result<PathBuf> 
     // SAFETY: id is a valid GUID and raw is a writable output pointer. A null
     // token selects the current user.
     let result = unsafe { resolve(id, 0, std::ptr::null_mut(), &raw mut raw) };
+    let folder = Folder {
+        ptr: raw,
+        free: &free,
+    };
     if result < 0 {
-        // SAFETY: the API owns this allocation; CoTaskMemFree accepts null.
-        unsafe { free(raw.cast()) };
         return Err(io::Error::other(format!(
             "SHGetKnownFolderPath failed: {result:#x}"
         )));
@@ -56,14 +70,12 @@ pub(crate) fn known_folder(id: &windows_sys::core::GUID) -> io::Result<PathBuf> 
     // SAFETY: a successful call returns a NUL-terminated wide string allocated
     // by COM. Copy it before freeing the allocation with its matching allocator.
     unsafe {
-        while *raw.add(len) != 0 {
+        while *folder.ptr.add(len) != 0 {
             len += 1;
         }
-        let path = PathBuf::from(std::ffi::OsString::from_wide(std::slice::from_raw_parts(
-            raw, len,
-        )));
-        free(raw.cast());
-        Ok(path)
+        Ok(PathBuf::from(std::ffi::OsString::from_wide(
+            std::slice::from_raw_parts(folder.ptr, len),
+        )))
     }
 }
 

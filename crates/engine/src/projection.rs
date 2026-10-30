@@ -47,11 +47,7 @@ impl super::Shared {
 #[derive(Default)]
 pub(super) struct Projection {
     pub(super) admissions: super::spawn::Admissions,
-    pub(super) active: Option<super::prefix::Active>,
-    pub(super) forks: Option<super::prefix::Projection>,
-    pub(super) seeds: std::collections::BTreeMap<protocol::BlobId, Vec<super::prefix::Seed>>,
-    pub(super) compiler: Option<(std::sync::Weak<ext::host::Registry>, super::Json)>,
-    pub(super) transcript: Option<Transcript>,
+    pub(super) model: Model,
     pub(super) invocations: Invocations,
     /// The message of the reply model call `.0` just had, until its
     /// result commits.
@@ -60,15 +56,17 @@ pub(super) struct Projection {
     pub(super) published_activity: Option<(u64, Activity)>,
 }
 
-impl Projection {
-    pub(super) fn release_model(&mut self) {
-        self.transcript = None;
-        self.active = None;
-        self.forks = None;
-        self.seeds.clear();
-        self.compiler = None;
-    }
+/// One disposable compiler generation; durable execution state belongs to `Projection`.
+#[derive(Default)]
+pub(super) struct Model {
+    pub(super) transcript: Option<Transcript>,
+    pub(super) active: Option<super::prefix::Active>,
+    pub(super) forks: Option<super::prefix::Projection>,
+    pub(super) seeds: std::collections::BTreeMap<protocol::BlobId, Vec<super::prefix::Seed>>,
+    pub(super) compiler: Option<(std::sync::Weak<ext::host::Registry>, super::Json)>,
+}
 
+impl Model {
     pub(super) fn compiler_scope(&mut self, registry: &Arc<ext::host::Registry>) -> super::Json {
         if let Some((held, scope)) = &self.compiler
             && held
@@ -299,7 +297,7 @@ impl Actor {
     pub(super) fn folded(&mut self, entries: &[Entry]) {
         let session = &self.live.session;
         let hooks = self.registry.hooks();
-        self.projection.transcript = self.projection.transcript.take().filter(|t| {
+        self.projection.model.transcript = self.projection.model.transcript.take().filter(|t| {
             t.is_on(&self.registry) && !entries.iter().any(|e| matches!(e.body, Body::Edit { .. }))
         });
         for e in entries {
@@ -363,7 +361,7 @@ impl Actor {
             // goes on from there on a blocking worker; as it does from
             // any entry it stopped short of before.
             if self
-                .projection
+                .projection.model
                 .transcript
                 .as_mut()
                 .is_some_and(|transcript| {
@@ -372,7 +370,7 @@ impl Actor {
                         && !transcript.apply(e, replied.map(|(_, m)| m))
                 })
             {
-                self.projection.transcript = None;
+                self.projection.model.transcript = None;
             }
             // A call ends with its result, unless it was detached: then
             // with its own envelope, its result a placeholder.
@@ -556,7 +554,7 @@ impl Actor {
     /// The conversation the model sees before entry `call`, extended on a CPU worker.
     pub(super) async fn conversation(&mut self, call: CallId) -> io::Result<llm::Conversation> {
         let restore = self.canonical_source(call);
-        if let Some(messages) = (self.projection.transcript.as_ref())
+        if let Some(messages) = (self.projection.model.transcript.as_ref())
             .filter(|t| t.through() + 1 >= call.get())
             .and_then(|t| {
                 let restore = Arc::clone(&restore);
@@ -570,7 +568,7 @@ impl Actor {
         let pending: Vec<_> = self.pending_entries().collect();
         let model_only = self.live.session.model_only();
         let places = self.live.session.blobs.places();
-        let kept = self.projection.transcript.take();
+        let kept = self.projection.model.transcript.take();
         let seed = lock(&self.live.session.incoming_prefix).take();
         let (transcript, messages) = rt::try_unblock_with(
             &*self.live.session.shared.rt,
@@ -645,7 +643,7 @@ impl Actor {
             },
         )
         .await??;
-        self.projection.transcript = Some(transcript);
+        self.projection.model.transcript = Some(transcript);
         Ok(messages)
     }
 }

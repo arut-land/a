@@ -1523,8 +1523,24 @@ impl Actor {
         }
     }
 
+    async fn run(self, mail: channel::Receiver<Msg>, first: StepPlan) {
+        let (ended, session) = {
+            let (mut actor, mail) = (self, mail);
+            actor.run_actor(&mail, first).await
+        };
+        ended.set();
+        session.changed.notify();
+        if let Some(daemon) = session.shared.daemon.upgrade() {
+            daemon.ended(session.id);
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
-    async fn run(mut self, mail: channel::Receiver<Msg>, first: StepPlan) {
+    async fn run_actor(
+        &mut self,
+        mail: &channel::Receiver<Msg>,
+        first: StepPlan,
+    ) -> (Flag, Arc<Session>) {
         let _ = self.carry(first).await;
         self.adopt_jobs();
         let mut next = None;
@@ -1648,7 +1664,7 @@ impl Actor {
                 self.completed(through, result).await;
             }
         }
-        self.drain_flushes(&mail, None).await;
+        self.drain_flushes(mail, None).await;
         self.publish();
         if self.journal.since_snapshot >= SNAPSHOT_EVERY {
             self.keep_snapshot().await;
@@ -1665,14 +1681,7 @@ impl Actor {
         }
         // Closed and let go before the end is told: a reload never makes
         // a second writer, and what is told the end holds the last of it.
-        let ended = self.live.ended.clone();
-        let session = Arc::clone(&self.live.session);
-        drop((self, mail));
-        ended.set();
-        session.changed.notify();
-        if let Some(daemon) = session.shared.daemon.upgrade() {
-            daemon.ended(session.id);
-        }
+        (self.live.ended.clone(), Arc::clone(&self.live.session))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1832,14 +1841,14 @@ impl Actor {
                     .await
                     .unwrap();
                 }
-                reply.send(self.projection.transcript.is_some());
+                reply.send(self.projection.model.transcript.is_some());
                 return None;
             }
             Msg::Sync => return None,
             Msg::Reclaim => {
                 if !self.live.idle_for().is_zero() && self.live.summary().activity == Activity::Idle
                 {
-                    self.projection.release_model();
+                    self.projection.model = projection::Model::default();
                     lock(&self.live.session.incoming_prefix).take();
                 }
                 return None;
@@ -2683,7 +2692,7 @@ impl Actor {
             pending.ended.wait().await;
         }
         self.admissions.clear();
-        self.projection.release_model();
+        self.projection.model = projection::Model::default();
         lock(&self.live.session.incoming_prefix).take();
         self.replies = Replies::default();
         self.delivery_queue.clear();
@@ -2926,7 +2935,7 @@ impl Actor {
         let seed = spawn::SpawnIntent::from_json(&intent)
             .ok()
             .and_then(|intent| intent.image.root)
-            .and_then(|root| self.projection.seeds.get_mut(&root.id))
+            .and_then(|root| self.projection.model.seeds.get_mut(&root.id))
             .and_then(Vec::pop);
         let env = lock(&self.live.session.env).clone();
         if let Some(daemon) = shared.daemon.upgrade() {
@@ -3060,9 +3069,9 @@ impl Actor {
                         .await
                         .map(|(decided, prepared, prefix)| {
                             if let (Some(prefix), Some(transcript)) =
-                                (prefix, &self.projection.transcript)
+                                (prefix, &self.projection.model.transcript)
                             {
-                                self.projection.active = Some(prefix::Active {
+                                self.projection.model.active = Some(prefix::Active {
                                     through: call.get() - 1,
                                     prefix,
                                     tail: transcript.fork_tail(Arc::clone(&self.registry)),
@@ -3209,7 +3218,7 @@ impl Actor {
     /// The request for model call `call`: the system prompt, the
     /// transcript before it, and the tools.
     async fn request(&mut self, call: CallId, model: &Model) -> Result<llm::Request, String> {
-        let scope = self.projection.compiler_scope(&self.registry);
+        let scope = self.projection.model.compiler_scope(&self.registry);
         let messages = self
             .conversation(call)
             .await

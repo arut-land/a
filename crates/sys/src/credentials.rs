@@ -271,6 +271,15 @@ mod native {
         fn CredDeleteW(target: *const u16, kind: u32, flags: u32) -> i32;
         fn CredFree(value: *const c_void);
     }
+
+    struct OwnedCredential(*mut Credential);
+
+    impl Drop for OwnedCredential {
+        fn drop(&mut self) {
+            // SAFETY: this is the allocation returned by a successful CredReadW.
+            unsafe { CredFree(self.0.cast()) };
+        }
+    }
     // Credential Manager limits each blob to 2560 bytes. Splitting removes
     // that platform limit from the OAuth token format.
     pub(super) fn load(key: &str) -> io::Result<Option<Vec<u8>>> {
@@ -329,16 +338,15 @@ mod native {
                 Err(error)
             };
         }
-        // SAFETY: successful CredReadW returns a valid credential and blob until CredFree.
+        let result = OwnedCredential(result);
+        // SAFETY: result owns the credential and its blob throughout this copy.
         let bytes = unsafe {
-            if (*result).length == 0 {
+            if (*result.0).length == 0 {
                 Vec::new()
             } else {
-                std::slice::from_raw_parts((*result).blob, (*result).length as usize).to_vec()
+                std::slice::from_raw_parts((*result.0).blob, (*result.0).length as usize).to_vec()
             }
         };
-        // SAFETY: result is owned by this successful CredReadW.
-        unsafe { CredFree(result.cast()) };
         Ok(Some(bytes))
     }
     fn write(key: &str, secret: Option<&[u8]>) -> io::Result<()> {

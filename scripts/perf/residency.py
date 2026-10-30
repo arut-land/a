@@ -1,4 +1,4 @@
-"""Complete ownership waves over real fixture daemons, with alternating A/A controls."""
+"""Complete ownership waves over real fixture daemons, with alternating controls."""
 import argparse
 import contextlib
 import hashlib
@@ -21,6 +21,10 @@ from process import memory_maps, snapshot, stop_daemon
 from stats import distribution
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def cargo_run(command, **kwargs):
+    return subprocess.run(["mise", "exec", "--", *command], **kwargs)
 
 # Generated only under CARGO_TARGET_DIR. Protocol encoding and native endpoints
 # stay in their owning Rust crates, including Windows named pipes.
@@ -365,12 +369,14 @@ fn main() {
             "turns" => {
                 let count = value["count"].as_u64().unwrap();
                 let bytes = value["bytes"].as_u64().unwrap() as usize;
+                let mut elapsed = Vec::new();
                 for turn in 0..count {
                     last = format!("wave {} turn {turn}: {}", value["wave"], "x".repeat(bytes));
                     let since: Vec<_> = held
                         .iter()
                         .map(|c| c.head.as_ref().unwrap().cut.seq)
                         .collect();
+                    let started = Instant::now();
                     for client in &mut held {
                         protocol::write_frame(
                             &mut client.stream,
@@ -386,8 +392,9 @@ fn main() {
                     for (client, since) in held.iter_mut().zip(since) {
                         client.reply(&home, since, &last);
                     }
+                    elapsed.push(started.elapsed().as_secs_f64() * 1000.0);
                 }
-                serde_json::json!({"completed": count * held.len() as u64})
+                serde_json::json!({"completed": count * held.len() as u64, "turn_batch_ms": elapsed})
             }
             "detach" => {
                 for client in held.drain(..) {
@@ -544,8 +551,8 @@ def build_probe(source, output, target):
     for command in (["cargo", "fmt", "--manifest-path", str(root / "Cargo.toml")],
                     ["cargo", "test", "--manifest-path", str(root / "Cargo.toml")],
                     ["cargo", "clippy", "--manifest-path", str(root / "Cargo.toml"), "--all-targets", "--", "-D", "warnings"]):
-        subprocess.run(command, cwd=source, env=env, check=True)
-    result = subprocess.run(["cargo", "build", *release_arguments(), "--manifest-path", str(root / "Cargo.toml"),
+        cargo_run(command, cwd=source, env=env, check=True)
+    result = cargo_run(["cargo", "build", *release_arguments(), "--manifest-path", str(root / "Cargo.toml"),
                              "--message-format=json"], cwd=source, env=env, check=True, capture_output=True, text=True)
     binary = next(Path(r["executable"]) for line in result.stdout.splitlines()
                   if (r := json.loads(line)).get("executable"))
@@ -663,10 +670,11 @@ def sample(binary, probe_binary, output, stored, count, turns, size, idle_second
                 latencies = [probe.call("attach", id=id) for id in ids[:count]]
                 if count:
                     probe.call("slow", id=ids[0])
-                assert probe.call("turns", count=turns, bytes=size, wave=wave)["completed"] == count * turns
+                completed = probe.call("turns", count=turns, bytes=size, wave=wave)
+                assert completed["completed"] == count * turns
                 rows = catalog(probe, stored, count)
                 assert sum(row["clients"] for row in rows) == count + bool(count), rows
-                stages[f"wave{wave}_used"] = dict(observe(probe, active, idle_seconds), catalog=rows, attach=latencies)
+                stages[f"wave{wave}_used"] = dict(observe(probe, active, idle_seconds), catalog=rows, attach=latencies, turns=completed)
                 probe.call("detach")
                 stages[f"wave{wave}_detached"] = observe(probe, active, idle_seconds)
                 if count:
@@ -687,6 +695,15 @@ def sample(binary, probe_binary, output, stored, count, turns, size, idle_second
             return stages
 
 
+def timing_metrics(stage):
+    values = {}
+    if stage.get("attach"):
+        values["reattach_ms"] = max(a["ms"] for a in stage["attach"])
+    if stage.get("turns", {}).get("completed"):
+        values["turn_batch_ms"] = max(stage["turns"]["turn_batch_ms"])
+    return values
+
+
 def summarize(records):
     groups = {}
     for r in records:
@@ -697,8 +714,7 @@ def summarize(records):
             for key in ("peak_rss_kib", "peak_footprint_kib"):
                 if key in s["after"]:
                     values[key] = s["after"][key]
-            if s.get("attach"):
-                values["reattach_ms"] = max(a["ms"] for a in s["attach"])
+            values.update(timing_metrics(s))
             key = f'{r["label"]}/stored={r["stored"]}/active={r["active"]}/{name}'
             for metric, value in values.items():
                 groups.setdefault(key, {}).setdefault(metric, []).append(value)
@@ -737,18 +753,22 @@ def paired(records):
                 cpu_ms=value["cpu_ms"] - other["stages"][stage]["cpu_ms"],
             ).items():
                 group.setdefault(metric, []).append(difference)
+            reference = timing_metrics(other["stages"][stage])
+            for metric, latency in timing_metrics(value).items():
+                if metric in reference:
+                    group.setdefault(metric, []).append(latency - reference[metric])
     return {key: {metric: distribution(values) for metric, values in group.items()} for key, group in groups.items()}
 
 
-def table(summary):
-    lines = ["Values are median [min, max]; A and A2 are unchanged-source controls.", "",
-             "| case/stage | charge KiB | RSS KiB | CPU ms | threads | reattach ms (slowest session/run) |",
-             "| --- | ---: | ---: | ---: | ---: | ---: |"]
+def table(summary, comparison=False):
+    lines = ["Values are median [min, max]; " + ("A is reference; A2 is candidate." if comparison else "A and A2 are unchanged-source controls."), "",
+             "| case/stage | charge KiB | RSS KiB | CPU ms | threads | reattach ms (slowest session/run) | slowest turn batch ms |",
+             "| --- | ---: | ---: | ---: | ---: | ---: | ---: |"]
     for key, row in summary.items():
         if "minus" in key:
             continue
         cells = []
-        for metric in ("charged_kib", "rss_kib", "cpu_ms", "threads", "reattach_ms"):
+        for metric in ("charged_kib", "rss_kib", "cpu_ms", "threads", "reattach_ms", "turn_batch_ms"):
             value = row.get(metric)
             cells.append("" if value is None else "{median:.3f} [{min:.3f}, {max:.3f}]".format(**value))
         lines.append("| " + key + " | " + " | ".join(cells) + " |")
@@ -756,11 +776,29 @@ def table(summary):
 
 
 def main():
+    # The workload only talks to fixture daemons and loopback diagnostics.
+    keep = {
+        "HOME", "USER", "LOGNAME", "PATH", "SHELL", "TMPDIR", "TMP", "TEMP",
+        "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "USERPROFILE", "APPDATA",
+        "LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "INCLUDE", "LIB", "LIBPATH",
+        "RUSTUP_HOME", "RUSTUP_TOOLCHAIN", "CARGO_HOME", "CARGO_TARGET_DIR",
+        "CARGO_PROFILE_DEV_CODEGEN_BACKEND", "RUSTFLAGS", "RUSTC_WRAPPER",
+        "MISE_DATA_DIR", "MISE_CACHE_DIR", "MISE_CONFIG_DIR", "MISE_AUTO_INSTALL",
+        "RUNNER_TEMP", "RUNNER_OS", "RUNNER_ARCH", "GITHUB_STEP_SUMMARY",
+    }
+    clean = {key: value for key, value in os.environ.items() if key.upper() in keep}
+    clean.update(MISE_NO_ENV="1", CARGO_BUILD_JOBS="2", PYTHONDONTWRITEBYTECODE="1",
+                 OPENAI_API_KEY="loopback-dummy", OPENAI_BASE_URL="http://127.0.0.1:1/v1",
+                 NO_PROXY="127.0.0.1,localhost")
+    os.environ.clear()
+    os.environ.update(clean)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, default=ROOT)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--target", type=Path, required=True)
     parser.add_argument("--binary", type=Path)
+    parser.add_argument("--reference-binary", type=Path, help="A executable; --binary is A2 (otherwise A/A controls)")
+    parser.add_argument("--reference-source", type=Path, help="build A from this checkout before building A2")
     parser.add_argument("--probe", type=Path)
     parser.add_argument("--build-only", action="store_true")
     parser.add_argument("--rounds", type=int, default=5)
@@ -772,6 +810,8 @@ def main():
     args = parser.parse_args()
     if args.rounds < 5:
         parser.error("at least five interleaved rounds are required")
+    if args.reference_binary and args.reference_source:
+        parser.error("select a reference binary or source, not both")
     stored, counts = [int(n) for n in args.stored.split(",")], [int(n) for n in args.active.split(",")]
     if min(stored + counts) < 1 or max(counts) > max(stored) or args.turns < 1 or args.bytes < 1 or args.idle_seconds <= 0:
         parser.error("positive populations/work required, with active <= maximum stored")
@@ -779,14 +819,19 @@ def main():
     if (output / "residency.jsonl").exists() or (output / "residency-failures.jsonl").exists():
         parser.error("select a fresh output directory; existing samples must not be mixed")
     output.mkdir(parents=True, exist_ok=True)
-    binary = args.binary.resolve() if args.binary else stage(executable(source, environment(target), ["--features", "fixtures"]), output / ("a-fixtures" + SUFFIX))
+    reference = args.reference_binary.resolve() if args.reference_binary else None
+    if args.reference_source:
+        reference = stage(executable(args.reference_source.resolve(), environment(target), ["--features", "fixtures"], run=cargo_run), output / ("a-reference" + SUFFIX))
+    binary = args.binary.resolve() if args.binary else stage(executable(source, environment(target), ["--features", "fixtures"], run=cargo_run), output / ("a-fixtures" + SUFFIX))
+    reference = reference or binary
     probe = args.probe.resolve() if args.probe else build_probe(source, output, target)
     from hosted import hardware
     metadata = dict(hardware=hardware(), platform=platform.platform(), machine=platform.machine(),
                     revision=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip(),
                     working_tree=subprocess.check_output(["git", "status", "--short"], cwd=source, text=True),
                     workload_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-                    binaries={str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in (binary, probe)},
+                    binaries={str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in (binary, reference, probe)},
+                    labels=dict(A=str(reference), A2=str(binary)),
                     parameters=dict(stored=stored, active=counts, turns=args.turns, bytes=args.bytes, idle_seconds=args.idle_seconds))
     (output / "residency-host.json").write_text(json.dumps(metadata, indent=2) + "\n")
     if args.build_only:
@@ -799,7 +844,7 @@ def main():
                 print(f"round={round} {label} stored={total} active={active}", flush=True)
                 record = dict(round=round, label=label, stored=total, active=active)
                 try:
-                    record["stages"] = sample(binary, probe, output, total, active, args.turns, args.bytes, args.idle_seconds)
+                    record["stages"] = sample(reference if label == "A" else binary, probe, output, total, active, args.turns, args.bytes, args.idle_seconds)
                 except Exception as error:
                     record["failure"] = repr(error)
                     with (output / "residency-failures.jsonl").open("a") as stream:
@@ -810,7 +855,7 @@ def main():
                     stream.write(json.dumps(record) + "\n")
                 (output / "residency.json").write_text(json.dumps(dict(**metadata, summary=summarize(records), paired_A2_minus_A=paired(records)), indent=2) + "\n")
 
-    report = table(summarize(records))
+    report = table(summarize(records), reference != binary)
     (output / "residency.md").write_text(report)
     if summary_file := os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(summary_file, "a") as stream:

@@ -763,66 +763,68 @@ fn canonical_exports_cannot_cache_encoded_bytes_in_the_resident_tail() {
 #[test]
 fn a_fork_reuses_settled_chunks_without_refolding_its_parent() {
     for provider in providers() {
-        let canonical = Messages::from(vec![
-            Message::system("terse"),
-            Message::user("begin"),
-            Message::assistant("settled answer"),
-            Message::user("next"),
-        ]);
-        let stored = StoredMessages::new(&canonical);
-        let mut tail = canonical.clone();
-        let mut resident = Resident::default();
-        let reads = Arc::new(AtomicU64::new(0));
-        let request = stored.request(&resident, &tail, &reads);
-        provider.request(&request.model, &request).unwrap();
-        folded();
-        let prefix = request.messages.prefix().unwrap();
-        let root = Arc::clone(prefix.0.0.settled.0.first().unwrap());
-        let references = Arc::strong_count(&root);
-        drop(request);
-        resident.retain(&mut tail);
-        assert!(tail.is_empty());
-        let branch = Messages::from(vec![
-            Message::assistant("private answer"),
-            Message::user("private prompt"),
-        ]);
-        let whole: Messages = canonical.iter().chain(branch.iter()).cloned().collect();
-        let expected = body(&provider, &whole);
-        folded();
-        stored.write(&whole);
-        let child = Resident::from(prefix.clone());
-        let request = stored.request(&child, &branch, &reads);
-        let actual = provider
-            .request(&request.model, &request)
-            .unwrap()
-            .body()
-            .to_vec();
-        assert_eq!(
-            folded(),
-            branch.len(),
-            "{} refolded ancestry",
-            provider.protocol.key()
-        );
-        assert_eq!(reads.load(Ordering::Relaxed), 0);
-        assert_eq!(actual, expected);
-        let held = child
-            .encoding
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .0
-            .settled
-            .clone();
-        assert!(
-            held.iter().any(|bytes| Arc::ptr_eq(bytes, &root)),
-            "branch replaced its prefix bytes"
-        );
-        assert_eq!(
-            Arc::strong_count(&root),
-            references,
-            "branch copied settled fragment references"
-        );
+        for shared in [false, true] {
+            let canonical = Messages::from(vec![
+                Message::system("terse"),
+                Message::user("begin"),
+                Message::assistant("settled answer"),
+                Message::user("next"),
+            ]);
+            let stored = StoredMessages::new(&canonical);
+            let mut tail = canonical.clone();
+            let mut resident = Resident::default();
+            let reads = Arc::new(AtomicU64::new(0));
+            let request = stored.request(&resident, &tail, &reads);
+            provider.request(&request.model, &request).unwrap();
+            folded();
+            let prefix = request.messages.prefix().unwrap();
+            let root = Arc::clone(prefix.0.0.settled.0.first().unwrap());
+            let references = Arc::strong_count(&root);
+            drop(request);
+            resident.retain(&mut tail);
+            assert!(tail.is_empty());
+            let branch = Messages::from(vec![
+                Message::assistant("private answer"),
+                Message::user("private prompt"),
+            ]);
+            let whole: Messages = canonical.iter().chain(branch.iter()).cloned().collect();
+            let expected = body(&provider, &whole);
+            folded();
+            stored.write(&whole);
+            let child = Resident::from(if shared { prefix.clone() } else { prefix });
+            let request = stored.request(&child, &branch, &reads);
+            let actual = provider
+                .request(&request.model, &request)
+                .unwrap()
+                .body()
+                .to_vec();
+            assert_eq!(
+                folded(),
+                branch.len(),
+                "{} refolded ancestry",
+                provider.protocol.key()
+            );
+            assert_eq!(reads.load(Ordering::Relaxed), 0);
+            assert_eq!(actual, expected);
+            let held = child
+                .encoding
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .0
+                .settled
+                .clone();
+            assert!(
+                held.iter().any(|bytes| Arc::ptr_eq(bytes, &root)),
+                "branch replaced its prefix bytes"
+            );
+            assert_eq!(
+                Arc::strong_count(&root),
+                references,
+                "branch copied settled fragment references"
+            );
+        }
     }
 }
 

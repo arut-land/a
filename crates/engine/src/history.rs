@@ -120,24 +120,25 @@ pub(crate) async fn answer(
     request: Request,
 ) -> Result<protocol::Json, crate::query::Ended> {
     let failed = |error: io::Error| crate::query::Ended::Failed(error.to_string());
-    let slot = daemon
-        .slot(request.cut.session)
-        .ok_or_else(|| crate::query::Ended::Failed("no such history session".into()))?;
-    let live = daemon.live(&slot).await.map_err(failed)?;
-    let frames = Arc::clone(&live.frames);
-    let json = rt::try_unblock_with(
-        &*daemon.shared.rt,
-        rt::BlockingClass::Cpu,
-        rt::STORAGE_BYTES,
-        move || {
-            let page = frames.history.page(&frames, &request)?;
-            serde_json::to_string(&page).map_err(io::Error::other)
-        },
-    )
-    .await
-    .map_err(failed)?
-    .map_err(failed)?;
-    drop((live, slot));
+    let json = {
+        let slot = daemon
+            .slot(request.cut.session)
+            .ok_or_else(|| crate::query::Ended::Failed("no such history session".into()))?;
+        let live = daemon.live(&slot).await.map_err(failed)?;
+        let frames = Arc::clone(&live.frames);
+        rt::try_unblock_with(
+            &*daemon.shared.rt,
+            rt::BlockingClass::Cpu,
+            rt::STORAGE_BYTES,
+            move || {
+                let page = frames.history.page(&frames, &request)?;
+                serde_json::to_string(&page).map_err(io::Error::other)
+            },
+        )
+        .await
+        .map_err(failed)?
+        .map_err(failed)?
+    };
     let mut at = 0;
     while at < json.len() {
         let mut end = (at + (64 << 10)).min(json.len());

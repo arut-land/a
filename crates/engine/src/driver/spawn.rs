@@ -379,6 +379,7 @@ impl Actor {
             && let Ok(Some(seed)) = self.fork_seed(&image, call, Arc::new(child), &model).await
         {
             self.projection
+                .model
                 .seeds
                 .entry(seed.root)
                 .or_default()

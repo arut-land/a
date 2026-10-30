@@ -162,21 +162,26 @@ fn sid_string(sid: PSID) -> io::Result<String> {
     let mut text = null_mut();
     // SAFETY: the caller's SID is valid; the output is a LocalAlloc string.
     ok(unsafe { ConvertSidToStringSidW(sid, &raw mut text) })?;
+    let allocation = LocalAllocation(text.cast());
     let mut len = 0;
     // SAFETY: the successful conversion returned a NUL-terminated string.
     while unsafe { *text.add(len) } != 0 {
         len += 1;
     }
-    // SAFETY: `len` covers the string and LocalFree matches its allocator.
-    let sid = unsafe {
-        let sid = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
-        LocalFree(text.cast());
-        sid
-    };
-    Ok(sid)
+    // SAFETY: the allocation owns this NUL-terminated string and `len` excludes NUL.
+    Ok(unsafe { String::from_utf16_lossy(std::slice::from_raw_parts(allocation.0.cast(), len)) })
 }
 
-pub struct Security(*mut std::ffi::c_void);
+struct LocalAllocation(*mut std::ffi::c_void);
+
+impl Drop for LocalAllocation {
+    fn drop(&mut self) {
+        // SAFETY: this allocation came from a LocalAlloc-owning Windows API.
+        unsafe { LocalFree(self.0) };
+    }
+}
+
+pub struct Security(LocalAllocation);
 
 impl Security {
     /// The user alone, inherited by nothing: pipes, jobs and single files.
@@ -208,7 +213,7 @@ impl Security {
                 null_mut(),
             )
         })?;
-        Ok(Self(descriptor))
+        Ok(Self(LocalAllocation(descriptor)))
     }
 
     /// The descriptor's DACL, borrowed for as long as `self` lives.
@@ -216,28 +221,26 @@ impl Security {
         let (mut present, mut dacl, mut defaulted) = (0, null_mut(), 0);
         // SAFETY: the descriptor is live and every output is writable.
         ok(unsafe {
-            GetSecurityDescriptorDacl(self.0, &raw mut present, &raw mut dacl, &raw mut defaulted)
+            GetSecurityDescriptorDacl(
+                self.0.0,
+                &raw mut present,
+                &raw mut dacl,
+                &raw mut defaulted,
+            )
         })?;
         Ok(dacl)
     }
 
     pub fn descriptor(&self) -> *mut std::ffi::c_void {
-        self.0
+        self.0.0
     }
 
     pub fn attributes(&self) -> SECURITY_ATTRIBUTES {
         SECURITY_ATTRIBUTES {
             nLength: u32::try_from(size_of::<SECURITY_ATTRIBUTES>()).unwrap(),
-            lpSecurityDescriptor: self.0,
+            lpSecurityDescriptor: self.0.0,
             bInheritHandle: 0,
         }
-    }
-}
-
-impl Drop for Security {
-    fn drop(&mut self) {
-        // SAFETY: this descriptor was allocated by the SDDL conversion.
-        unsafe { LocalFree(self.0) };
     }
 }
 

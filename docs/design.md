@@ -569,7 +569,9 @@ daemon's `Config::daemon` counts effective parallelism (Windows CPU sets and
 job caps) and runs blocking jobs at the foreground class; clients keep the
 standard count and their caller's class. Catalog reconstruction
 shares storage admission. macOS pressure events ask actors to release disposable
-projection caches while retaining session ownership. Platform calls and unsafe
+projection caches while retaining session ownership. Model projection caches share
+one owner, replaced as a whole when their compiler generation ends. Encoded wire
+frames own boxed byte slices; clones share the same allocation. Platform calls and unsafe
 code belong in `sys`; `rt` owns admission and readiness integration.
 [Native resource measurements](perf/resources.md) describe the policy and channel
 comparisons.

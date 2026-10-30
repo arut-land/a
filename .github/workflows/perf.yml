@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       residency:
-        description: "Complete lifecycle ownership waves (five alternating A/A rounds)"
+        description: "Complete lifecycle ownership waves (five alternating rounds; optional paired_ref)"
         default: false
         type: boolean
       idle_charge:
@@ -108,10 +108,11 @@ jobs:
       CARGO_BUILD_JOBS: 2
       CARGO_PROFILE_DEV_CODEGEN_BACKEND: llvm
       PYTHONDONTWRITEBYTECODE: 1
+      MISE_NO_ENV: 1
       PERF_PAIRED_ROUNDS: ${{ inputs.paired_rounds || '5' }}
     steps:
       - name: External build directory
-        run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/tgt-residency-waves" >> "$GITHUB_ENV"
+        run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/tgt-mem-release" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.harness_ref || github.sha }}
@@ -120,6 +121,11 @@ jobs:
         with:
           ref: ${{ inputs.source_ref || github.sha }}
           path: measured
+      - uses: actions/checkout@v7
+        if: inputs.paired_ref != ''
+        with:
+          ref: ${{ inputs.paired_ref }}
+          path: reference
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
@@ -151,9 +157,18 @@ jobs:
       - name: Native Cargo path
         working-directory: measured
         run: echo "$(dirname "$(rustup which cargo)")" >> "$GITHUB_PATH"
+      - uses: jdx/mise-action@v5
+        with:
+          working_directory: measured
+          install_args: mr-boxington
       - name: Build and measure complete ownership waves
         working-directory: harness
-        run: python scripts/perf/hosted.py --phase residency --source ../measured --runner '${{ matrix.runner }}' --output "$RUNNER_TEMP/residency-output"
+        env:
+          REFERENCE: ${{ inputs.paired_ref }}
+        run: |
+          reference=()
+          if [[ -n "$REFERENCE" ]]; then reference+=(--reference-source ../reference); fi
+          python scripts/perf/residency.py --source ../measured --target "$CARGO_TARGET_DIR" --output "$RUNNER_TEMP/residency-output" --rounds "$PERF_PAIRED_ROUNDS" "${reference[@]}"
       - uses: actions/upload-artifact@v5
         if: always()
         with:
@@ -164,7 +179,7 @@ jobs:
         if: always()
         working-directory: measured
         run: |
-          cargo clean --target-dir "$CARGO_TARGET_DIR"
+          mise exec -- cargo clean --target-dir "$CARGO_TARGET_DIR"
           python - <<'PYTHON'
           import os, shutil
           shutil.rmtree(os.environ['CARGO_TARGET_DIR'], ignore_errors=True)
