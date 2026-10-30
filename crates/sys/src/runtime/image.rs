@@ -219,7 +219,12 @@ pub(super) fn collect(dir: &Path) {
     for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
         let path = entry.path();
         if path.is_dir() {
-            let _ = discard(&path.join(".retired"));
+            let result = discard(&path.join(".retired"));
+            #[cfg(test)]
+            if std::env::var_os("A_TEST_IMAGE_HANDLE_PROBE").is_some() {
+                eprintln!("collect {path:?}: {result:?}");
+            }
+            let _ = result;
         }
     }
 }
@@ -286,6 +291,8 @@ mod tests {
     #[test]
     fn retiring_a_running_image_allows_updates_and_reclamation_after_exit() {
         use std::io::{BufRead, Read, Write};
+        use std::os::windows::io::AsHandle;
+        use std::os::windows::process::ChildExt;
         use std::process::{Command, Stdio};
 
         const CHILD: &str = "A_TEST_INSTALLED_IMAGE_CHILD";
@@ -300,7 +307,8 @@ mod tests {
         std::fs::create_dir(&build).unwrap();
         let exe = build.join(super::super::EXE);
         super::copy(&std::env::current_exe().unwrap(), &exe).unwrap();
-        let mut child = Command::new(&exe)
+        let mode = std::env::var("A_TEST_IMAGE_HANDLE_PROBE").unwrap_or_else(|_| "held".into());
+        let mut child = Some(Command::new(&exe)
             .args([
                 "--exact",
                 "runtime::image::tests::retiring_a_running_image_allows_updates_and_reclamation_after_exit",
@@ -310,9 +318,29 @@ mod tests {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
-            .unwrap();
+            .unwrap());
+        let retained = match mode.as_str() {
+            "duplicate" => Some(
+                child
+                    .as_ref()
+                    .unwrap()
+                    .as_handle()
+                    .try_clone_to_owned()
+                    .unwrap(),
+            ),
+            "thread" => Some(
+                child
+                    .as_ref()
+                    .unwrap()
+                    .main_thread_handle()
+                    .try_clone_to_owned()
+                    .unwrap(),
+            ),
+            _ => None,
+        };
         let result = (|| {
-            let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+            let mut output =
+                std::io::BufReader::new(child.as_mut().unwrap().stdout.take().unwrap());
             assert!(
                 (&mut output)
                     .lines()
@@ -321,16 +349,38 @@ mod tests {
             super::retire(&exe)?;
             assert!(!exe.exists());
             super::collect(dir.path());
-            assert!(child.try_wait()?.is_none());
-            child.stdin.take().unwrap().write_all(&[0])?;
-            assert!(child.wait()?.success());
+            assert!(child.as_mut().unwrap().try_wait()?.is_none());
+            child
+                .as_mut()
+                .unwrap()
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(&[0])?;
+            assert!(child.as_mut().unwrap().wait()?.success());
+            if mode != "held" {
+                drop(child.take());
+            }
             super::collect(dir.path());
+            eprintln!(
+                "probe mode={mode} child_owned={} extra_handle_owned={} entries={:?}",
+                child.is_some(),
+                retained.is_some(),
+                std::fs::read_dir(&build)
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name())
+                    .collect::<Vec<_>>()
+            );
             std::fs::remove_dir(&build)?;
             assert!(!build.exists());
             Ok::<_, std::io::Error>(())
         })();
-        let _ = child.kill();
-        let _ = child.wait();
+        if let Some(child) = &mut child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        drop(child);
+        drop(retained);
         result.unwrap();
     }
 }

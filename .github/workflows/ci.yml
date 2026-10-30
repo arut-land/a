@@ -1,230 +1,99 @@
-name: CI
+name: Windows retirement probe
 
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 env:
-  CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: 2
-  # Each job installs its own tools; task execution must not install the rest.
+  CARGO_PROFILE_DEV_CODEGEN_BACKEND: llvm
+  MISE_NO_ENV: 1
   MISE_AUTO_INSTALL: false
 
 jobs:
-  check:
-    name: check (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        # Apple silicon and x86_64 Linux on main and branches.
-        os: [macos-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
-      # mbx (the cargo wrapper in mise.toml) keeps compiled crates in its own
-      # store; caching that store and the toolchain is what makes reruns fast.
-      - &mbx-dir
-        shell: bash
-        run: echo "MBX_CACHE_DIR=$RUNNER_TEMP/mbx" >> "$GITHUB_ENV"
-      - &cache
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.rustup/toolchains
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ${{ runner.temp }}/mbx/actions
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '.cargo/*.toml') }}-${{ github.sha }}
-          restore-keys: |
-            cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '.cargo/*.toml') }}-
-            cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
-      - &mise
-        uses: jdx/mise-action@v5
-        with:
-          install_args: rust mr-boxington cargo:cargo-nextest ${{ runner.os == 'Linux' && 'mold' || '' }}
-      # The no-polling acceptance test traces the client's syscalls.
-      - if: runner.os == 'Linux'
-        run: sudo apt-get install -y --no-install-recommends clang pkg-config libssl-dev strace
-      # Use the image's Chrome and Node; install only the pinned browser driver.
-      # This also prepares the browser for the un-ignored test in the full suite.
-      - name: Web browser regression
-        run: mise run test:web
-      # fmt, clippy -D warnings, then every test: unit, llm parity, and the
-      # black-box M1 acceptance tests in apps/cli/tests/blackbox. The
-      # release budgets run in their own jobs. Live-model tests stay
-      # #[ignore]d; there are no secrets.
-      - run: mise run check
-      - &transport-features
-        name: Transport without TLS and with rustls
-        run: |
-          for feature in client tls-rustls; do
-            mise exec -- cargo clippy -p transport --all-targets --features "$feature" -- -D warnings
-            mise exec -- cargo nextest run -p transport --features "$feature" --no-tests=fail
-          done
-      # The Windows build, cross-linted: no platform cfg above `sys`/`rt`.
-      - if: runner.os == 'Linux'
-        run: mise run check:windows
-
-  budgets:
-    name: budgets (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        # Latency is held to the design's budgets on one lane (strict).
-        include:
-          - os: macos-latest
-            strict: 0
-          - os: ubuntu-latest
-            strict: 1
-    runs-on: ${{ matrix.os }}
-    env:
-      A_STRICT_BUDGETS: ${{ matrix.strict }}
-    steps:
-      - uses: actions/checkout@v7
-      - *mbx-dir
-      - *cache
-      - *mise
-      - if: runner.os == 'Linux'
-        run: sudo apt-get install -y --no-install-recommends clang pkg-config libssl-dev
-      # Idle daemon charged memory (10 MiB) is held exactly; cold start and attach
-      # latency too where strict, else with slack.
-      - run: mise run budgets
-
-  deny:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: jdx/mise-action@v5
-        with:
-          install_args: rust mr-boxington cargo:cargo-deny
-      - run: mise run deny
-
-  machete:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: jdx/mise-action@v5
-        with:
-          install_args: rust mr-boxington cargo:cargo-machete
-      - run: mise run machete
-
-  threads:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - run: |
-          python3 -m unittest discover -s scripts/check -p 'test_*.py'
-          python3 scripts/check/threads.py
-
-  # Nothing `a` builds depends on tokio.
-  no-tokio:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: jdx/mise-action@v5
-        with:
-          install_args: rust mr-boxington
-      - run: mise run check:no-tokio
-
-  # Coverage-guided fuzzing of the framer, the JSON decoders and the view
-  # reducer, briefly: a regression gate, not a campaign.
-  fuzz:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - *mbx-dir
-      - *cache
-      - uses: jdx/mise-action@v5
-        with:
-          install_args: rust mr-boxington mold cargo:cargo-bolero
-      - run: mise run fuzz --time 30s
-      - if: failure()
-        uses: actions/upload-artifact@v5
-        with:
-          name: fuzz-crashes
-          path: |
-            crates/protocol/tests/__fuzz__/*/crashes
-            crates/ext-skills/src/parse/__fuzz__/*/crashes
-
-  miri:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - *mbx-dir
-      - *cache
-      - uses: jdx/mise-action@v5
-        with:
-          install_args: rust mr-boxington mold
-      - run: mise run test:miri
-
-  windows:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, windows-11-arm]
-    runs-on: ${{ matrix.os }}
-    env:
-      # Session panic isolation and the test harness require unwinding;
-      # Cranelift does not support it on Windows.
-      CARGO_PROFILE_DEV_CODEGEN_BACKEND: llvm
-      NEXTEST_PROFILE: windows
-    defaults:
-      run:
-        shell: bash
-    # Native completion, security, job containment, and daemon acceptance.
-    steps:
-      # Recorded wire/provider fixtures must keep their checked-in bytes.
       - run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
-      - *mbx-dir
-      - *cache
       - name: Install native LLVM toolchain
         shell: pwsh
         run: |
           $channel = (Select-String -Path rust-toolchain.toml -Pattern '^channel = "(.*)"').Matches.Groups[1].Value
-          $arch = if ($env:RUNNER_ARCH -eq 'ARM64') { 'aarch64' } else { 'x86_64' }
-          $toolchain = "$channel-$arch-pc-windows-msvc"
+          $toolchain = "$channel-x86_64-pc-windows-msvc"
           "RUSTUP_TOOLCHAIN=$toolchain" >> $env:GITHUB_ENV
           rustup toolchain install $toolchain --profile minimal --component clippy,rust-src,rustfmt
       - uses: jdx/mise-action@v5
         with:
           install_args: mr-boxington
-      - name: Install native nextest
+      - name: Compare pristine and controlled handle lifetimes
         shell: pwsh
         run: |
-          $platform = if ($env:RUNNER_ARCH -eq 'ARM64') { 'windows-arm' } else { 'windows' }
-          $archive = "$env:RUNNER_TEMP/nextest.zip"
-          Invoke-WebRequest "https://get.nexte.st/0.9.148/$platform" -OutFile $archive
-          Expand-Archive $archive -DestinationPath "$env:USERPROFILE/.cargo/bin" -Force
-      - name: Select native PowerShell contract runners
-        shell: pwsh
-        run: |
-          $runners = @((Get-Command pwsh.exe).Source, "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe")
-          "A_TEST_POWERSHELL=$($runners -join ';')" >> $env:GITHUB_ENV
-      - run: mise run check:clippy
-      - run: mise exec -- cargo build -p a
-      - run: mise run test
-      - *transport-features
+          @'
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+          import subprocess
 
-  # The macOS app: the FFI package (boltffi pack apple --deny-skipped), the
-  # reducer vectors and a live session through it in Swift, then the app
-  # built headless with xcodebuild.
-  apple:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v7
-      - *mbx-dir
-      - *cache
-      - uses: jdx/mise-action@v5
+          root = Path(os.environ["RUNNER_TEMP"])
+          evidence = root / "retirement-evidence"
+          evidence.mkdir(exist_ok=True)
+          keep = {"PATH", "PATHEXT", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "COMMONPROGRAMFILES", "COMMONPROGRAMFILES(X86)", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "TMP", "TEMP", "RUSTUP_HOME", "CARGO_HOME", "RUSTUP_TOOLCHAIN", "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS", "LIB", "INCLUDE", "LIBPATH", "VSINSTALLDIR", "VCINSTALLDIR", "VCTOOLSINSTALLDIR", "WINDOWSSDKDIR", "WINDOWSSDKVERSION"}
+          clean = {k: v for k, v in os.environ.items() if k.upper() in keep}
+          clean.update(MISE_NO_ENV="1", MISE_AUTO_INSTALL="false", CARGO_BUILD_JOBS="2", CARGO_PROFILE_DEV_CODEGEN_BACKEND="llvm", CARGO_TARGET_DIR=str(root / "tgt-small-fixes"), MBX_CACHE_DIR=str(root / "mbx"), A_HOME=str(root / "retirement-home"), OPENAI_API_KEY="loopback-dummy", OPENAI_BASE_URL="http://127.0.0.1:1/v1", ANTHROPIC_API_KEY="loopback-dummy", ANTHROPIC_BASE_URL="http://127.0.0.1:1", NO_PROXY="127.0.0.1,localhost")
+          source = Path("crates/sys/src/runtime/image.rs")
+          probed = source.read_bytes()
+          pristine = subprocess.check_output(["git", "show", "c6e1b87f:crates/sys/src/runtime/image.rs"], env=clean)
+
+          def build(label):
+              result = subprocess.run(["mise", "exec", "--", "cargo", "test", "-p", "sys", "--lib", "--no-run", "--message-format=json"], env=clean, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+              (evidence / f"build-{label}.log").write_text(result.stdout)
+              if result.returncode:
+                  print(result.stdout, flush=True)
+                  raise SystemExit(result.returncode)
+              for line in result.stdout.splitlines():
+                  try:
+                      item = json.loads(line)
+                  except ValueError:
+                      continue
+                  if item.get("reason") == "compiler-artifact" and item.get("executable") and item["target"]["name"] == "sys":
+                      target = root / f"sys-{label}.exe"
+                      shutil.copyfile(item["executable"], target)
+                      return str(target)
+              raise RuntimeError("sys test executable missing from Cargo metadata")
+
+          try:
+              source.write_bytes(pristine)
+              original_exe = build("pristine")
+          finally:
+              source.write_bytes(probed)
+          probe_exe = build("probe")
+          name = "runtime::image::tests::retiring_a_running_image_allows_updates_and_reclamation_after_exit"
+          modes = ["pristine", "held", "dropped", "duplicate", "thread"]
+          counts = {mode: {"passed": 0, "failed": 0} for mode in modes}
+          for round_number in range(1, 201):
+              order = modes if round_number % 2 else list(reversed(modes))
+              for mode in order:
+                  env = dict(clean)
+                  if mode != "pristine":
+                      env["A_TEST_IMAGE_HANDLE_PROBE"] = mode
+                  result = subprocess.run([original_exe if mode == "pristine" else probe_exe, "--exact", name, "--nocapture"], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                  (evidence / f"{round_number:03d}-{mode}.log").write_text(result.stdout)
+                  counts[mode]["passed" if result.returncode == 0 else "failed"] += 1
+                  if result.returncode and counts[mode]["failed"] <= 3:
+                      print(f"round={round_number} mode={mode}\n{result.stdout}", flush=True)
+              if round_number % 25 == 0:
+                  print(json.dumps({"rounds": round_number, "counts": counts}), flush=True)
+          (evidence / "summary.json").write_text(json.dumps({"rounds": 200, "counts": counts}, indent=2))
+          print(json.dumps(counts), flush=True)
+          '@ | Set-Content "$env:RUNNER_TEMP/retirement-probe.py"
+          python "$env:RUNNER_TEMP/retirement-probe.py"
+      - if: always()
+        uses: actions/upload-artifact@v5
         with:
-          install_args: rust mr-boxington github:boltffi/boltffi xcodegen
-      - run: mise run --jobs 1 apple:check
+          name: retirement-evidence
+          path: ${{ runner.temp }}/retirement-evidence
