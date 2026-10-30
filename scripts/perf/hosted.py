@@ -414,7 +414,8 @@ def main():
             parser.error("residency measures unchanged-source A/A ownership waves; omit variant and paired-ref")
         run([sys.executable, ROOT / "scripts/perf/residency.py", "--source", source,
              "--output", output, "--target", Path(os.environ["CARGO_TARGET_DIR"]),
-             "--rounds", os.environ.get("PERF_PAIRED_ROUNDS", "5")], cwd=source)
+             "--rounds", os.environ.get("PERF_PAIRED_ROUNDS", "5"),
+             *(["--census"] if os.environ.get("PERF_ALLOC_CENSUS") == "true" else [])], cwd=source)
         return
     if args.phase == "sessions":
         sessions(source, output, variant, args.paired_ref)

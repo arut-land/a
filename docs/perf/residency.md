@@ -419,3 +419,57 @@ verified. Hosted jobs clean their external targets as their final step.
 Only the four owned paths differ from `origin/main`. No product source fix,
 new dependency or branch-owned wire change was made. CI has not been
 dispatched; phase 2 awaits independent review.
+
+
+### Opt-in Linux and Windows allocator census
+
+The `perf` workflow's `alloc_census=true` input selects an instrumented
+residency cohort. With `runner=all`, it runs on native Ubuntu x64/ARM64 and
+Windows x64/ARM64 runners. Five alternating A/A rounds remain the minimum;
+the lifecycle, equal stored histories, slow follower assertions and reopen
+checks are unchanged. This cohort must not be used for latency, idle CPU or
+thread-count comparisons with the uninstrumented workload.
+
+Only `a --features fixtures` includes `sys::census`. With the feature off,
+the CLI initialization call and census module are compiled out. With fixtures
+on, only the internal daemon entry point checks `A_ALLOC_CENSUS`; the harness
+sets it to a directory inside its isolated home. The hook publishes a PID
+specific loopback port there and serves one native census per connection.
+One extra diagnostic thread persists for the daemon's lifetime. The harness
+warms the endpoint before seeding histories, samples every lifecycle boundary,
+and stops the daemon through that home's ordinary stop command.
+
+On glibc, `malloc_info(0, ...)` supplies raw XML for all arenas, with no
+preload or replacement allocator. The report derives free capacity from the
+root `fast` and `rest` totals, allocator capacity from the root current
+system bytes plus `mmap` bytes, and allocated bytes by subtraction. Raw
+`mallinfo2` allocated/free counters are also retained as a cross-check.
+Allocator-accounted allocated bytes include metadata and per-thread cached
+blocks; they are not an exact count of application-live payloads. Free
+capacity can include pages already discarded by the allocator and therefore
+is not a measurement of resident free pages.
+
+On Windows, `GetProcessHeaps` enumerates process heaps and `HeapSummary`
+records each heap's allocated, committed and reserved bytes. The report
+sums allocated bytes and committed capacity, with their difference labeled
+free capacity; that difference also includes heap overhead. These totals
+do not include direct VM allocations outside the heaps. See Microsoft's
+[HeapSummary contract](https://learn.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-heapsummary)
+and [counter definitions](https://learn.microsoft.com/en-us/windows/win32/api/heapapi/ns-heapapi-heap_summary).
+
+Every raw response carries the daemon PID and charged bytes immediately
+before and after collecting allocator statistics. The external charge probe
+continues to report PSS or private commit separately. Neither the native
+heap collection nor the charge bracket freezes all daemon threads; only
+stable lifecycle boundaries should be compared. Raw XML/per-heap records,
+all stage distributions and paired hibernation deltas remain in JSON/JSONL
+artifacts. Summary tables give median [min, max] in KiB.
+
+The platform guidance is to preserve allocator hysteresis and profile
+before tuning. glibc's [trim and mmap thresholds](https://sourceware.org/glibc/manual/latest/html_node/Memory-Allocation-Tunables.html)
+adapt when left at their defaults; setting thresholds explicitly disables
+that adaptation. Microsoft's [LFH guidance](https://learn.microsoft.com/en-us/windows/win32/memory/low-fragmentation-heap)
+says modern Windows enables the policy as needed and recommends profiling
+to assess its benefit. This census changes no arena limit, threshold,
+heap policy or reclamation schedule. Native findings and any proposed policy
+experiment must be supported by the resulting cohort, not by the M3 result.

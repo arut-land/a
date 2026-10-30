@@ -7,6 +7,10 @@ on:
     - cron: '17 4 * * 1'
   workflow_dispatch:
     inputs:
+      alloc_census:
+        description: "Native fixture allocation census (instrumented residency cohort)"
+        default: false
+        type: boolean
       residency:
         description: "Complete lifecycle ownership waves (five alternating A/A rounds)"
         default: false
@@ -82,7 +86,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: perf-${{ github.ref }}-${{ inputs.autostart && 'autostart' || 'measure' }}-${{ inputs.runner || 'all' }}-${{ inputs.source_ref || github.sha }}-${{ inputs.paired_ref }}-${{ inputs.build_only }}-${{ inputs.sessions }}-${{ inputs.residency }}-${{ inputs.variant || '{}' }}
+  group: perf-${{ github.ref }}-${{ inputs.autostart && 'autostart' || 'measure' }}-${{ inputs.runner || 'all' }}-${{ inputs.source_ref || github.sha }}-${{ inputs.paired_ref }}-${{ inputs.build_only }}-${{ inputs.sessions }}-${{ inputs.residency }}-${{ inputs.alloc_census }}-${{ inputs.variant || '{}' }}
   cancel-in-progress: false
 
 env:
@@ -93,14 +97,14 @@ env:
 
 jobs:
   residency:
-    if: inputs.residency
+    if: inputs.residency || inputs.alloc_census
     name: residency (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        runner: ${{ fromJSON(inputs.runner == 'linux-windows' && '["ubuntu-latest", "windows-latest"]' || inputs.runner && inputs.runner != 'all' && format('["{0}"]', inputs.runner) || '["ubuntu-latest", "ubuntu-24.04-arm", "windows-latest", "windows-11-arm", "macos-latest", "macos-15-intel"]') }}
+        runner: ${{ fromJSON(inputs.alloc_census && inputs.runner == 'all' && '["ubuntu-latest", "ubuntu-24.04-arm", "windows-latest", "windows-11-arm"]' || inputs.runner == 'linux-windows' && '["ubuntu-latest", "windows-latest"]' || inputs.runner && inputs.runner != 'all' && format('["{0}"]', inputs.runner) || '["ubuntu-latest", "ubuntu-24.04-arm", "windows-latest", "windows-11-arm", "macos-latest", "macos-15-intel"]') }}
     defaults:
       run:
         shell: bash
@@ -108,6 +112,8 @@ jobs:
       CARGO_BUILD_JOBS: 2
       CARGO_PROFILE_DEV_CODEGEN_BACKEND: llvm
       PYTHONDONTWRITEBYTECODE: 1
+      MISE_IGNORED_CONFIG_PATHS: ${{ github.workspace }}
+      PERF_ALLOC_CENSUS: ${{ inputs.alloc_census || false }}
       PERF_PAIRED_ROUNDS: ${{ inputs.paired_rounds || '5' }}
     steps:
       - name: External build directory
@@ -148,6 +154,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang mold pkg-config libssl-dev
+      - uses: jdx/mise-action@v5
+        with:
+          working_directory: measured
+          install_args: cargo:cargo-nextest
+      - name: Fixture census invariants
+        if: inputs.alloc_census
+        working-directory: measured
+        run: mise exec cargo:cargo-nextest -- cargo +"$RUSTUP_TOOLCHAIN" nextest run -p sys --features fixtures
       - name: Native Cargo path
         working-directory: measured
         run: echo "$(dirname "$(rustup which cargo)")" >> "$GITHUB_PATH"
@@ -158,13 +172,15 @@ jobs:
         if: always()
         with:
           name: residency-${{ matrix.runner }}
-          path: ${{ runner.temp }}/residency-output/*.json*
+          path: |
+            ${{ runner.temp }}/residency-output/*.json*
+            ${{ runner.temp }}/residency-output/*.md
           retention-days: 30
       - name: Clean owned target
         if: always()
         working-directory: measured
         run: |
-          cargo clean --target-dir "$CARGO_TARGET_DIR"
+          mise exec -- cargo +"$RUSTUP_TOOLCHAIN" clean --target-dir "$CARGO_TARGET_DIR"
           python - <<'PYTHON'
           import os, shutil
           shutil.rmtree(os.environ['CARGO_TARGET_DIR'], ignore_errors=True)
@@ -218,7 +234,7 @@ jobs:
           path: ${{ runner.temp }}/idle-charge-output/*.json
 
   measure:
-    if: github.event_name != 'schedule' && !inputs.autostart && !inputs.idle_charge && !inputs.residency
+    if: github.event_name != 'schedule' && !inputs.autostart && !inputs.idle_charge && !inputs.residency && !inputs.alloc_census
     name: perf (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
     # Churn workloads and twenty-round ablations need longer than the standard suite.

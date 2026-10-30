@@ -37,6 +37,8 @@ sys::main!(run);
 
 fn run(startup: sys::handover::Startup) -> ExitCode {
     sys::small_footprint();
+    #[cfg(feature = "fixtures")]
+    sys::census::initialize();
     // The daemon never wants one: whoever starts it gives it no terminal.
     if std::env::args_os()
         .nth(1)

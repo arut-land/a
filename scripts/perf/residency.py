@@ -8,12 +8,14 @@ from pathlib import Path
 import platform
 import queue
 import shutil
+import socket
 import subprocess
 import sys
 import threading
 import time
 import tomllib
 import unittest
+import xml.etree.ElementTree as ET
 
 from build import SUFFIX, environment, executable, release_arguments, stage
 from lifecycle import checked, daemon
@@ -253,6 +255,17 @@ mod tests {
 '''
 
 
+def cargo_run(command, **kwargs):
+    if command[0] == "cargo":
+        toolchain = os.environ.get("RUSTUP_TOOLCHAIN")
+        if not toolchain:
+            with (Path(kwargs["cwd"]) / "rust-toolchain.toml").open("rb") as stream:
+                toolchain = tomllib.load(stream)["toolchain"]["channel"]
+        command = ["mise", "exec", *(["cargo:cargo-nextest"] if command[1] == "nextest" else []),
+                   "--", "cargo", f"+{toolchain}", *command[1:]]
+    return subprocess.run(command, **kwargs)
+
+
 def build_probe(source, output, target):
     root = target / "residency-probe-source"
     root.mkdir(parents=True, exist_ok=True)
@@ -274,10 +287,10 @@ def build_probe(source, output, target):
     shutil.copy2(source / "Cargo.lock", root / "Cargo.lock")
     env = environment(target)
     for command in (["cargo", "fmt", "--manifest-path", str(root / "Cargo.toml")],
-                    ["cargo", "test", "--manifest-path", str(root / "Cargo.toml")],
+                    ["cargo", "nextest", "run", "--manifest-path", str(root / "Cargo.toml")],
                     ["cargo", "clippy", "--manifest-path", str(root / "Cargo.toml"), "--all-targets", "--", "-D", "warnings"]):
-        subprocess.run(command, cwd=source, env=env, check=True)
-    result = subprocess.run(["cargo", "build", *release_arguments(), "--manifest-path", str(root / "Cargo.toml"),
+        cargo_run(command, cwd=source, env=env, check=True)
+    result = cargo_run(["cargo", "build", *release_arguments(), "--manifest-path", str(root / "Cargo.toml"),
                              "--message-format=json"], cwd=source, env=env, check=True, capture_output=True, text=True)
     binary = next(Path(r["executable"]) for line in result.stdout.splitlines()
                   if (r := json.loads(line)).get("executable"))
@@ -333,6 +346,35 @@ def hibernate(probe, stored):
     raise TimeoutError(f"hibernation not acknowledged: {rows}")
 
 
+def allocation_census(active):
+    port = active.census / f"{active.pid}.port"
+    deadline = time.monotonic() + 30
+    while not port.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("fixture daemon did not publish census endpoint")
+        time.sleep(.01)
+    with socket.create_connection(("127.0.0.1", int(port.read_text())), timeout=30) as stream:
+        with stream.makefile("r") as reader:
+            value = json.loads(reader.readline())
+    if "error" in value:
+        raise RuntimeError(value["error"])
+    if value["allocator"] == "glibc":
+        root = ET.fromstring(value["malloc_info"])
+        arena = int(root.find("./system[@type='current']").attrib["size"])
+        free = sum(int(root.find(f"./total[@type='{kind}']").attrib["size"]) for kind in ("fast", "rest"))
+        mapped = int(root.find("./total[@type='mmap']").attrib["size"])
+        value.update(allocated_bytes=arena - free + mapped, retained_free_bytes=free,
+                     allocator_bytes=arena + mapped)
+    else:
+        allocated = sum(row["allocated_bytes"] for row in value["heaps"])
+        committed = sum(row["committed_bytes"] for row in value["heaps"])
+        value.update(allocated_bytes=allocated, retained_free_bytes=committed - allocated,
+                     allocator_bytes=committed)
+    assert value["pid"] == active.pid, value
+    value["observed_at_ns"] = time.time_ns()
+    return value
+
+
 def observe(probe, active, idle_seconds):
     if active.monitor_errors:
         raise RuntimeError(active.monitor_errors)
@@ -341,12 +383,14 @@ def observe(probe, active, idle_seconds):
     started = time.monotonic()
     time.sleep(idle_seconds)
     after = snapshot(active.pid, threads=True)
-    return dict(**charge, **active.peaks, before=before, after=after, seconds=time.monotonic() - started,
+    elapsed = time.monotonic() - started
+    census = dict(census=allocation_census(active)) if hasattr(active, "census") else {}
+    return dict(**charge, **census, **active.peaks, before=before, after=after, seconds=elapsed,
                 cpu_ms=(after["cpu_seconds"] - before["cpu_seconds"]) * 1000,
                 switches=after["ctx_switches"] - before["ctx_switches"])
 
 
-def sample(binary, probe_binary, output, stored, count, turns, size, idle_seconds):
+def sample(binary, probe_binary, output, stored, count, turns, size, idle_seconds, census=False):
     with daemon(str(binary), output) as active:
         # lifecycle owns startup/teardown; restart applies this benchmark's
         # hibernation interval without changing the shared helper or product.
@@ -354,8 +398,14 @@ def sample(binary, probe_binary, output, stored, count, turns, size, idle_second
         active.client.wait(timeout=30)
         stop_daemon(binary, active.env, active.home)
         (active.home / "config.toml").write_text('[daemon]\nagent="echo"\nidle_secs=600\nhibernate_secs=1\n')
+        if census:
+            active.census = active.home / "census"
+            active.census.mkdir()
+            active.env["A_ALLOC_CENSUS"] = str(active.census)
         checked([str(binary), "ls"], env=active.env, cwd=active.home, timeout=60)
         active.pid = int((active.home / "run/daemon.pid").read_text().splitlines()[0])
+        if census:
+            allocation_census(active)  # warm diagnostic buffers before catalog seeding
         probe = Probe(probe_binary, active)
         with contextlib.ExitStack() as stack:
             stack.enter_context(contextlib.closing(probe))
@@ -427,6 +477,9 @@ def summarize(records):
             for key in ("peak_rss_kib", "peak_footprint_kib"):
                 if key in s["after"]:
                     values[key] = s["after"][key]
+            if "census" in s:
+                values.update({metric.removesuffix("_bytes") + "_kib": s["census"][metric] / 1024 for metric in
+                               ("allocated_bytes", "retained_free_bytes", "allocator_bytes")})
             if s.get("attach"):
                 values["reattach_ms"] = max(a["ms"] for a in s["attach"])
             key = f'{r["label"]}/stored={r["stored"]}/active={r["active"]}/{name}'
@@ -436,6 +489,10 @@ def summarize(records):
                                ("wave2_hibernated", "wave1_hibernated")):
             key = f'{r["label"]}/stored={r["stored"]}/active={r["active"]}/{later}-minus-{earlier}'
             group = groups.setdefault(key, {})
+            if "census" in r["stages"][later]:
+                for metric in ("allocated_bytes", "retained_free_bytes", "allocator_bytes"):
+                    group.setdefault(metric.removesuffix("_bytes") + "_kib", []).append((r["stages"][later]["census"][metric] -
+                                                         r["stages"][earlier]["census"][metric]) / 1024)
             for metric, value in dict(
                 charged_kib=(r["stages"][later]["charged_bytes"] - r["stages"][earlier]["charged_bytes"]) / 1024,
                 rss_kib=r["stages"][later]["before"]["rss_kib"] - r["stages"][earlier]["before"]["rss_kib"],
@@ -462,6 +519,10 @@ def paired(records):
         for stage, value in r["stages"].items():
             key = f"stored={stored}/active={active}/{stage}"
             group = groups.setdefault(key, {})
+            if "census" in value:
+                for metric in ("allocated_bytes", "retained_free_bytes", "allocator_bytes"):
+                    group.setdefault(metric.removesuffix("_bytes") + "_kib", []).append(
+                        (value["census"][metric] - other["stages"][stage]["census"][metric]) / 1024)
             for metric, difference in dict(
                 charged_kib=(value["charged_bytes"] - other["stages"][stage]["charged_bytes"]) / 1024,
                 cpu_ms=value["cpu_ms"] - other["stages"][stage]["cpu_ms"],
@@ -482,6 +543,15 @@ def table(summary):
             value = row.get(metric)
             cells.append("" if value is None else "{median:.3f} [{min:.3f}, {max:.3f}]".format(**value))
         lines.append("| " + key + " | " + " | ".join(cells) + " |")
+    census = {key: row for key, row in summary.items() if "allocated_kib" in row}
+    if census:
+        lines.extend(["", "Instrumented native allocator observations; timings above are diagnostic only.", "",
+                      "| case/stage | allocator allocated KiB | allocator free capacity KiB | allocator total KiB |",
+                      "| --- | ---: | ---: | ---: |"])
+        for key, row in census.items():
+            cells = [f"{row[metric]['median']:.3f} [{row[metric]['min']:.3f}, {row[metric]['max']:.3f}]"
+                     for metric in ("allocated_kib", "retained_free_kib", "allocator_kib")]
+            lines.append("| " + " | ".join([key, *cells]) + " |")
     return "\n".join(lines) + "\n"
 
 
@@ -493,6 +563,7 @@ def main():
     parser.add_argument("--binary", type=Path)
     parser.add_argument("--probe", type=Path)
     parser.add_argument("--build-only", action="store_true")
+    parser.add_argument("--census", action="store_true", help="instrumented native allocator cohort; excluded from timing claims")
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--stored", default="1,8,32")
     parser.add_argument("--active", default="1,4,8")
@@ -500,6 +571,18 @@ def main():
     parser.add_argument("--bytes", type=int, default=65536)
     parser.add_argument("--idle-seconds", type=float, default=1)
     args = parser.parse_args()
+    # Do not inherit provider credentials or proxy routing into fixture processes.
+    keep = {"PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TMP", "TEMP", "LANG",
+            "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
+            "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMDATA", "NUMBER_OF_PROCESSORS",
+            "RUNNER_TEMP", "GITHUB_STEP_SUMMARY"}
+    clean = {key: value for key, value in os.environ.items()
+             if key.upper() in keep or key.startswith(("CARGO_", "RUST", "MISE_", "MBX_"))}
+    os.environ.clear()
+    os.environ.update(clean, OPENAI_API_KEY="loopback-dummy", OPENAI_BASE_URL="http://127.0.0.1:1/v1",
+                      NO_PROXY="127.0.0.1,localhost", CARGO_BUILD_JOBS="2")
+    if args.census and sys.platform not in ("linux", "win32"):
+        parser.error("native census cohort requires glibc Linux or Windows")
     if args.rounds < 5:
         parser.error("at least five interleaved rounds are required")
     stored, counts = [int(n) for n in args.stored.split(",")], [int(n) for n in args.active.split(",")]
@@ -509,7 +592,7 @@ def main():
     if (output / "residency.jsonl").exists() or (output / "residency-failures.jsonl").exists():
         parser.error("select a fresh output directory; existing samples must not be mixed")
     output.mkdir(parents=True, exist_ok=True)
-    binary = args.binary.resolve() if args.binary else stage(executable(source, environment(target), ["--features", "fixtures"]), output / ("a-fixtures" + SUFFIX))
+    binary = args.binary.resolve() if args.binary else stage(executable(source, environment(target), ["--features", "fixtures"], run=cargo_run), output / ("a-fixtures" + SUFFIX))
     probe = args.probe.resolve() if args.probe else build_probe(source, output, target)
     from hosted import hardware
     metadata = dict(hardware=hardware(), platform=platform.platform(), machine=platform.machine(),
@@ -517,7 +600,7 @@ def main():
                     working_tree=subprocess.check_output(["git", "status", "--short"], cwd=source, text=True),
                     workload_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                     binaries={str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in (binary, probe)},
-                    parameters=dict(stored=stored, active=counts, turns=args.turns, bytes=args.bytes, idle_seconds=args.idle_seconds))
+                    parameters=dict(census=args.census, stored=stored, active=counts, turns=args.turns, bytes=args.bytes, idle_seconds=args.idle_seconds))
     (output / "residency-host.json").write_text(json.dumps(metadata, indent=2) + "\n")
     if args.build_only:
         return
@@ -529,7 +612,7 @@ def main():
                 print(f"round={round} {label} stored={total} active={active}", flush=True)
                 record = dict(round=round, label=label, stored=total, active=active)
                 try:
-                    record["stages"] = sample(binary, probe, output, total, active, args.turns, args.bytes, args.idle_seconds)
+                    record["stages"] = sample(binary, probe, output, total, active, args.turns, args.bytes, args.idle_seconds, args.census)
                 except Exception as error:
                     record["failure"] = repr(error)
                     with (output / "residency-failures.jsonl").open("a") as stream:
