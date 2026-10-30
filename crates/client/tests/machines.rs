@@ -76,16 +76,31 @@ fn ssh_resolves_each_host_and_a_second_name_for_one_route_is_left_out() {
 
 #[test]
 fn the_host_list_follows_its_files() {
+    let started = Instant::now();
+    eprintln!(
+        "diagnostic {:?} watcher start",
+        std::time::SystemTime::now()
+    );
     let (_dir, sources) = sources("", "Host one\n  HostName one.example\n");
     let seen: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
     let into = Arc::clone(&seen);
     let hub = rt::watch::Hub::new(Arc::new(rt::Threads::default()));
     let _watch = sources.watch(&hub, move |known: io::Result<Vec<Known>>| {
+        eprintln!(
+            "diagnostic {:?} {:?} callback {known:?}",
+            std::time::SystemTime::now(),
+            started.elapsed()
+        );
         let known = known.unwrap();
         into.lock()
             .unwrap()
             .push(known.into_iter().map(|k| k.machine.name).collect());
     });
+    eprintln!(
+        "diagnostic {:?} {:?} subscribed",
+        std::time::SystemTime::now(),
+        started.elapsed()
+    );
     let until = |names: &[&str]| {
         let deadline = Instant::now() + Duration::from_secs(20);
         while seen.lock().unwrap().last().is_none_or(|last| last != names) {
@@ -94,6 +109,21 @@ fn the_host_list_follows_its_files() {
         }
     };
     until(&["one"]);
+    eprintln!(
+        "diagnostic {:?} {:?} initial observed",
+        std::time::SystemTime::now(),
+        started.elapsed()
+    );
     fs::write(&sources.machines, "[machine.mac2]\n").unwrap();
+    eprintln!(
+        "diagnostic {:?} {:?} update written",
+        std::time::SystemTime::now(),
+        started.elapsed()
+    );
     until(&["mac2", "one"]);
+    eprintln!(
+        "diagnostic {:?} {:?} update observed",
+        std::time::SystemTime::now(),
+        started.elapsed()
+    );
 }

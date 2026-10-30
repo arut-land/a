@@ -152,8 +152,17 @@ impl Sources {
 
     /// Resolves routes concurrently on the supplied runtime's Storage pool.
     pub async fn resolve_async(&self, rt: &Rt) -> io::Result<Vec<Known>> {
+        eprintln!(
+            "diagnostic {:?} resolve begin",
+            std::time::SystemTime::now()
+        );
         let sources = self.clone();
         let machines = rt::unblock(&**rt, move || sources.machines()).await?;
+        eprintln!(
+            "diagnostic {:?} list read {}",
+            std::time::SystemTime::now(),
+            machines.len()
+        );
         let resolving: Vec<_> = machines
             .iter()
             .map(|machine| {
@@ -215,6 +224,10 @@ impl Sources {
     }
 
     fn route(&self, host: &Host) -> Option<Route> {
+        eprintln!(
+            "diagnostic {:?} ssh start {host}",
+            std::time::SystemTime::now()
+        );
         let mut ssh =
             Command::new(std::env::var_os("A_SSH").unwrap_or_else(|| OsString::from("ssh")));
         ssh.arg("-G");
@@ -227,6 +240,11 @@ impl Sources {
             .stderr(Stdio::null())
             .output()
             .ok()?;
+        eprintln!(
+            "diagnostic {:?} ssh finished {host} {}",
+            std::time::SystemTime::now(),
+            output.status
+        );
         output.status.success().then_some(())?;
         let text = String::from_utf8_lossy(&output.stdout);
         let value = |key: &str| {
@@ -271,12 +289,24 @@ struct Watched {
 impl Watched {
     fn changed(self: &Arc<Self>) {
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        eprintln!(
+            "diagnostic {:?} generation {generation} scheduled",
+            std::time::SystemTime::now()
+        );
         let watched = Arc::downgrade(self);
         self.rt.spawn(Box::pin(async move {
             let Some(shared) = watched.upgrade() else {
                 return;
             };
+            eprintln!(
+                "diagnostic {:?} generation {generation} running",
+                std::time::SystemTime::now()
+            );
             let found = shared.sources.resolve_async(&shared.rt).await;
+            eprintln!(
+                "diagnostic {:?} generation {generation} resolved",
+                std::time::SystemTime::now()
+            );
             if shared.generation.load(Ordering::Acquire) == generation {
                 (shared.sink)(found);
             }
