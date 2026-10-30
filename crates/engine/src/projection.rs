@@ -236,7 +236,7 @@ impl Actor {
     }
 
     pub(super) async fn await_reply(&mut self, call: CallId, waiter: super::Waiter) {
-        if let Some(seq) = self.journal.index.result(call, self.journal.durable_seq) {
+        if let Some(seq) = self.journal.index.result(call, self.journal.durable.seq()) {
             if let Ok(entry) = self.indexed_entry(seq).await {
                 self.replies.contexts.remove(&call);
                 waiter.reply(&entry.body);
@@ -246,7 +246,7 @@ impl Actor {
         }
     }
 
-    pub(super) async fn show(&mut self, entries: Vec<Entry>) {
+    pub(super) async fn show(&mut self, entries: Vec<Entry>, cut: super::journal::DurableCut) {
         if entries.is_empty() {
             return;
         }
@@ -272,7 +272,10 @@ impl Actor {
         let indexed = frames.history.is_indexed();
         let publish = move || {
             for entry in entries {
-                frames.push(entry.seq.get());
+                frames.publish(
+                    cut.prefix(entry.seq.get())
+                        .expect("durable publication prefix"),
+                );
                 if indexed {
                     frames.history.observe(&entry);
                 }
@@ -424,7 +427,7 @@ impl Actor {
 
     pub(super) fn current_activity(&self) -> Option<(u64, Activity)> {
         let seq = self.core.ledger().seq();
-        (self.live.frames.seq() == seq && self.journal.durable_seq >= seq)
+        (self.live.frames.seq() == seq && self.journal.durable.seq() >= seq)
             .then(|| (seq, self.core.ledger().activity()))
     }
 
@@ -491,7 +494,7 @@ impl Actor {
             self.live.session.blobs.places(),
             self.live.session.model_only(),
             HistoryCut {
-                through: self.journal.ordered_seq,
+                through: self.journal.ordered.seq(),
                 call,
                 exchanges: None,
             },

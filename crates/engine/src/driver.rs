@@ -48,7 +48,7 @@ use crate::{Daemon, lock};
 use kernel::SideFact;
 
 #[path = "journal.rs"]
-mod journal;
+pub(crate) mod journal;
 #[path = "projection.rs"]
 mod projection;
 use journal::{FlushMode, Journal};
@@ -910,12 +910,9 @@ impl Live {
             deferred: std::collections::VecDeque::new(),
             rested: true,
             journal: Journal {
-                writer: Some(loaded.writer),
                 fold_snapshot,
-                ordered_seq: loaded.seq,
-                durable_seq: loaded.seq,
                 since_snapshot: loaded.read,
-                ..Journal::default()
+                ..Journal::loaded(header.id, loaded.writer, loaded.seq)
             },
             projection: Projection {
                 invocations,
@@ -1426,7 +1423,7 @@ impl Actor {
         // A generation cannot divide a prefix whose epoch still owns completion.
         if !self.journal.is_durable() {
             self.sync().await?;
-            if self.journal.durable_seq < self.journal.ordered_seq
+            if !self.journal.durable.covers(self.journal.ordered)
                 || !self.journal.flushes.is_empty()
             {
                 return Ok(());
@@ -1612,16 +1609,15 @@ impl Actor {
             }
             // Recovery does not commit the burst that failed.
             match self.burst(events, mutations, sync).await {
-                Ok(()) if self.journal.durable_seq >= self.journal.ordered_seq => {
+                Ok(()) if self.journal.durable.covers(self.journal.ordered) => {
                     for done in dones {
                         done.send(());
                     }
                 }
-                Ok(()) => self.journal.waiting_sync.extend(
-                    dones
-                        .into_iter()
-                        .map(|done| (self.journal.ordered_seq, done)),
-                ),
+                Ok(()) => self
+                    .journal
+                    .waiting_sync
+                    .extend(dones.into_iter().map(|done| (self.journal.ordered, done))),
                 Err(()) => drop(dones),
             }
             // A call may begin to wait without the work marked ending.
@@ -1794,7 +1790,7 @@ impl Actor {
             Msg::Attach(client, since, done) => {
                 self.admissions.push(Guarded {
                     admission: Admission {
-                        through: self.journal.ordered_seq,
+                        through: self.journal.ordered.seq(),
                         requirement: Requirement::Durable,
                     },
                     work: Admitted::Attach(client, since, done),
@@ -1824,14 +1820,14 @@ impl Actor {
             }
             #[cfg(test)]
             Msg::Position(done) => {
-                done.send((self.journal.ordered_seq, self.journal.durable_seq));
+                done.send((self.journal.ordered.seq(), self.journal.durable.seq()));
                 return None;
             }
             #[cfg(test)]
             Msg::ProjectionCache(populate, reply) => {
                 if populate {
                     self.conversation(CallId(
-                        protocol::Seq::new(self.journal.ordered_seq.max(1)).unwrap(),
+                        protocol::Seq::new(self.journal.ordered.seq().max(1)).unwrap(),
                     ))
                     .await
                     .unwrap();
@@ -2368,7 +2364,7 @@ impl Actor {
                 }
             }
         }
-        let through = commit.map_or(self.journal.ordered_seq, |commit| commit.through);
+        let through = commit.map_or(self.journal.ordered.seq(), |commit| commit.through);
         let publish = commit.is_some_and(|commit| commit.publish);
         let needs = after
             .iter()
@@ -2376,7 +2372,8 @@ impl Actor {
             .map(|guarded| guarded.admission.through)
             .max()
             .unwrap_or(0);
-        let flush = (publish || needs > self.journal.durable_seq) && through > self.covering();
+        let flush =
+            (publish || needs > self.journal.durable.seq()) && through > self.covering().seq();
         let written = if let Some(commit) = commit {
             self.commit(
                 &mut appends,
@@ -2467,8 +2464,8 @@ impl Actor {
         for guarded in std::mem::take(&mut self.admissions) {
             let admission = guarded.admission;
             let watermark = match admission.requirement {
-                Requirement::Ordered => self.journal.ordered_seq,
-                Requirement::Durable => self.journal.durable_seq,
+                Requirement::Ordered => self.journal.ordered.seq(),
+                Requirement::Durable => self.journal.durable.seq(),
             };
             if admission.through > watermark {
                 waiting.push(guarded);
@@ -2591,8 +2588,8 @@ impl Actor {
                 return;
             }
         };
-        self.journal.ordered_seq = loaded.seq;
-        self.journal.durable_seq = loaded.seq;
+        self.journal
+            .recovered(self.live.id, &loaded.writer, loaded.seq);
         let recovered = FrameLog::with_owner(
             Arc::clone(&loaded.lines),
             loaded.seq,
@@ -2633,7 +2630,7 @@ impl Actor {
                 return;
             }
         };
-        self.show(entries).await;
+        self.show(entries, self.journal.durable).await;
         self.publish();
         let load = Load {
             session: Some(self.live.id),
@@ -2745,7 +2742,7 @@ impl Actor {
             self.live.session.spawn_work(
                 WorkId::Report(child),
                 Admission {
-                    through: self.journal.durable_seq,
+                    through: self.journal.durable.seq(),
                     requirement: Requirement::Durable,
                 },
                 |cancel| {

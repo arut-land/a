@@ -159,7 +159,16 @@ impl FrameLog {
     }
 
     /// Publishes the next committed sequence without retaining its payload.
+    pub(crate) fn publish(&self, cut: crate::driver::journal::DurableCut) {
+        self.advance(cut.seq());
+    }
+
+    #[cfg(test)]
     pub fn push(&self, seq: u64) {
+        self.advance(seq);
+    }
+
+    fn advance(&self, seq: u64) {
         let last = self.seq.swap(seq, Ordering::Release);
         debug_assert_eq!(last + 1, seq, "entries are shown in order");
     }

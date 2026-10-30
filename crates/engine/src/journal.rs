@@ -1,6 +1,65 @@
 //! Ordered writes and durable publication belong to the same session writer.
+//!
+//! An ordered prefix cannot substitute for a durable certificate:
+//! ```compile_fail,E0308
+//! mod journal {
+//!     include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/driver/cuts.rs"));
+//! }
+//! fn ordered_is_not_durable(cut: journal::OrderedCut) {
+//!     let _: journal::DurableCut = cut;
+//! }
+//! ```
+//! Cuts have no total ordering across sessions or generations:
+//! ```compile_fail,E0277
+//! mod journal {
+//!     include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/driver/cuts.rs"));
+//! }
+//! fn cuts_cannot_be_combined_by_max(a: journal::OrderedCut, b: journal::OrderedCut) {
+//!     let _ = std::cmp::max(a, b);
+//! }
+//! ```
+//! ```compile_fail,E0277
+//! mod journal {
+//!     include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/driver/cuts.rs"));
+//! }
+//! fn durable_cuts_cannot_be_combined_by_max(a: journal::DurableCut, b: journal::DurableCut) {
+//!     let _ = std::cmp::max(a, b);
+//! }
+//! ```
+//! Only the journal can strengthen the guarantee:
+//! ```compile_fail,E0624
+//! mod journal {
+//!     mod cuts {
+//!         include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/driver/cuts.rs"));
+//!     }
+//!     pub(crate) use cuts::{DurableCut, OrderedCut};
+//! }
+//! fn callers_cannot_certify_an_ordered_cut(cut: journal::OrderedCut) {
+//!     let _ = journal::DurableCut::certify(cut);
+//! }
+//! ```
+//! These contracts compile the actual certificate implementation, including
+//! its private constructors, without exporting engine internals:
+//! ```
+//! mod journal {
+//!     include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/driver/cuts.rs"));
+//!     pub(crate) fn certificate() -> DurableCut {
+//!         DurableCut::certify(OrderedCut::new(protocol::history::Cut {
+//!             session: protocol::SessionId::new(),
+//!             generation: protocol::Epoch(1),
+//!             seq: 2,
+//!         }))
+//!     }
+//! }
+//! assert_eq!(journal::certificate().prefix(1).unwrap().seq(), 1);
+//! assert!(journal::certificate().prefix(3).is_none());
+//! ```
 
 use crate::store::AppendMode;
+
+#[path = "driver/cuts.rs"]
+mod cuts;
+pub(crate) use cuts::{DurableCut, OrderedCut};
 
 use super::{
     Actor, Admission, Arc, AssertUnwindSafe, Entry, Flag, Future, Json, Msg, Ordering, Poll,
@@ -8,7 +67,6 @@ use super::{
     io, lock, oneshot, relisted, store_fault, unless,
 };
 
-#[derive(Default)]
 pub(super) struct Journal {
     pub(super) index: crate::store::index::Index,
     /// `None` only while a commit has it on a blocking thread.
@@ -19,14 +77,14 @@ pub(super) struct Journal {
     /// for each: shown to no one until a sync. A seq a client has seen is
     /// one that survives a power cut, so it is never given out twice.
     pub(super) unsynced: Vec<Vec<Entry>>,
-    pub(super) waiting_sync: Vec<(u64, oneshot::Sender<()>)>,
+    pub(super) waiting_sync: Vec<(OrderedCut, oneshot::Sender<()>)>,
     pub(super) waiting_mutations: Vec<(
         protocol::Seq,
         ext::MutationResult,
         oneshot::Sender<ext::MutationResult>,
     )>,
-    pub(super) ordered_seq: u64,
-    pub(super) durable_seq: u64,
+    pub(super) ordered: OrderedCut,
+    pub(super) durable: DurableCut,
     pub(super) flushes: Vec<PendingFlush>,
     pub(super) sync_armed: bool,
     /// The bytes of log the next load would read past the newest
@@ -35,14 +93,44 @@ pub(super) struct Journal {
 }
 
 pub(super) struct PendingFlush {
-    pub(super) through: u64,
+    pub(super) through: OrderedCut,
     pub(super) ended: Flag,
     pub(super) result: Option<io::Result<()>>,
 }
 
 impl Journal {
+    pub(super) fn loaded(session: protocol::SessionId, writer: Writer, seq: u64) -> Self {
+        let cut = OrderedCut::new(protocol::history::Cut {
+            session,
+            generation: protocol::Epoch(writer.epoch()),
+            seq,
+        });
+        Self {
+            index: crate::store::index::Index::default(),
+            writer: Some(writer),
+            fold_snapshot: None,
+            unsynced: Vec::new(),
+            waiting_sync: Vec::new(),
+            waiting_mutations: Vec::new(),
+            ordered: cut,
+            durable: DurableCut::certify(cut),
+            flushes: Vec::new(),
+            sync_armed: false,
+            since_snapshot: 0,
+        }
+    }
+
+    pub(super) fn recovered(&mut self, session: protocol::SessionId, writer: &Writer, seq: u64) {
+        self.ordered = OrderedCut::new(protocol::history::Cut {
+            session,
+            generation: protocol::Epoch(writer.epoch()),
+            seq,
+        });
+        self.durable = DurableCut::certify(self.ordered);
+    }
+
     pub(super) fn is_durable(&self) -> bool {
-        self.durable_seq >= self.ordered_seq && self.flushes.is_empty()
+        self.durable.covers(self.ordered) && self.flushes.is_empty()
     }
 }
 
@@ -119,28 +207,29 @@ impl Actor {
         }
     }
 
-    pub(super) fn covering(&self) -> u64 {
+    pub(super) fn covering(&self) -> OrderedCut {
         self.journal
             .flushes
             .iter()
-            .map(|pending| pending.through)
-            .max()
-            .unwrap_or(self.journal.durable_seq)
-            .max(self.journal.durable_seq)
+            .fold(self.journal.durable.ordered(), |covered, pending| {
+                if pending.through.covers(covered) {
+                    pending.through
+                } else {
+                    covered
+                }
+            })
     }
 
-    pub(super) async fn durable(&mut self, through: u64) {
-        self.journal.durable_seq = self.journal.durable_seq.max(through);
+    async fn durable(&mut self, through: DurableCut) {
+        if through.covers(self.journal.durable.ordered()) {
+            self.journal.durable = through;
+        }
         self.show_synced().await;
         self.publish();
         self.admit().await;
     }
 
-    pub(super) async fn track(
-        &mut self,
-        through: u64,
-        mut epoch: rt::FlushEpoch,
-    ) -> io::Result<()> {
+    async fn track(&mut self, through: OrderedCut, mut epoch: rt::FlushEpoch) -> io::Result<()> {
         let polled = {
             let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
             std::pin::Pin::new(&mut epoch).poll(&mut cx)
@@ -148,7 +237,7 @@ impl Actor {
         if let Poll::Ready(result) = polled {
             result.inspect_err(|e| store_fault(self.live.id, ext_logging::Operation::Commit, e))?;
             if self.journal.flushes.is_empty() {
-                self.durable(through).await;
+                self.durable(DurableCut::certify(through)).await;
             } else {
                 let ended = Flag::default();
                 ended.set();
@@ -166,6 +255,7 @@ impl Actor {
             ended: ended.clone(),
             result: None,
         });
+        let through = through.seq();
         let session = Arc::clone(&self.live.session);
         let fence = session.fence.load(Ordering::SeqCst);
         self.live.session.shared.rt.spawn(Box::pin(async move {
@@ -185,7 +275,7 @@ impl Actor {
             .journal
             .flushes
             .iter_mut()
-            .find(|pending| pending.through == through)
+            .find(|pending| pending.through.seq() == through)
         else {
             return;
         };
@@ -200,7 +290,7 @@ impl Actor {
         {
             let pending = self.journal.flushes.remove(0);
             match pending.result.expect("completed epoch") {
-                Ok(()) => self.durable(pending.through).await,
+                Ok(()) => self.durable(DurableCut::certify(pending.through)).await,
                 Err(error) => {
                     store_fault(self.live.id, ext_logging::Operation::Commit, &error);
                     self.failed(format!("flushing: {error}"), Vec::new()).await;
@@ -273,16 +363,19 @@ impl Actor {
             };
             format!("{} entries {how}", entries.len())
         });
-        self.journal.ordered_seq = entries
-            .last()
-            .map_or(self.journal.ordered_seq, |entry| entry.seq.get());
+        self.journal.ordered = self.journal.ordered.advance(
+            entries
+                .last()
+                .map_or(self.journal.ordered.seq(), |entry| entry.seq.get()),
+        );
         self.journal.since_snapshot += lines.lines().map(|line| line.len() as u64 + 1).sum::<u64>();
         self.folded(&entries);
         self.journal.unsynced.push(entries);
         if let Some(epoch) = epoch {
-            self.track(self.journal.ordered_seq, epoch).await?;
+            self.track(self.journal.ordered, epoch).await?;
         } else if durable_on_order || flush == FlushMode::Immediate {
-            self.durable(self.journal.ordered_seq).await;
+            self.durable(DurableCut::certify(self.journal.ordered))
+                .await;
         }
         if !self.journal.unsynced.is_empty() {
             self.arm_sync();
@@ -362,7 +455,7 @@ impl Actor {
         self.live.session.spawn_work(
             WorkId::Sync,
             Admission {
-                through: self.journal.ordered_seq,
+                through: self.journal.ordered.seq(),
                 requirement: Requirement::Ordered,
             },
             |cancel| {
@@ -379,7 +472,7 @@ impl Actor {
     /// fails leaves the session as a failed commit does.
     pub(super) async fn sync(&mut self) -> Result<(), ()> {
         self.journal.sync_armed = false;
-        if self.journal.ordered_seq <= self.covering() {
+        if self.covering().covers(self.journal.ordered) {
             return Ok(());
         }
         if let Err(error) = self.order_flush().await {
@@ -410,9 +503,10 @@ impl Actor {
         self.journal.writer = Some(writer);
         result.inspect_err(|e| store_fault(self.live.id, ext_logging::Operation::Commit, e))?;
         if let Some(epoch) = epoch {
-            self.track(self.journal.ordered_seq, epoch).await?;
+            self.track(self.journal.ordered, epoch).await?;
         } else {
-            self.durable(self.journal.ordered_seq).await;
+            self.durable(DurableCut::certify(self.journal.ordered))
+                .await;
         }
         Ok(())
     }
@@ -422,9 +516,9 @@ impl Actor {
         for entries in std::mem::take(&mut self.journal.unsynced) {
             if entries
                 .last()
-                .is_some_and(|entry| entry.seq.get() <= self.journal.durable_seq)
+                .is_some_and(|entry| entry.seq.get() <= self.journal.durable.seq())
             {
-                self.show(entries).await;
+                self.show(entries, self.journal.durable).await;
             } else {
                 pending.push(entries);
             }
@@ -432,11 +526,11 @@ impl Actor {
         self.journal.unsynced = pending;
         self.journal
             .waiting_sync
-            .extract_if(.., |(through, _)| *through <= self.journal.durable_seq)
+            .extract_if(.., |(through, _)| self.journal.durable.covers(*through))
             .for_each(|(_, done)| done.send(()));
         self.journal
             .waiting_mutations
-            .extract_if(.., |(seq, _, _)| seq.get() <= self.journal.durable_seq)
+            .extract_if(.., |(seq, _, _)| seq.get() <= self.journal.durable.seq())
             .for_each(|(_, result, done)| done.send(result));
     }
 }

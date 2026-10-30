@@ -43,7 +43,7 @@ impl Actor {
         self.live.session.spawn_work(
             super::WorkId::Delivery,
             super::Admission {
-                through: self.journal.durable_seq,
+                through: self.journal.durable.seq(),
                 requirement: super::Requirement::Durable,
             },
             |cancel| {

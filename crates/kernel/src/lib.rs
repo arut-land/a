@@ -55,6 +55,7 @@ pub struct StepPlan {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Commit {
+    /// A requested position, not evidence that the writer has reached it.
     pub through: u64,
     pub durability: Durability,
     pub publish: bool,
@@ -330,6 +331,7 @@ pub struct Ticket(pub u64);
 /// The prefix an effect depends on, independently of its current step's appends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Admission {
+    /// A dependency to check against the writer's ordered or durable certificate.
     pub through: u64,
     pub requirement: Requirement,
 }

@@ -356,7 +356,7 @@ impl Actor {
         }
         if let ext::Context::Owner = request.context {
             let seq = call.0;
-            if seq.get() > self.journal.ordered_seq {
+            if seq.get() > self.journal.ordered.seq() {
                 refusal = Some(SpawnRefusal::Unavailable(
                     "prefix is not committed in the owning conversation".into(),
                 ));

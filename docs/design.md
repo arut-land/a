@@ -357,8 +357,14 @@ path. Fault-injecting store tests cover power cuts between ordering and
 flushing, failed epochs, recovery and replay-safe admission. The design and
 measurements are recorded in [session measurements](perf/sessions.md).
 
+The journal issues opaque `OrderedCut` and `DurableCut` certificates using
+the same session/generation identity as history paging. Kernel positions are
+requests, not certificates. Publication accepts only a durable cut; cuts
+have no integer ordering across generations. Flush results still resolve in
+registration order: a later success cannot certify an unresolved earlier epoch.
+
 Kernel activity is certified after a complete burst. Activity at N requires
-both the ledger and visible frames to end at N, with `durable_seq >= N`;
+both the ledger and visible frames to end at N, with a durable cut covering N;
 `send_after(N, ...)` orders it after its entries. Live publication, snapshot
 and suffix attach, recovery and the final drain share that condition.
 Clients end turns on this certification rather than an entry prefix.
