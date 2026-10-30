@@ -380,6 +380,94 @@ mod tests {
         }
     }
     #[test]
+    fn a_grep_cancelled_at_a_held_delivery_never_advances_or_replies_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        for name in ["first.txt", "second.txt"] {
+            std::fs::write(root.join(name), "needle\n").unwrap();
+        }
+        let daemon = Daemon::load(
+            &sys::Home::from(dir.path().to_path_buf()),
+            &crate::Config {
+                extensions: |_| Ok(Registry::default()),
+                ..crate::Config::default()
+            },
+        )
+        .unwrap();
+        let indexes = ext_index::Indexes::new(ext_index::Limits::default());
+        let index = indexes.open(
+            &root,
+            Arc::clone(&daemon.shared.rt),
+            Arc::new(rt::watch::Hub::new(Arc::clone(&daemon.shared.rt))),
+        );
+        let queries = Queries::default();
+        let outbox = Outbox::new();
+        let dropped = ext::Flag::default();
+        let delivery = HeldGrepDelivery {
+            outbox: outbox.clone(),
+            dropped: dropped.clone(),
+        };
+        let cancel = Cancel::default();
+        let reading = cancel.clone();
+        queries.run(
+            &daemon,
+            &outbox,
+            7,
+            QueuePermit::query(64, ReadClass::Query).unwrap(),
+            cancel.clone(),
+            Box::pin(async move {
+                let summary = index
+                    .grep(
+                        ext_index::GrepQuery {
+                            pattern: ext_index::Pattern::Typed("needle".into()),
+                            options: ext_index::GrepOptions::default(),
+                            limit: usize::MAX,
+                        },
+                        &reading,
+                        delivery,
+                    )
+                    .await
+                    .map_err(Ended::Failed)?;
+                Ok(Json::encode(&summary.matches).unwrap())
+            }),
+        );
+        rt::block_on(rt::or(
+            async {
+                let first = outbox.next(&*daemon.shared.rt).await.unwrap();
+                assert!(matches!(
+                    DaemonMsg::from_json(first.body()).unwrap(),
+                    DaemonMsg::Update { id: 7, .. }
+                ));
+                queries.take(
+                    &daemon,
+                    &outbox,
+                    MachineId([0; 16]),
+                    Role::Owner,
+                    ClientMsg::Cancel { id: 7 },
+                    0,
+                );
+                assert!(cancel.is_set(), "the query did not receive its cancel");
+                let reply = outbox.next(&*daemon.shared.rt).await.unwrap();
+                assert!(matches!(
+                    DaemonMsg::from_json(reply.body()).unwrap(),
+                    DaemonMsg::Reply {
+                        id: 7,
+                        outcome: Outcome::Interrupted { output: None }
+                    }
+                ));
+                assert!(dropped.is_set(), "the held grep was not dropped");
+                assert!(lock(&queries.0).is_empty());
+                assert!(outbox.try_next().is_none(), "nothing follows cancellation");
+            },
+            async {
+                daemon.shared.rt.sleep(Duration::from_secs(10)).await;
+                panic!("the held grep did not start or cancel");
+            },
+        ));
+    }
+
+    #[test]
     fn workspace_discovery_waits_on_storage_without_delaying_queries_or_cancellation() {
         use rt::Runtime;
 
@@ -476,5 +564,34 @@ mod tests {
         drop(release);
         drop(daemon);
         runtime.shutdown();
+    }
+    struct HeldGrepDelivery {
+        outbox: Outbox,
+        dropped: ext::Flag,
+    }
+
+    impl ext_index::GrepSink for HeldGrepDelivery {
+        async fn found(&mut self, file: ext_index::Grepped) {
+            assert_eq!(file.matches.len(), 1);
+            self.outbox
+                .send_paced(
+                    Frame::new(&DaemonMsg::Update {
+                        id: 7,
+                        body: Json::encode(&file.path).unwrap(),
+                    })
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            // The first update cannot race the grep's completion: delivery
+            // stays held until the engine drops the cancelled query.
+            std::future::pending::<()>().await;
+        }
+    }
+
+    impl Drop for HeldGrepDelivery {
+        fn drop(&mut self) {
+            self.dropped.set();
+        }
     }
 }

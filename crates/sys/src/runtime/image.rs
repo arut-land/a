@@ -284,7 +284,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn retiring_a_running_image_allows_updates_and_reclamation_after_exit() {
+    fn retired_images_are_reclaimed_after_the_last_mapping_is_released() {
         use std::io::{BufRead, Read, Write};
         use std::process::{Command, Stdio};
 
@@ -300,10 +300,12 @@ mod tests {
         std::fs::create_dir(&build).unwrap();
         let exe = build.join(super::super::EXE);
         super::copy(&std::env::current_exe().unwrap(), &exe).unwrap();
+        // The owned view makes the last unmap an explicit collection boundary.
+        let mapping = ImageMapping::new(&exe);
         let mut child = Command::new(&exe)
             .args([
                 "--exact",
-                "runtime::image::tests::retiring_a_running_image_allows_updates_and_reclamation_after_exit",
+                "runtime::image::tests::retired_images_are_reclaimed_after_the_last_mapping_is_released",
                 "--nocapture",
             ])
             .env(CHILD, "1")
@@ -321,16 +323,59 @@ mod tests {
             super::retire(&exe)?;
             assert!(!exe.exists());
             super::collect(dir.path());
+            assert!(build.join(".retired").is_file());
             assert!(child.try_wait()?.is_none());
             child.stdin.take().unwrap().write_all(&[0])?;
             assert!(child.wait()?.success());
             super::collect(dir.path());
-            std::fs::remove_dir(&build)?;
-            assert!(!build.exists());
+            assert!(build.join(".retired").is_file());
             Ok::<_, std::io::Error>(())
         })();
         let _ = child.kill();
         let _ = child.wait();
+        drop(child);
         result.unwrap();
+        drop(mapping);
+        super::collect(dir.path());
+        std::fs::remove_dir(&build).unwrap();
+        assert!(!build.exists());
+    }
+
+    #[cfg(windows)]
+    struct ImageMapping(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS);
+
+    #[cfg(windows)]
+    impl ImageMapping {
+        fn new(path: &std::path::Path) -> Self {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::System::Memory::{
+                CreateFileMappingW, FILE_MAP_READ, MapViewOfFile, PAGE_READONLY, SEC_IMAGE,
+            };
+            let file = std::fs::File::open(path).unwrap();
+            // SAFETY: the file is owned through creation; null security/name pointers are allowed.
+            let mapping = crate::windows::owned(unsafe {
+                CreateFileMappingW(
+                    file.as_raw_handle(),
+                    std::ptr::null(),
+                    PAGE_READONLY | SEC_IMAGE,
+                    0,
+                    0,
+                    std::ptr::null(),
+                )
+            })
+            .unwrap();
+            // SAFETY: the mapping is live; a zero length maps the complete file.
+            let view = unsafe { MapViewOfFile(mapping.as_raw_handle(), FILE_MAP_READ, 0, 0, 0) };
+            assert!(!view.Value.is_null(), "{}", std::io::Error::last_os_error());
+            Self(view)
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for ImageMapping {
+        fn drop(&mut self) {
+            // SAFETY: this view has one owner and has not been unmapped.
+            unsafe { windows_sys::Win32::System::Memory::UnmapViewOfFile(self.0) };
+        }
     }
 }

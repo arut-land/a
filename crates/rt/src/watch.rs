@@ -308,7 +308,7 @@ impl Hub {
 
 impl Subscription {
     /// Watches `dir` (under the root, as subscribed) too, for a
-    /// [`Scope::Entered`] subscription: its entries are reported from now.
+    /// [`Watch::entered`] subscription: its entries are reported from now.
     pub fn enter(&self, dir: &Path) {
         let mut state = lock(&self.hub.state);
         let State {

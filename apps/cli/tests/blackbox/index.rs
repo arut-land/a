@@ -132,30 +132,3 @@ fn a_grep_streams_each_files_matches_then_its_summary() {
     assert_eq!(summary["matches"], 2, "{summary}");
     assert_eq!(summary["truncated"], false, "{summary}");
 }
-
-#[test]
-fn a_grep_cancelled_mid_stream_is_interrupted_and_reads_no_further() {
-    let (_env, daemon, tree) = started("index-cancel");
-    // More files with a match than the connection holds updates for: the
-    // grep waits on the client, so it is still running when cancelled.
-    for i in 0..3000 {
-        let path = tree.join(format!("many/{i}.txt"));
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, "needle\n").unwrap();
-    }
-    let scope = Scope::Workspace(tree.clone().try_into().unwrap());
-    let body = Json::encode(&json!({ "query": "needle", "limit": 100_000 })).unwrap();
-    let mut answers = daemon.query("files.grep", scope, body).unwrap();
-    assert!(matches!(
-        answers.next().unwrap().unwrap(),
-        Answer::Update(_)
-    ));
-    answers.canceller().cancel().unwrap();
-    // Updates already on their way may come first; the reply ends it.
-    let rest: Vec<Answer> = answers.map(Result::unwrap).collect();
-    assert_eq!(
-        rest.last(),
-        Some(&Answer::Reply(Outcome::Interrupted { output: None }))
-    );
-    assert!(rest.len() < 3000, "{} answers after the cancel", rest.len());
-}
