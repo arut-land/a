@@ -332,11 +332,17 @@ and residency probes from phase 1 are not rerun here.
 
 The first completed local n=10 run confirms a deep CPU problem: main
 **93.94 [89.06–99.74] ms**, candidate **100.79 [97.89–152.40] ms**. All ten
-paired deltas are positive (median +6.11 ms). The completed Linux x64 cohort
-has main **121.25 [117.50–125.00] ms**, candidate
-**120.00 [117.50–122.50] ms**. Results are kept per native host, not pooled.
-The original local observations are in `cpu-local-final`; Linux's raw log and
-summary are `cpu-linux.log` and `cpu-linux-summary-from-log.json`.
+paired deltas are positive (median +6.11 ms). The original local observations are in `cpu-local-final`.
+Initial hosted cohorts are excluded: the raw identity audit found identical
+before/after executable hashes in the fixed Linux cohort, despite different
+checkout revisions. Those jobs copied the common target executable instead of
+staging Cargo's reported artifact. No hosted timing from that staging method is
+accepted. Their raw records and logs remain as invalid diagnostics. The revised
+hosted build stages the reported artifact, bypasses command-wrapper ambiguity,
+and requires distinct hashes plus each source revision's expected on-disk log
+format before timing. Local format probes independently confirm main format 1
+and candidate format 2; the final local release rebuild is byte-for-byte
+identical to its measured binary. Results remain per native host, never pooled.
 
 An extra native `sample` capture during turns 57–64 (excluded from timings)
 shows added retained-log publication work: source and disposable-index hard
