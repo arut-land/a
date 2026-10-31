@@ -25,7 +25,9 @@ use protocol::view::{
 use protocol::{CommandInfo, SessionSummary};
 
 pub use feed::{Recovery, Reducer};
-pub use live::{BlobFetch, Client, QueryStream, Session, SessionWatch, find_session};
+pub use live::{
+    BlobFetch, Client, ConversationWatch, QueryStream, Session, SessionWatch, find_session,
+};
 
 /// The purpose of the side request that titles a session, as the app
 /// reads its reply from the view.
@@ -972,6 +974,20 @@ pub struct StreamingText {
 
 /// The whole view at `rev`: what a client takes on a gap too large to
 /// replay.
+/// One row of the SDK's conversation family, without transcript payloads.
+#[data]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConversationInfo {
+    pub id: String,
+    pub parent: Option<String>,
+    pub depth: u32,
+    pub agent: String,
+    pub title: String,
+    pub status: String,
+    pub detail: String,
+    pub running: bool,
+}
+
 #[data]
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionSnapshot {

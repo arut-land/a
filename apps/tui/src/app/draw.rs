@@ -151,7 +151,7 @@ impl App {
         out.extend(working);
         out.extend(self.menu_rows(width));
         out.push(rule.clone());
-        let (rows, (cx, cy)) = if self.question_edit.as_ref().is_some_and(|edit| {
+        let (mut rows, (cx, cy)) = if self.question_edit.as_ref().is_some_and(|edit| {
             edit.fields
                 .get(edit.field)
                 .is_some_and(|field| field.sensitive)
@@ -160,10 +160,22 @@ impl App {
         } else {
             self.editor.lines(width, USER)
         };
+        if self.editor.is_empty()
+            && let Some(row) = self
+                .conversations
+                .iter()
+                .find(|row| Some(row.session) == self.client.view().session && row.parent.is_some())
+        {
+            rows = vec![Line::plain(
+                ellipsize(&format!("Message @{}…", row.title), width),
+                MUTED,
+            )];
+        }
         // The caret's row stays in view.
         let skip = usize::from(cy).saturating_sub(INPUT_ROWS - 1);
         let caret_row = out.len() + usize::from(cy) - skip;
         out.extend(rows.into_iter().skip(skip).take(INPUT_ROWS));
+        out.extend(self.conversation_rows(width));
         out.push(rule);
         let hint = if asked {
             "↑/↓ choose · enter confirms · 1/y yes · 2/n/esc no"
@@ -175,13 +187,65 @@ impl App {
         out.push(Line::plain(ellipsize(hint, width), MUTED));
         out.push(self.status(width, summary.reply));
         let last_col = u16::try_from(width.saturating_sub(1)).unwrap_or(u16::MAX);
-        let caret = self.overlay.is_none().then(|| {
+        let caret = (self.overlay.is_none() && self.conversation_at.is_none()).then(|| {
             (
                 cx.min(last_col),
                 u16::try_from(caret_row).unwrap_or(u16::MAX),
             )
         });
         (out, caret)
+    }
+
+    fn conversation_rows(&self, width: usize) -> Vec<Line> {
+        if self.conversations.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let now = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        let selected = self.conversation_at.unwrap_or_else(|| {
+            self.conversations
+                .iter()
+                .position(|row| Some(row.session) == self.client.view().session)
+                .unwrap_or(0)
+        });
+        let start = selected.saturating_sub(3);
+        for (at, row) in self.conversations.iter().enumerate().skip(start).take(6) {
+            let marker = if Some(row.session) == self.client.view().session {
+                "●"
+            } else {
+                "○"
+            };
+            let title = if row.depth == 0 { "main" } else { &row.title };
+            let detail = row.detail(now);
+            let title = format!("{marker} {}{} {title}", "  ".repeat(row.depth), row.agent);
+            let line = format!(
+                "{} · {detail}",
+                ellipsize(&title, width.saturating_sub(detail.chars().count() + 3))
+            );
+            out.push(Line::from([Span::button(
+                ellipsize(&line, width),
+                if self.conversation_at == Some(at) {
+                    Style::new().fg(Color::Cyan).bold()
+                } else {
+                    MUTED
+                },
+                Action::Conversation(at),
+            )]));
+        }
+        if self.conversation_at.is_some() {
+            out.push(Line::plain(
+                "↑/↓ to select · Enter to view · x to stop · Esc to compose",
+                MUTED,
+            ));
+        }
+
+        out
     }
 
     /// `✢ Working… (3s · ↓ 120 tokens · esc to interrupt)`, while a turn

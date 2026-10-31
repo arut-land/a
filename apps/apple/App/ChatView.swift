@@ -3,6 +3,9 @@ import SwiftUI
 
 struct ChatView: View {
     @Bindable var store: SessionStore
+    var conversations: ConversationStore?
+    @FocusState private var composing: Bool
+    @State private var managing = false
     /// What a typed line asks of the app, rather than of the session.
     var perform: (AppAction) -> Void = { _ in }
     @State private var input = ""
@@ -11,10 +14,13 @@ struct ChatView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            if let parent = conversations?.rows.first(where: { $0.id == store.sessionId })?.parent {
+                Button("Back to parent") { openChild(parent) }.buttonStyle(.link).padding(.top, 4)
+            }
             if let recap = store.recap {
                 RecapBar(recap: recap)
             }
-            TranscriptView(store: store) { item in
+            TranscriptView(store: store, text: nativeText) { item in
                 ItemView(item: item, store: store, openChild: openChild)
             }
             if let problem = store.problem {
@@ -25,7 +31,13 @@ struct ChatView: View {
             }
             Divider()
             HStack {
-                TextField("Message, or $ command", text: $input)
+                TextField(composerPlaceholder, text: $input)
+                    .focused($composing)
+                    .onKeyPress(.downArrow) {
+                        guard input.isEmpty, conversations?.rows.isEmpty == false else { return .ignored }
+                        composing = false; managing = true
+                        return .handled
+                    }
                     .textFieldStyle(.plain)
                     .onSubmit(send)
                 if store.turn.canInterrupt {
@@ -37,6 +49,10 @@ struct ChatView: View {
                     .disabled(input.trimmingCharacters(in: .whitespaces).isEmpty || !store.turn.canSend)
             }
             .padding(10)
+            if let conversations {
+                ConversationSwitcher(store: conversations, current: store.sessionId, managing: $managing, open: openChild)
+                    .onChange(of: managing) { _, active in if !active { composing = true } }
+            }
         }
         .navigationTitle(store.title ?? store.sessionId.map { String($0.suffix(8)) } ?? "New session")
         .navigationSubtitle(store.workspace)
@@ -58,6 +74,23 @@ struct ChatView: View {
             }
             .padding()
         }
+    }
+
+    private func nativeText(_ item: DisplayItem) -> NativeTranscriptText? {
+        switch item.kind {
+        case .user: .user(item.presentation.body?.text ?? "")
+        case .assistant:
+            if let body = item.presentation.body, body.kind == .markdown { .markdown(body) }
+            else { .text(item.presentation.body?.text.trimmingCharacters(in: .newlines) ?? "") }
+        default: nil
+        }
+    }
+
+    private var composerPlaceholder: String {
+        if let row = conversations?.rows.first(where: { $0.id == store.sessionId }), row.parent != nil {
+            return "Message @\(row.title)…"
+        }
+        return "Message, or $ command"
     }
 
     private func send() {

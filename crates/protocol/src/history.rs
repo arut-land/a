@@ -27,6 +27,29 @@ pub struct Head {
     pub model: Option<String>,
     pub usage: Usage,
     pub recap: Option<Recap>,
+    pub conversation: Conversation,
+}
+
+/// Public conversation identity and observations, independent of transcript demand.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Conversation {
+    pub parent: Option<SessionId>,
+    pub agent: Option<String>,
+    pub title: Option<String>,
+    pub admitted_unix_ms: Option<u64>,
+    /// Observed monotonic spans, summed across daemon clock epochs without inventing downtime.
+    pub elapsed_ns: Option<u64>,
+    pub outcome: Option<crate::ledger::OutcomeKind>,
+    pub children: Vec<Child>,
+}
+
+/// A committed spawn, retained even after its transcript page is released.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Child {
+    pub session: SessionId,
+    pub agent: String,
+    pub title: String,
+    pub admitted_unix_ms: u64,
 }
 
 impl Head {

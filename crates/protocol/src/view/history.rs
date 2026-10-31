@@ -162,6 +162,7 @@ impl Index {
 
     pub fn head_for(&self, generation: Epoch, since: u64, purposes: &[String]) -> Head {
         Head {
+            conversation: crate::history::Conversation::default(),
             cut: Cut {
                 session: self.view.session.expect("an index belongs to a session"),
                 generation,

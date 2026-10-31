@@ -9,6 +9,10 @@ mod question;
 pub use question::{QuestionDraft, question_text};
 mod approval;
 mod command;
+mod conversations;
+pub use conversations::{
+    ConversationHead, ConversationRow, ConversationStatus, ConversationTree, ConversationWatch,
+};
 mod daemons;
 mod drive;
 mod fetch;

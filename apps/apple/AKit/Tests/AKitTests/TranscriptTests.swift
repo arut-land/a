@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import Observation
 import Testing
 
 @testable import AKit
@@ -119,6 +120,122 @@ struct NativeTranscriptTests {
         try writer.detach()
         await store.detach()
     }
+    @Test(.enabled(if: live != nil))
+    func plain_transcript_rows_use_selectable_native_cells_and_preserve_the_viewport() async throws {
+        let client = try Client(helper: live!)
+        let store = SessionStore(session: Session(client: client))
+        let workspace = FileManager.default.temporaryDirectory.appending(path: "akit-native-text-\(UUID())")
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        store.open(.new(workspace: workspace.path))
+        try await eventually("native text session") { store.link == .live }
+        for turn in 0..<16 {
+            let marker = "native turn \(turn)"
+            await store.send(String(repeating: "歴史 🦀 history line\n", count: 160) + marker)
+            try await eventually("native text history") {
+                store.history?.pending == false && store.items.contains { $0.kind == .assistant && $0.presentation.body?.text.hasSuffix(marker) == true }
+            }
+        }
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 800, height: 500), styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
+        let host = NSHostingView(rootView: TranscriptView(store: store, text: { item in
+            item.kind == .user ? .user(item.presentation.body?.text ?? "") : .text(item.presentation.body?.text ?? "")
+        }) { item in Text(item.presentation.title) })
+        window.contentView = host
+        window.orderFront(nil)
+        try await eventually("native text table installed") { findScrollView(host)?.documentView is NSTableView }
+        let scroll = try #require(findScrollView(host))
+        let table = try #require(scroll.documentView as? NSTableView)
+        try await eventually("native text scrolled to tail") {
+            table.frame.height > 1500 && abs(scroll.contentView.bounds.maxY - table.frame.height) <= 1
+        }
+        let labels = nativeLabels(table)
+        #expect(!labels.isEmpty && labels.allSatisfy { $0.isSelectable })
+        #expect(labels.contains { $0.stringValue.contains("歴史 🦀") })
+        scroll.contentView.scroll(to: NSPoint(x: 0, y: scroll.contentView.bounds.minY - 300))
+        scroll.reflectScrolledClipView(scroll.contentView)
+        try await Task.sleep(for: .milliseconds(100))
+        let before = scroll.contentView.bounds.origin
+        let writer = Session(client: client)
+        try writer.open(target: .id(id: try #require(store.sessionId)))
+        try await eventually("native text external writer") { writer.snapshot().link == .live }
+        let seq = store.seq
+        try writer.send(text: "native external update")
+        try await eventually("native external update displayed") { store.seq > seq && store.history?.pending == false && !store.turn.running }
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(abs(scroll.contentView.bounds.origin.y - before.y) <= 1)
+        try writer.detach()
+        await store.detach()
+    }
+
+    @Test
+    func native_markdown_keeps_inline_styles_links_and_fragment_continuations() throws {
+        let cell = TranscriptPlainCell()
+        cell.show(.markdown(ShownBody(kind: .markdown, text: "**bold** and `code` [link](https://example.invalid)", runs: nil)))
+        let attributed = try #require(cell.measurement(for: 500).attributed)
+        #expect(attributed.string == "bold and code link")
+        let bold = try #require(attributed.attribute(.font, at: 0, effectiveRange: nil) as? NSFont)
+        #expect(NSFontManager.shared.traits(of: bold).contains(.boldFontMask))
+        let code = try #require(attributed.attribute(.font, at: 9, effectiveRange: nil) as? NSFont)
+        #expect(code.isFixedPitch)
+        #expect(attributed.attribute(.link, at: 14, effectiveRange: nil) as? URL == URL(string: "https://example.invalid"))
+        cell.show(.markdown(ShownBody(kind: .markdown, text: "continued** plain", runs: [MarkdownRun(text: "continued", style: .bold), MarkdownRun(text: " plain", style: .text)])))
+        let fragment = try #require(cell.measurement(for: 500).attributed)
+        #expect(fragment.string == "continued plain")
+        let continued = try #require(fragment.attribute(.font, at: 0, effectiveRange: nil) as? NSFont)
+        #expect(NSFontManager.shared.traits(of: continued).contains(.boldFontMask))
+    }
+
+    @Test(.enabled(if: live != nil))
+    func native_agent_list_uses_arrows_return_and_escape() async throws {
+        let client = try Client(helper: live!)
+        let parent = SessionStore(session: Session(client: client))
+        let workspace = FileManager.default.temporaryDirectory.appending(path: "akit-picker-\(UUID())")
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        parent.open(.new(workspace: workspace.path))
+        try await eventually("picker parent attached") { parent.link == .live }
+        let id = try #require(parent.sessionId)
+        let store = try ConversationStore(client: client, origin: id)
+        store.start()
+        defer { store.stop() }
+        await parent.send("spawn picker child")
+        try await eventually("picker family ready") { store.rows.count == 2 && store.rows.allSatisfy { !$0.running && $0.status != "connecting" } }
+        let child = try #require(store.rows.first { $0.parent == id })
+        let selection = ConversationSelection()
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 800, height: 200), styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
+        let host = NSHostingView(rootView: ConversationSwitcher(store: store, current: id,
+            managing: Binding(get: { selection.managing }, set: { selection.managing = $0 }),
+            open: { selection.opened = $0 }))
+        window.contentView = host
+        window.makeKeyAndOrderFront(nil)
+        try await Task.sleep(for: .milliseconds(100))
+        selection.managing = true
+        try await Task.sleep(for: .milliseconds(150))
+        func key(_ code: UInt16, _ characters: String) {
+            window.sendEvent(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+                windowNumber: window.windowNumber, context: nil, characters: characters, charactersIgnoringModifiers: characters,
+                isARepeat: false, keyCode: code)!)
+        }
+        key(125, "\u{F701}")
+        try await Task.sleep(for: .milliseconds(100))
+        key(36, "\r")
+        try await eventually("Return activates the selected child") { selection.opened == child.id }
+        host.rootView = ConversationSwitcher(store: store, current: child.id,
+            managing: Binding(get: { selection.managing }, set: { selection.managing = $0 }),
+            open: { selection.opened = $0 })
+        try await Task.sleep(for: .milliseconds(100))
+        let table = try #require(findScrollView(host)?.documentView as? NSTableView)
+        let marker = try #require(table.view(atColumn: 0, row: 1, makeIfNecessary: true) as? NSTextField)
+        #expect(marker.stringValue.hasPrefix("●"))
+        key(53, "\u{1b}")
+        try await eventually("Escape returns to the composer") { !selection.managing }
+        await parent.detach()
+    }
+
 }
 
 private func findScrollView(_ view: NSView) -> NSScrollView? {
@@ -128,4 +245,15 @@ private func findScrollView(_ view: NSView) -> NSScrollView? {
 
 private final class TranscriptFrames {
     var items: [UInt64: CGRect] = [:]
+}
+
+@Observable
+private final class ConversationSelection {
+    var managing = false
+    var opened: String?
+}
+
+private func nativeLabels(_ view: NSView) -> [NSTextField] {
+    if let label = view as? NSTextField { return [label] }
+    return view.subviews.flatMap(nativeLabels)
 }

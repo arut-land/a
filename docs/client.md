@@ -81,8 +81,41 @@ and its pixel offset when reading earlier output, and follows the bottom only
 when pinned there. Revisions do not issue scroll commands. These display pages
 are released with the transcript view; they do not extend SDK history demand.
 An NSTableView realizes visible row views, caching measured heights instead of
-keeping full-page layout trees. Off-screen reusable hosts clear their SwiftUI
-content when removed, releasing text layout and backing layers.
+keeping full-page layout trees. Selectable native NSTextFields render user and
+assistant text, sharing immutable Markdown attributes and measured geometry
+between measurement and display. Complex items use SwiftUI hosts that release
+their content and hosting tree when removed from the viewport.
+
+## Conversation families
+
+Public `history::Head.conversation` projects parent identity, child inventory,
+agent kind, work title, admission time, observed execution duration and outcome
+from existing session facts. It carries no execution authority or context image.
+Completed duration spans monotonic execution observations within each clock epoch;
+unknown duration stays absent. Usage comes from the existing public head counter.
+
+`ConversationTree` folds those heads and public activity into one list of the
+session's ancestors and descendants. It retains finished, failed and interrupted
+children independently of the transcript's demanded history range. `ConversationWatch`
+observes heads without demanding transcripts, releases settled observers, and
+uses catalog revision notifications to reattach when a settled session changes.
+Only public heads supply displayed metadata. Its shared formatter supplies status,
+elapsed time and token counts; running families refresh once a second.
+
+All clients render that model below the composer. Empty-composer Down enters the
+list; arrows select, Enter opens the selected session, Escape or Up past the first
+row returns to the composer, and x stops a running child through the existing
+interrupt path. Child composers send through the ordinary session inbox and
+show `Message @<title>…`. The parent row and parent navigation return to the
+parent transcript. TUI alternate-screen and inline modes share the same input
+and compose model; web rows use roving tabindex and accessible options; macOS
+uses an NSTableView. The native sidebar omits children of the displayed family,
+which already has its own conversation list.
+
+The FFI exposes `ConversationWatch` snapshots through `ConversationStore`.
+Conversation and session list streams buffer one complete snapshot, since older
+full lists are superseded by the latest list. Opening a conversation still uses
+the existing paged History API and native scroll-anchor rules.
 
 ## Layers
 

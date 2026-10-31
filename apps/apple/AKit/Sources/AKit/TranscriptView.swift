@@ -6,15 +6,17 @@ import os
 public struct TranscriptView<Row: View>: View {
     private let store: SessionStore
     private let row: (DisplayItem) -> Row
+    private let text: (DisplayItem) -> NativeTranscriptText?
 
-    public init(store: SessionStore, @ViewBuilder row: @escaping (DisplayItem) -> Row) {
+    public init(store: SessionStore, text: @escaping (DisplayItem) -> NativeTranscriptText? = { _ in nil }, @ViewBuilder row: @escaping (DisplayItem) -> Row) {
         self.store = store
         self.row = row
+        self.text = text
     }
 
     public var body: some View {
         TranscriptScroll(store: store, items: store.items, history: store.history,
-                         follows: store.followsHistory, row: row)
+                         follows: store.followsHistory, row: row, text: text)
     }
 }
 
@@ -24,7 +26,14 @@ private struct TranscriptEntry: Equatable {
         let offset: UInt64
     }
     let item: DisplayItem
+    let text: NativeTranscriptText?
     let id: ID
+}
+
+private struct TranscriptMeasurement {
+    let entry: TranscriptEntry
+    let height: CGFloat
+    let text: NativeTextMeasurement?
 }
 
 private enum TranscriptRow: Equatable {
@@ -39,6 +48,7 @@ private struct TranscriptScroll<Row: View>: NSViewRepresentable {
     let history: HistoryWindow?
     let follows: Bool
     let row: (DisplayItem) -> Row
+    let text: (DisplayItem) -> NativeTranscriptText?
 
     func makeCoordinator() -> TranscriptCoordinator { TranscriptCoordinator() }
 
@@ -54,7 +64,7 @@ private struct TranscriptScroll<Row: View>: NSViewRepresentable {
 
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         let coordinator = context.coordinator
-        let entries = coordinator.install(items, history: history, follows: follows)
+        let entries = coordinator.install(items, text: text, history: history, follows: follows)
         coordinator.store = store
         coordinator.content = { entry, width in
             AnyView(Group {
@@ -87,7 +97,7 @@ private final class TranscriptCoordinator: NSObject, NSTableViewDataSource, NSTa
     private var page: [TranscriptEntry] = []
     private var previous: [TranscriptEntry] = []
     private var rows: [TranscriptRow] = []
-    private var heights: [TranscriptEntry.ID: (DisplayItem, CGFloat)] = [:]
+    private var heights: [TranscriptEntry.ID: TranscriptMeasurement] = [:]
     private var generation: UInt32?
     private var start: UInt64?
     private var textStart: UInt64?
@@ -98,6 +108,7 @@ private final class TranscriptCoordinator: NSObject, NSTableViewDataSource, NSTa
     private var width: CGFloat = 0
     private weak var scroll: NSScrollView?
     private let table = NSTableView()
+    private let measurementText = TranscriptPlainCell()
     private let measurement = NSHostingView(rootView: AnyView(EmptyView()))
     var store: SessionStore?
     var content: ((TranscriptRow, CGFloat) -> AnyView)?
@@ -118,7 +129,7 @@ private final class TranscriptCoordinator: NSObject, NSTableViewDataSource, NSTa
             name: NSView.boundsDidChangeNotification, object: scroll.contentView)
     }
 
-    func install(_ items: [DisplayItem], history: HistoryWindow?, follows: Bool) -> [TranscriptEntry] {
+    func install(_ items: [DisplayItem], text: (DisplayItem) -> NativeTranscriptText?, history: HistoryWindow?, follows: Bool) -> [TranscriptEntry] {
         if generation != history?.generation {
             page = []
             previous = []
@@ -136,7 +147,7 @@ private final class TranscriptCoordinator: NSObject, NSTableViewDataSource, NSTa
             textStart = history?.textStart
         }
         page = items.map { item in
-            TranscriptEntry(item: item, id: .init(key: item.key,
+            TranscriptEntry(item: item, text: text(item), id: .init(key: item.key,
                 offset: history?.textKey == item.key ? history?.textStart ?? 0 : 0))
         }
         let current = Set(page.map(\.id))
@@ -172,6 +183,7 @@ private final class TranscriptCoordinator: NSObject, NSTableViewDataSource, NSTa
         // A single measuring host replaces full-page retained SwiftUI layout trees.
         measurement.rootView = AnyView(EmptyView())
         measurement.layoutSubtreeIfNeeded()
+        measurementText.clear()
         let maximum = max(0, table.frame.height - scroll.contentSize.height)
         let y: CGFloat
         if pinned && follows { y = maximum }
@@ -211,27 +223,49 @@ private final class TranscriptCoordinator: NSObject, NSTableViewDataSource, NSTa
 
     func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
         let entry = rows[row]
-        if case .item(let item) = entry, let (old, height) = heights[item.id], old == item.item { return height }
-        measurement.rootView = content?(entry, width) ?? AnyView(EmptyView())
-        measurement.setFrameSize(NSSize(width: width, height: 1))
-        let height = max(1, ceil(measurement.fittingSize.height))
-        if case .item(let item) = entry { heights[item.id] = (item.item, height) }
+        if case .item(let item) = entry, let old = heights[item.id], old.entry == item { return old.height }
+        let log = OSLog(subsystem: "dev.a.app", category: .pointsOfInterest)
+        os_signpost(.begin, log: log, name: "Measure transcript row")
+        defer { os_signpost(.end, log: log, name: "Measure transcript row") }
+        let height: CGFloat
+        let textMeasurement: NativeTextMeasurement?
+        if case .item(let item) = entry, let text = item.text {
+            measurementText.show(text)
+            let measured = measurementText.measurement(for: width)
+            height = measured.height
+            textMeasurement = measured
+        } else {
+            textMeasurement = nil
+            measurement.rootView = content?(entry, width) ?? AnyView(EmptyView())
+            measurement.setFrameSize(NSSize(width: width, height: 1))
+            height = max(1, ceil(measurement.fittingSize.height))
+        }
+        if case .item(let item) = entry { heights[item.id] = TranscriptMeasurement(entry: item, height: height, text: textMeasurement) }
         return height
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        if case .item(let item) = rows[row], let text = item.text {
+            let id = NSUserInterfaceItemIdentifier("transcript-text")
+            let cell = table.makeView(withIdentifier: id, owner: nil) as? TranscriptPlainCell ?? TranscriptPlainCell()
+            cell.identifier = id
+            cell.show(text, measured: heights[item.id]?.text)
+            return cell
+        }
         let id = NSUserInterfaceItemIdentifier("transcript-row")
-        let host = table.makeView(withIdentifier: id, owner: nil) as? NSHostingView<AnyView>
-            ?? NSHostingView(rootView: AnyView(EmptyView()))
-        host.identifier = id
-        host.rootView = content?(rows[row], width) ?? AnyView(EmptyView())
-        return host
+        let cell = table.makeView(withIdentifier: id, owner: nil) as? TranscriptCell ?? TranscriptCell()
+        cell.identifier = id
+        cell.show(content?(rows[row], width) ?? AnyView(EmptyView()))
+        return cell
     }
 
     func tableView(_ tableView: NSTableView, didRemove rowView: NSTableRowView, forRow row: Int) {
-        for case let host as NSHostingView<AnyView> in rowView.subviews {
-            host.rootView = AnyView(EmptyView())
-            host.layoutSubtreeIfNeeded()
+        let log = OSLog(subsystem: "dev.a.app", category: .pointsOfInterest)
+        os_signpost(.begin, log: log, name: "Release transcript row")
+        defer { os_signpost(.end, log: log, name: "Release transcript row") }
+        for view in rowView.subviews {
+            if let cell = view as? TranscriptCell { cell.clear() }
+            else if let cell = view as? TranscriptPlainCell { cell.clear() }
         }
     }
 
@@ -271,5 +305,46 @@ private final class TranscriptScroller: NSScrollView {
     override func scrollWheel(with event: NSEvent) {
         super.scrollWheel(with: event)
         owner?.wheel(event.scrollingDeltaY)
+    }
+}
+
+private final class TranscriptCell: NSTableCellView {
+    private var host: TranscriptCellHost?
+
+    func show(_ content: AnyView) {
+        if host == nil {
+            let host = TranscriptCellHost(rootView: content)
+            host.sizingOptions = []
+            self.host = host
+            addSubview(host)
+        } else { host?.rootView = content }
+        host?.cold = true
+        needsLayout = true
+    }
+
+    override func layout() {
+        super.layout()
+        host?.frame = bounds
+    }
+
+    func clear() {
+        host?.rootView = AnyView(EmptyView())
+        host?.layoutSubtreeIfNeeded()
+        host?.removeFromSuperview()
+        host = nil
+    }
+}
+
+private final class TranscriptCellHost: NSHostingView<AnyView> {
+    var cold = true
+
+    override func layout() {
+        let log = OSLog(subsystem: "dev.a.app", category: .pointsOfInterest)
+        if cold { os_signpost(.begin, log: log, name: "First transcript row layout") }
+        else { os_signpost(.begin, log: log, name: "Transcript row layout") }
+        super.layout()
+        if cold { os_signpost(.end, log: log, name: "First transcript row layout") }
+        else { os_signpost(.end, log: log, name: "Transcript row layout") }
+        cold = false
     }
 }

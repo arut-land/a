@@ -1,5 +1,6 @@
 //! Log-derived public controls and seek positions, shared by attached clients.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
@@ -12,6 +13,7 @@ use crate::outbox::FrameLog;
 
 pub(crate) struct Owner {
     pub session: SessionId,
+    pub parent: Option<SessionId>,
     pub workspace: HostPath,
     pub generation: Epoch,
 }
@@ -19,14 +21,114 @@ pub(crate) struct Owner {
 pub(crate) struct History {
     session: SessionId,
     workspace: HostPath,
+    parent: Option<SessionId>,
     generation: AtomicU32,
-    index: Mutex<Option<Arc<Mutex<protocol::view::Index>>>>,
+    index: Mutex<Option<Arc<Mutex<Indexed>>>>,
+}
+
+struct Indexed {
+    session: SessionId,
+    index: protocol::view::Index,
+    conversation: protocol::history::Conversation,
+    clocks: BTreeMap<SessionId, (u64, u64)>,
+}
+
+impl Indexed {
+    fn apply(&mut self, entry: &protocol::Entry) {
+        use protocol::{Body, ledger::OutcomeKind};
+        self.index.apply(entry);
+        let meta = &mut self.conversation;
+        match &entry.body {
+            Body::Spawned { intent } | Body::Link { intent, .. } => {
+                if let Ok(spawn) = crate::driver::spawn::SpawnIntent::from_json(intent) {
+                    let agent = spawn
+                        .request
+                        .runner
+                        .agent()
+                        .unwrap_or("model_only")
+                        .to_owned();
+                    let title = spawn
+                        .request
+                        .prompt
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(96)
+                        .collect();
+                    let admitted = u64::try_from(
+                        spawn
+                            .admitted_at
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis(),
+                    )
+                    .unwrap_or(u64::MAX);
+                    if let Body::Link { child, .. } = &entry.body {
+                        meta.children.push(protocol::history::Child {
+                            session: *child,
+                            agent,
+                            title,
+                            admitted_unix_ms: admitted,
+                        });
+                    } else {
+                        meta.agent = Some(agent);
+                        meta.title = Some(title);
+                        meta.admitted_unix_ms = Some(admitted);
+                    }
+                }
+            }
+            Body::Input { .. } | Body::Take { into: None, .. } => meta.outcome = None,
+            Body::Interrupt { .. } => meta.outcome = Some(OutcomeKind::Interrupted),
+            Body::ModelResult {
+                outcome,
+                r#for: None,
+                ..
+            } => {
+                if meta.outcome != Some(OutcomeKind::Interrupted) {
+                    meta.outcome = Some(OutcomeKind::of(outcome));
+                }
+            }
+            Body::ToolResult { outcome, .. } => {
+                if meta.outcome != Some(OutcomeKind::Interrupted) {
+                    meta.outcome = Some(OutcomeKind::of(outcome));
+                }
+            }
+            Body::Assistant { .. } => meta.outcome = Some(OutcomeKind::Done),
+            _ => {}
+        }
+        if let Some(fact) = entry
+            .execution
+            .as_ref()
+            .and_then(|json| protocol::CallFact::from_json(json).ok())
+            && !fact.side
+            && fact.id.executing_session == self.session
+        {
+            if meta.agent.is_none() {
+                meta.agent = Some(fact.agent);
+            }
+            if let Some(elapsed) = fact.elapsed_ns {
+                let range = self
+                    .clocks
+                    .entry(fact.clock_epoch)
+                    .or_insert((fact.start_ns, fact.start_ns));
+                range.0 = range.0.min(fact.start_ns);
+                range.1 = range.1.max(fact.start_ns.saturating_add(elapsed));
+                meta.elapsed_ns = Some(
+                    self.clocks
+                        .values()
+                        .fold(0_u64, |sum, (start, end)| sum.saturating_add(end - start)),
+                );
+            }
+        }
+    }
 }
 
 impl History {
     pub(crate) fn new(owner: Owner) -> Self {
         Self {
             session: owner.session,
+            parent: owner.parent,
             workspace: owner.workspace,
             generation: AtomicU32::new(owner.generation.0),
             index: Mutex::default(),
@@ -38,12 +140,17 @@ impl History {
         *lock(&self.index) = None;
     }
 
-    fn index(&self) -> Arc<Mutex<protocol::view::Index>> {
+    fn index(&self) -> Arc<Mutex<Indexed>> {
         Arc::clone(lock(&self.index).get_or_insert_with(|| {
-            Arc::new(Mutex::new(protocol::view::Index::new(
-                self.session,
-                self.workspace.clone(),
-            )))
+            Arc::new(Mutex::new(Indexed {
+                session: self.session,
+                index: protocol::view::Index::new(self.session, self.workspace.clone()),
+                clocks: BTreeMap::new(),
+                conversation: protocol::history::Conversation {
+                    parent: self.parent,
+                    ..Default::default()
+                },
+            }))
         }))
     }
 
@@ -61,7 +168,7 @@ impl History {
             Err(TryLockError::WouldBlock) => return,
             Err(TryLockError::Poisoned(_)) => panic!("history index lock poisoned"),
         };
-        if index.through() + 1 == entry.seq.get() {
+        if index.index.through() + 1 == entry.seq.get() {
             index.apply(entry);
         }
     }
@@ -79,16 +186,18 @@ impl History {
     ) -> io::Result<Head> {
         let index = self.index();
         let mut index = lock(&index);
-        for batch in frames.batches_after(index.through()) {
+        for batch in frames.batches_after(index.index.through()) {
             for entry in batch? {
                 index.apply(&entry);
             }
         }
-        Ok(index.head_for(
+        let mut head = index.index.head_for(
             Epoch(self.generation.load(Ordering::Acquire)),
             since,
             purposes,
-        ))
+        );
+        head.conversation = index.conversation.clone();
+        Ok(head)
     }
 
     pub(crate) fn page(&self, frames: &FrameLog, request: &Request) -> io::Result<Page> {
@@ -103,12 +212,12 @@ impl History {
         }
         let index = self.index();
         let mut index = lock(&index);
-        for batch in frames.batches_after(index.through()) {
+        for batch in frames.batches_after(index.index.through()) {
             for entry in batch? {
                 index.apply(&entry);
             }
         }
-        index.page(request, |seq| frames.entry(seq.get()))
+        index.index.page(request, |seq| frames.entry(seq.get()))
     }
 }
 
@@ -168,6 +277,73 @@ mod tests {
     use protocol::Body;
 
     #[test]
+    fn execution_spans_include_gaps_without_combining_clock_epochs() {
+        let session = SessionId::new();
+        let clock = SessionId::new();
+        let mut indexed = Indexed {
+            session,
+            index: protocol::view::Index::new(session, "/test".into()),
+            conversation: protocol::history::Conversation::default(),
+            clocks: BTreeMap::new(),
+        };
+        for (at, (epoch, start, elapsed)) in
+            [(clock, 10, 1), (clock, 15, 1), (SessionId::new(), 2, 2)]
+                .into_iter()
+                .enumerate()
+        {
+            let call = protocol::CallId::new(at as u64 * 2 + 1).unwrap();
+            indexed.apply(&protocol::Entry::new(
+                protocol::Seq::new(call.get()).unwrap(),
+                Epoch(1),
+                Body::ModelCall {
+                    model: "fixture".into(),
+                    attempt: 0,
+                    choice: protocol::ToolChoice::Auto,
+                    r#for: None,
+                    purpose: None,
+                    request: None,
+                },
+            ));
+            let mut result = protocol::Entry::new(
+                protocol::Seq::new(call.get() + 1).unwrap(),
+                Epoch(1),
+                Body::ModelResult {
+                    call,
+                    r#for: None,
+                    outcome: protocol::Outcome::Done {
+                        output: protocol::Json::null(),
+                    },
+                    failure: None,
+                },
+            );
+            result.execution = Some(
+                protocol::CallFact {
+                    id: protocol::AttemptId {
+                        executing_session: session,
+                        call,
+                        attempt: 0,
+                    },
+                    model: "fixture".into(),
+                    role: "session".into(),
+                    runner: "agent".into(),
+                    agent: "echo".into(),
+                    side: false,
+                    unix_ms: 0,
+                    clock_epoch: epoch,
+                    start_ns: start * 1_000_000_000,
+                    elapsed_ns: Some(elapsed * 1_000_000_000),
+                    usage: None,
+                    charge: None,
+                }
+                .to_json()
+                .unwrap(),
+            );
+            indexed.apply(&result);
+        }
+        assert_eq!(indexed.conversation.elapsed_ns, Some(8_000_000_000));
+    }
+
+    #[test]
     fn committed_facts_update_a_hot_index_without_rereading_or_waiting_for_readers() {
         let root = tempfile::tempdir().unwrap();
         let session = SessionId::new();
@@ -184,6 +360,7 @@ mod tests {
             0,
             Owner {
                 session,
+                parent: None,
                 workspace: "/test".into(),
                 generation: Epoch(1),
             },
@@ -215,7 +392,7 @@ mod tests {
             .unwrap();
         frames.push(second.seq.get());
         frames.history.observe(&second);
-        assert_eq!(reader.through(), first.seq.get());
+        assert_eq!(reader.index.through(), first.seq.get());
         drop(reader);
         let head = frames.history.head(&frames, first.seq.get()).unwrap();
         assert_eq!((head.cut.seq, head.count), (second.seq.get(), 2));

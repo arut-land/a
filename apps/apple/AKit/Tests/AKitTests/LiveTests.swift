@@ -326,3 +326,53 @@ func spawned_work_has_one_navigable_row_and_output_is_fetched_on_demand() async 
     await transcript.detach()
     await store.detach()
 }
+
+@Test(.enabled(if: live != nil))
+func conversation_store_keeps_children_after_paging_and_stops_them_through_the_sdk() async throws {
+    let client = try Client(helper: live!)
+    let parent = SessionStore(session: Session(client: client))
+    let workspace = FileManager.default.temporaryDirectory.appending(path: "akit-family-\(UUID())")
+    try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: workspace) }
+    parent.open(.new(workspace: workspace.path))
+    try await eventually("family parent") { parent.link == .live }
+    let id = try #require(parent.sessionId)
+    let conversations = try ConversationStore(client: client, origin: id)
+    conversations.start()
+    defer { conversations.stop() }
+    await parent.send("call background_task {\"prompt\":\"$ printf ready; sleep 30\",\"messages\":[]}")
+    try await eventually("running child in the head-only family") {
+        conversations.rows.contains { $0.parent == id && $0.running }
+    }
+    let child = try #require(conversations.rows.first { $0.parent == id })
+    #expect(child.agent == "echo")
+    #expect(child.title == "$ printf ready; sleep 30")
+    for turn in 0..<28 {
+        await parent.send(String(repeating: "history line\n", count: 160) + "later parent turn \(turn)")
+        try await eventually("parent progressed") { parent.history?.pending == false && parent.items.contains { $0.kind == .assistant && $0.presentation.body?.text.hasSuffix("later parent turn \(turn)") == true } }
+    }
+    #expect(!parent.items.contains { $0.navigation == child.id })
+    #expect(conversations.rows.contains { $0.id == child.id && $0.running })
+    let transcript = SessionStore(session: Session(client: client))
+    transcript.open(.id(id: child.id))
+    try await eventually("child paged transcript") { transcript.link == .live && transcript.history?.pending == false && !transcript.items.isEmpty }
+    let fromChild = try ConversationStore(client: client, origin: child.id)
+    fromChild.start()
+    defer { fromChild.stop() }
+    try await eventually("parent reachable from a directly opened child") {
+        fromChild.rows.contains { $0.id == id && $0.depth == 0 } && fromChild.rows.contains { $0.id == child.id && $0.parent == id }
+    }
+    try await eventually("child approval is reachable in its own transcript") { transcript.turn.asking != nil }
+    conversations.interrupt(child.id)
+    #expect(conversations.problem == nil)
+    try await eventually("child interruption published") { conversations.rows.contains { $0.id == child.id && $0.status == "interrupted" } }
+    #expect(conversations.rows.count == 2)
+    #expect(conversations.problem == nil)
+    await transcript.send("follow up for child")
+    try await eventually("message reaches the child's existing inbox") {
+        transcript.items.contains { $0.kind == .assistant && $0.presentation.body?.text == "follow up for child" }
+    }
+    try await eventually("a messaged child is observed again after completion") { conversations.rows.contains { $0.id == child.id && $0.status == "finished" } }
+    await transcript.detach()
+    await parent.detach()
+}

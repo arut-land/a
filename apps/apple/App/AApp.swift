@@ -32,6 +32,7 @@ struct AApp: App {
 @Observable
 final class AppModel {
     private(set) var client: Client?
+    private(set) var conversations: ConversationStore?
     private(set) var list: SessionListStore?
     private let cache = SessionStoreCache()
     var stores: [String: SessionStore] { cache.stores }
@@ -69,11 +70,20 @@ final class AppModel {
     func open(_ id: String) {
         guard let client else { return }
         cache.open(id, client: client)
+        if conversations?.origin != id && conversations?.rows.contains(where: { $0.id == id }) != true {
+            conversations?.stop()
+            do {
+                conversations = try ConversationStore(client: client, origin: id)
+                conversations?.start()
+            } catch { notice = error.localizedDescription }
+        }
     }
 
     func newSession(in workspace: URL) {
         guard let client else { return }
         let store = SessionStore(session: Session(client: client))
+        conversations?.stop()
+        conversations = nil
         draft = store
         selection = nil
         store.open(.new(workspace: workspace.path))
@@ -85,6 +95,7 @@ final class AppModel {
         selection = id
         cache.insert(draft, id: id)
         self.draft = nil
+        open(id)
     }
 
     func chooseWorkspace() {

@@ -10,10 +10,10 @@ struct ContentView: View {
                 .navigationSplitViewColumnWidth(min: 220, ideal: 260)
         } detail: {
             if let draft = model.draft {
-                ChatView(store: draft, perform: model.perform, openChild: { model.selection = $0; model.open($0) })
+                ChatView(store: draft, conversations: model.conversations, perform: model.perform, openChild: { model.selection = $0; model.open($0) })
                     .onChange(of: draft.sessionId) { model.adoptDraft() }
             } else if let id = model.selection, let store = model.stores[id] {
-                ChatView(store: store, perform: model.perform, openChild: { model.selection = $0; model.open($0) }).id(id)
+                ChatView(store: store, conversations: model.conversations, perform: model.perform, openChild: { model.selection = $0; model.open($0) }).id(id)
             } else if let problem = model.problem {
                 ContentUnavailableView(
                     "Cannot reach the daemon", systemImage: "exclamationmark.triangle",
@@ -34,9 +34,15 @@ struct SessionList: View {
     @Bindable var model: AppModel
 
     var body: some View {
-        List(selection: $model.selection) {
+        let family = model.conversations?.rows ?? []
+        let root = family.first(where: { $0.depth == 0 })?.id
+        let children = root == nil ? Set<String>() : Set(family.filter { $0.parent != nil }.map(\.id))
+        List(selection: Binding<String?>(get: {
+            if let selected = model.selection, children.contains(selected) { return root }
+            return model.selection
+        }, set: { model.selection = $0 })) {
             if let list = model.list {
-                ForEach(list.sessions) { session in
+                ForEach(list.sessions.filter { !children.contains($0.id) }) { session in
                     VStack(alignment: .leading, spacing: 2) {
                         Text(session.short).font(.body.monospaced())
                         Text(URL(filePath: session.workspace).lastPathComponent)

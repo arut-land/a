@@ -18,7 +18,7 @@ pub use question::{
 };
 
 /// The exact protocol this build speaks.
-pub const PROTO: u32 = 44;
+pub const PROTO: u32 = 45;
 
 /// Ordinary payloads leave 4 KiB per reserved control slot for cancellation.
 #[derive(Clone, Copy)]
