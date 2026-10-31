@@ -1040,6 +1040,7 @@ def engine_suites(source, reference, target, output, rounds):
         if reference and label == "main":
             cargo_run(["cargo", "clean"], cwd=checkout, env=env, check=True)
     (output / "engine-sources.json").write_text(json.dumps(identities, indent=2))
+    (target / "engine-run").mkdir(parents=True, exist_ok=True)
     for round in range(rounds):
         labels = list(sources) if round % 2 == 0 else list(reversed(sources))
         for label in labels:
@@ -1057,6 +1058,8 @@ def engine_suites(source, reference, target, output, rounds):
                 stream.write(json.dumps(row) + "\n")
             print(json.dumps(row), flush=True)
             print(result.stdout.decode("utf-8", errors="replace")[-5000:], flush=True)
+            if result.returncode not in (0, 100) or b"tests run:" not in result.stdout:
+                raise SystemExit(result.returncode or 1)
             if not reference and result.returncode:
                 raise SystemExit(result.returncode)
 
