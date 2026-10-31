@@ -328,6 +328,34 @@ Swift suite completed 41 tests (one external diagnostic skipped), including the
 new streaming and native insertion checks. Clippy, formatting, the native Release
 build and the Windows lint passed. Initial extended browser runs failed test setup while establishing a shared
 authenticated context; the corrected test creates an explicit browser context
-and both tabs share it. The focused browser journey passes (`p2-web-3.log`). The complete package(a) result and hosted CI
-result are recorded below when complete. Phase-1 performance numbers above refer
+and both tabs share it. The focused browser journey passes (`p2-web-3.log`). The final complete package(a) run passed all 147 tests (10 skipped;
+`p2-package-a-final.log`). The hosted CI result is recorded below. Phase-1 performance numbers above refer
 to its measured candidate; they were not rerun for these two correctness fixes.
+
+
+### Phase-2 CI and cleanup
+
+`git fetch origin main` followed by `git merge --no-edit origin/main` reported
+already up to date: origin/main was already an ancestor. Review fixes were
+committed and pushed as `f6f85331`. CI was dispatched **exactly once** with
+`gh workflow run CI --ref app-ux`.
+
+[CI run 41209007284](https://github.com/arut-land/a/actions/runs/41209007284)
+completed successfully against `f6f85331e871477db8dcbe7a64c279ed40ccb075`.
+Linux, Windows x64, Windows ARM64, macOS, Apple native checks, both budget jobs,
+fuzz, Miri and all dependency/thread/runtime checks passed. No failed job or
+rerun occurred. Polls were separated by at least three minutes; final job data
+and preceding snapshots are retained in `p2-ci-latest.json` and `p2-ci-poll-*.json`.
+
+After all hosted jobs passed, `mise exec -- cargo clean` ran with jobs=2 and
+only the designated external target (`p2-cargo-clean.log`), reporting 38,531 files
+and 6.3 GiB removed. The entire `tgt-app-ux` directory was then deleted, including
+non-Cargo files beneath it; absence is recorded in `p2-target-delete.json`.
+The isolated navigation daemon was stopped with its exact A_HOME before cleanup.
+Raw evidence, traces and source mirrors remain under the specified evidence
+directory. No worktree build directories or user-home data were touched.
+
+The closing report commit changes documentation only; the tested code remains
+that of the CI head above. The owner's white-space screenshot is still pending,
+and the previously recorded non-cooperative-tool cancellation limitation is
+unchanged. Neither is concealed by the successful review fixes.
