@@ -245,6 +245,10 @@ jobs:
           REFERENCE: ${{ inputs.paired_ref }}
         run: |
           $reference = @()
+          if ($env:PERF_RELEASE_OVERLAP -eq 'engine-trace-contended') {
+            python scripts/perf/residency.py --source ../measured --target $env:CARGO_TARGET_DIR --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 5 --suite-trial 0 --depth-trace --depth-load 8
+            exit $LASTEXITCODE
+          }
           if ($env:PERF_RELEASE_OVERLAP -eq 'engine-trace-stress') {
             python scripts/perf/residency.py --source ../measured --target $env:CARGO_TARGET_DIR --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 5 --suite-trial 0 --suite-scope workspace --depth-trace --suite-threads 16
             exit $LASTEXITCODE
@@ -527,6 +531,7 @@ jobs:
             ${{ runner.temp }}/residency-output/*.patch
             ${{ runner.temp }}/residency-output/census-module.rs
             ${{ runner.temp }}/residency-output/engine-*.txt
+            ${{ runner.temp }}/residency-output/cold-load-*.txt
           retention-days: 30
       - name: Clean owned target
         if: always()

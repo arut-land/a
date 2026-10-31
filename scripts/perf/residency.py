@@ -1023,36 +1023,20 @@ def table(summary, comparison=False):
 
 
 DEPTH_TRACE = r'''
-    for live in daemon.loaded() {
-        live.barrier();
-    }
     let started = Instant::now();
-    let observations = std::sync::Mutex::new(Vec::new());
-    let ready = || {
-        let idle = daemon.idle();
-        let mut graph: Vec<_> = daemon.loaded().iter()
-            .map(|live| (live.id, live.has_work(), live.has_input(), live.has_jobs()))
-            .collect();
-        graph.sort_by_key(|entry| entry.0);
-        let mut rows = crate::lock(&observations);
-        if rows.last().is_none_or(|(_, previous, previous_idle)| previous != &graph || *previous_idle != idle) {
-            rows.push((started.elapsed(), graph, idle));
-        }
-        idle
-    };
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        daemon.wait("settled", PATIENCE, &ready);
-    }));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| settle(&daemon)));
     eprintln!("depth-trace first-window elapsed={:?} result={}", started.elapsed(), result.is_ok());
-    eprintln!("depth-trace observations={:#?}", crate::lock(&observations));
     if let Err(panic) = result {
+        eprintln!("depth-trace timeout-idle={} graph={:#?}", daemon.idle(), daemon.loaded().iter()
+            .map(|live| (live.id, live.has_work(), live.has_jobs())).collect::<Vec<_>>());
+        eprintln!("depth-trace timeout-events={:#?}", crate::lock(&super::EVENTS.0));
         for header in daemon.shared.store.headers().unwrap() {
             eprintln!("depth-trace timeout-log {} {:#?}", header.id, bodies(&*daemon.shared.store, header.id));
         }
-        rt::block_on(rt::or(daemon.pulse.until(&ready),
-            rt::or(daemon.jobs.until(&ready), super::EVENTS.1.until(&ready))));
+        rt::block_on(rt::or(daemon.pulse.until(|| daemon.idle()),
+            rt::or(daemon.jobs.until(|| daemon.idle()), super::EVENTS.1.until(|| daemon.idle()))));
         eprintln!("depth-trace eventual-idle elapsed={:?}", started.elapsed());
-        eprintln!("depth-trace observations={:#?}", crate::lock(&observations));
+        eprintln!("depth-trace final-events={:#?}", crate::lock(&super::EVENTS.0));
         for header in daemon.shared.store.headers().unwrap() {
             eprintln!("depth-trace final-log {} {:#?}", header.id, bodies(&*daemon.shared.store, header.id));
         }
@@ -1061,7 +1045,8 @@ DEPTH_TRACE = r'''
 '''
 
 
-def engine_suites(source, reference, target, output, rounds, prepare, trial, scope, trace, threads):
+
+def engine_suites(source, reference, target, output, rounds, prepare, trial, scope, trace, threads, load):
     env = environment(target)
     env["NEXTEST_PROFILE"] = "windows"
     env["A_TEST_POWERSHELL"] = ";".join([shutil.which("pwsh.exe"),
@@ -1111,9 +1096,34 @@ def engine_suites(source, reference, target, output, rounds, prepare, trial, sco
                        "--workspace-remap", str(checkout), "--extract-to", str(target / "engine-run"),
                        "--extract-overwrite", "--no-fail-fast", "--retries", "0", "--no-tests=fail",
                        *(["--success-output", "final"] if trace else []),
-                       *(["--test-threads", str(threads)] if threads else [])]
-            result = cargo_run(command, nextest_version="0.9.148", cwd=checkout, env=env,
-                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                       *(["--test-threads", str(threads)] if threads else []),
+                       *(["-E", "test(=tests::inherited_task_cannot_reset_an_exhausted_depth_budget)"] if load else [])]
+            pressure = []
+            if load:
+                binaries = list((target / "debug/deps").glob("engine-*.exe"))
+                assert len(binaries) == 1, binaries
+                for index in range(load):
+                    path = output / f"cold-load-{round:02}-{index:02}.txt"
+                    stream = path.open("wb")
+                    child = subprocess.Popen([str(binaries[0]), "--exact",
+                        "tests::cold_start_does_not_grow_with_session_count", "--nocapture"],
+                        cwd=checkout, env=env, stdout=stream, stderr=subprocess.STDOUT)
+                    pressure.append((child, stream, path))
+            try:
+                result = cargo_run(command, nextest_version="0.9.148", cwd=checkout, env=env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            finally:
+                load_results = []
+                for child, stream, path in pressure:
+                    try:
+                        child.wait(timeout=120)
+                    except subprocess.TimeoutExpired:
+                        child.kill()
+                        child.wait()
+                    stream.close()
+                    load_results.append(dict(pid=child.pid, returncode=child.returncode, log=path.name))
+                if pressure:
+                    (output / f"cold-load-{round:02}.json").write_text(json.dumps(load_results, indent=2))
             log = output / f"engine-{label}-{round:02}.txt"
             log.write_bytes(result.stdout)
             row = dict(round=round, label=label, returncode=result.returncode, log=log.name,
@@ -1122,7 +1132,7 @@ def engine_suites(source, reference, target, output, rounds, prepare, trial, sco
                 stream.write(json.dumps(row) + "\n")
             print(json.dumps(row), flush=True)
             print(result.stdout.decode("utf-8", errors="replace")[-5000:], flush=True)
-            if result.returncode not in (0, 100) or b"tests run:" not in result.stdout:
+            if result.returncode not in (0, 100) or not (b"tests run:" in result.stdout or b"test run:" in result.stdout):
                 raise SystemExit(result.returncode or 1)
             if not reference and result.returncode:
                 raise SystemExit(result.returncode)
@@ -1170,6 +1180,7 @@ def main():
     parser.add_argument("--suite-scope", choices=["engine", "workspace"], default="engine")
     parser.add_argument("--depth-trace", action="store_true")
     parser.add_argument("--suite-threads", type=int)
+    parser.add_argument("--depth-load", type=int, default=0)
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--stored", default="1,8,32")
     parser.add_argument("--active", default="1,4,8")
@@ -1203,7 +1214,7 @@ def main():
     os.environ["A_HOME"] = str(output / "test-home")
     if args.engine_suites:
         engine_suites(source, args.reference_source.resolve() if args.reference_source else None,
-                      target, output, args.rounds, args.prepare_engine, args.suite_trial, args.suite_scope, args.depth_trace, args.suite_threads)
+                      target, output, args.rounds, args.prepare_engine, args.suite_trial, args.suite_scope, args.depth_trace, args.suite_threads, args.depth_load)
         return
     if args.overlap:
         if args.census or args.reference_source or args.reference_binary or args.binary:
