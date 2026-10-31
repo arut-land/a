@@ -25,7 +25,9 @@ The JSONL store retains the original file with a durable hard link at
 This is the same inode/file identity, including later appends, not a byte copy.
 The retained namespace is outside catalog discovery. Removing a visible parent
 or catalog entry cannot remove referenced bytes. Readers cap every operation at
-the recorded sequence. Source logs themselves contain earlier source references,
+the recorded sequence. Live cut readers reuse the ordinary source log and its
+disposable index; if its visible name is gone, they open the retained JSONL and
+rebuild missing positions. Retention publishes no second index alias. Source logs themselves contain earlier source references,
 so retention is recursive. Disposable indexes can be lost and rebuilt from
 ordinary sealed JSONL. No ordinary garbage collector currently deletes
 unreferenced retained logs or payload blobs; this change does not introduce one.
@@ -313,6 +315,53 @@ The fixture-enabled measurement binaries are
 7,821,168 → 7,821,040 bytes.
 These are deterministic artifact sizes, not timing estimates. Binary SHA-256
 values and the raw count are in `final-size-loc.json`.
+
+## Phase 2 CPU review investigation
+
+The sole independent finding was the original n=5 deep CPU increase. Main was
+refetched and merged without conflicts: baseline `cd04f52d`, merged product
+`8cdf5565`. A temporary diagnostic job in `perf.yml` builds native release
+fixtures with rebuilt std, two jobs and one external target per runner. It runs
+10 alternating A/B or B/A rounds at 1/4/8 roots × 32 turns and 1 root × 64 turns,
+80 fresh homes per host. The same loopback SSE workload, five 128 KiB fresh
+agent outputs and eight tools per root turn are preserved. Each case audits
+all durable model/tool completions and child addresses, then stops its daemon
+before archiving the isolated home. Late CPU is the mean of the final four
+turns per root, using native process counters. Controls are CPU-only; clients
+and residency probes from phase 1 are not rerun here.
+
+The first completed local n=10 run confirms a deep CPU problem: main
+**93.94 [89.06–99.74] ms**, candidate **100.79 [97.89–152.40] ms**. All ten
+paired deltas are positive (median +6.11 ms). The completed Linux x64 cohort
+has main **121.25 [117.50–125.00] ms**, candidate
+**120.00 [117.50–122.50] ms**. Results are kept per native host, not pooled.
+The original local observations are in `cpu-local-final`; Linux's raw log and
+summary are `cpu-linux.log` and `cpu-linux-summary-from-log.json`.
+
+An extra native `sample` capture during turns 57–64 (excluded from timings)
+shows added retained-log publication work: source and disposable-index hard
+links, directory ordering and metadata lookups under `Jsonl::retain`. Exact
+UUID-matched symbols and both profiles are retained under `cpu-profile`.
+A disposable index needs no retained publication: it can be reused at the
+ordinary log or rebuilt after visible-source removal. The fix removes that
+extra index link and namespace, and reads the ordinary source before falling
+back to its retained alias. The source-log hard link, directory ordering and
+referring admission durability barrier remain. Frozen cuts, recursive retention,
+provider caches and admission authority are unchanged.
+
+A release, five-round interleaved ablation of the previous candidate against
+this change reduces the deep median from **103.07 [97.79–104.99]** to
+**95.08 [92.91–145.59] ms**. Four of five paired deltas improve; the wide outlier
+is retained. These diagnostic results support the narrow cause fix, but do not
+replace final n=10 acceptance. The final candidate must be remeasured against
+main on all three hosted platforms and quietly on this Mac.
+
+The revised code passes 523 engine/protocol tests (17 skipped), clippy with
+warnings denied, formatting and the Windows lint. The recursive removal tests
+still recover the same transcript and payloads after deleting the visible tree;
+their obsolete second-index-directory deletion is removed. Detailed logs are
+`cpu-index-ablation-tests.log`, `cpu-index-clippy.log`,
+`cpu-index-fmt.log`, and `cpu-index-windows.log`. No full CI has been dispatched.
 
 ## Owner-pending items
 

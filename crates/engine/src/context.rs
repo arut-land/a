@@ -1141,7 +1141,6 @@ mod tests {
         .into_messages();
         drop((source, loaded, logs));
         std::fs::remove_dir_all(visible).unwrap();
-        std::fs::remove_dir_all(retained.join("derived")).unwrap();
         let logs = Arc::new(Jsonl::open(&path).unwrap());
         assert_eq!(logs.headers().unwrap(), [grandchild]);
         let source = Source::new(logs, places);

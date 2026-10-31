@@ -214,7 +214,6 @@ impl LogStore for Jsonl {
         let dir = retained.parent().unwrap();
         if self.retention.get().is_none() {
             sys::fs::create_dir_all_durable(&self.dir, dir)?;
-            let _ = fs::create_dir_all(dir.join(DERIVED));
             let _ = self.retention.set(());
         }
         match fs::hard_link(&source, &retained) {
@@ -224,10 +223,6 @@ impl LogStore for Jsonl {
         }
         // Both names own the same ordinary log bytes, including later appends.
         // The archive stays outside discovery, so catalog visibility can end independently.
-        let index = beside(&source, "idx");
-        if index.is_file() {
-            let _ = fs::hard_link(index, beside(&retained, "idx"));
-        }
         // The referring admission's shared store barrier covers this ordered name.
         sys::fs::order_dir(dir)
     }
@@ -236,13 +231,15 @@ impl LogStore for Jsonl {
         &self,
         cut: protocol::publication::LogCut,
     ) -> io::Result<Box<dyn Iterator<Item = io::Result<Entry>> + Send>> {
-        let retained = self.retained(cut.session);
-        let path = if retained.is_file() {
-            retained
-        } else {
-            self.path(cut.session)?
+        let path = self.path(cut.session)?;
+        let (file, path) = match File::open(&path) {
+            Ok(file) => (file, path),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let retained = self.retained(cut.session);
+                (File::open(&retained)?, retained)
+            }
+            Err(error) => return Err(error),
         };
-        let file = File::open(&path)?;
         let mut index = Index::new(&file, path, 0)?;
         if index.header(&file)?.is_some() {
             return Err(io::Error::other("unreadable context source format"));
