@@ -83,6 +83,12 @@ is never constructed by the reopen transition. A disabled backend's pending
 type contains `Infallible`; its lease is zero-sized, and its compile-time
 policy constant prevents even taking an extra scheduling lock.
 
+The gated full-trim candidate missed the reopen criterion on both GNU
+architectures (+0.414 [-1.823, 0.542] ms on x64; +0.503 [-0.211, 1.211] ms on
+ARM64). The last GNU candidate retains the main arena's top and keeps the
+measured free-capacity floor and scoped batch priority. Each architecture is
+enabled only if that complete candidate meets the same criteria.
+
 Intel macOS gets one further controlled whole-process relief experiment,
 because default-zone relief did not reproduce the earlier whole-process gain.
 No capacity threshold is guessed for Apple's reservation statistics. Without

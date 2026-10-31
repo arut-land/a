@@ -78,6 +78,13 @@ mod idle {
         if pending.0.upgrade().is_none() {
             return false;
         }
+        #[cfg(target_os = "linux")]
+        {
+            // Keep the main arena warm for replay; interior pages still return.
+            // SAFETY: pad retains capacity without invalidating any live allocation.
+            unsafe { libc::malloc_trim(usize::MAX) };
+        }
+        #[cfg(target_os = "macos")]
         super::release();
         true
     }
