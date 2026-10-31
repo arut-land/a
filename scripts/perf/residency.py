@@ -951,11 +951,18 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     os.environ["A_HOME"] = str(output / "test-home")
     if args.census:
+        test_env = environment(target)
+        if sys.platform == "linux" and platform.machine() == "aarch64":
+            # The runner's mold aborts on range-extension thunks in the large
+            # engine test image. Release images keep the normal linker recipe.
+            flags = tomllib.loads((source / ".cargo/config.toml").read_text())["target"]['cfg(target_os = "linux")']["rustflags"]
+            test_env["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join(
+                flag.replace("-fuse-ld=mold", "-fuse-ld=lld") for flag in flags)
         cargo_run(["cargo", "nextest", "run", "-p", "sys", "-p", "engine", "--features", "sys/fixtures"],
-                  cwd=source, env=environment(target), check=True)
+                  cwd=source, env=test_env, check=True)
         cargo_run(["cargo", "clippy", "-p", "sys", "-p", "engine", "--all-targets",
                    "--features", "sys/fixtures", "--", "-D", "warnings"],
-                  cwd=source, env=environment(target), check=True)
+                  cwd=source, env=test_env, check=True)
     reference = args.reference_binary.resolve() if args.reference_binary else None
     if args.reference_source:
         reference = stage(executable(args.reference_source.resolve(), environment(target), ["--features", "fixtures"], run=cargo_run), output / ("a-reference" + SUFFIX))
