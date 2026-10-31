@@ -79,11 +79,11 @@ def instrument_overlap(source, output):
         ["git", "diff", "--", "crates/sys/src/memory.rs"], cwd=source))
 
 
-def cargo_run(command, **kwargs):
+def cargo_run(command, *, nextest_version="0.9.150", **kwargs):
     cargo = subprocess.check_output(["rustup", "which", "cargo"], cwd=kwargs.get("cwd"),
                                     env=kwargs.get("env"), text=True).strip()
     try:
-        return subprocess.run(["mise", "exec", *(["cargo:cargo-nextest@0.9.150"] if command[1] == "nextest" else []),
+        return subprocess.run(["mise", "exec", *([f"cargo:cargo-nextest@{nextest_version}"] if command[1] == "nextest" else []),
                                "--", cargo, *command[1:]], **kwargs)
     except subprocess.CalledProcessError as error:
         if error.stdout:
@@ -1022,6 +1022,45 @@ def table(summary, comparison=False):
     return "\n".join(lines) + "\n"
 
 
+def engine_suites(source, reference, target, output, rounds):
+    env = environment(target)
+    env["NEXTEST_PROFILE"] = "windows"
+    env["A_TEST_POWERSHELL"] = ";".join([shutil.which("pwsh.exe"),
+        str(Path(env["SYSTEMROOT"]) / "System32/WindowsPowerShell/v1.0/powershell.exe")])
+    sources = {"main": reference, "branch": source} if reference else {"branch": source}
+    identities = {}
+    for label, checkout in sources.items():
+        archive = output / f"engine-{label}.tar.zst"
+        cargo_run(["cargo", "nextest", "archive", "-p", "engine", "--archive-file", str(archive)],
+                  nextest_version="0.9.148", cwd=checkout, env=env, check=True)
+        identities[label] = dict(source=str(checkout),
+            revision=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=checkout, text=True).strip(),
+            working_tree=subprocess.check_output(["git", "status", "--short"], cwd=checkout, text=True),
+            archive=str(archive), sha256=hashlib.sha256(archive.read_bytes()).hexdigest())
+        if reference and label == "main":
+            cargo_run(["cargo", "clean"], cwd=checkout, env=env, check=True)
+    (output / "engine-sources.json").write_text(json.dumps(identities, indent=2))
+    for round in range(rounds):
+        labels = list(sources) if round % 2 == 0 else list(reversed(sources))
+        for label in labels:
+            checkout = sources[label]
+            command = ["cargo", "nextest", "run", "--archive-file", identities[label]["archive"],
+                       "--workspace-remap", str(checkout), "--extract-to", str(target / "engine-run"),
+                       "--extract-overwrite", "--no-fail-fast", "--retries", "0", "--no-tests=fail"]
+            result = cargo_run(command, nextest_version="0.9.148", cwd=checkout, env=env,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            log = output / f"engine-{label}-{round:02}.txt"
+            log.write_bytes(result.stdout)
+            row = dict(round=round, label=label, returncode=result.returncode, log=log.name,
+                       archive_sha256=identities[label]["sha256"])
+            with (output / "engine-trials.jsonl").open("a") as stream:
+                stream.write(json.dumps(row) + "\n")
+            print(json.dumps(row), flush=True)
+            print(result.stdout.decode("utf-8", errors="replace")[-5000:], flush=True)
+            if not reference and result.returncode:
+                raise SystemExit(result.returncode)
+
+
 def main():
     # The workload only talks to fixture daemons and loopback diagnostics.
     keep = {
@@ -1057,6 +1096,7 @@ def main():
     parser.add_argument("--vmmap", type=Path, help="native VMMap executable; census diagnostics only")
     parser.add_argument("--census", action="store_true", help="instrumented native allocator cohort; excluded from timing claims")
     parser.add_argument("--overlap", choices=["reopen", "turn"], help="fixture call-entry overlap, paired native release versus no-op")
+    parser.add_argument("--engine-suites", action="store_true")
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--stored", default="1,8,32")
     parser.add_argument("--active", default="1,4,8")
@@ -1088,6 +1128,10 @@ def main():
         parser.error("select a fresh output directory; existing samples must not be mixed")
     output.mkdir(parents=True, exist_ok=True)
     os.environ["A_HOME"] = str(output / "test-home")
+    if args.engine_suites:
+        engine_suites(source, args.reference_source.resolve() if args.reference_source else None,
+                      target, output, args.rounds)
+        return
     if args.overlap:
         if args.census or args.reference_source or args.reference_binary or args.binary:
             parser.error("overlap uses one identically instrumented executable for release/no-op pairs")

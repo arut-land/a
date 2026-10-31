@@ -178,7 +178,7 @@ jobs:
       - uses: jdx/mise-action@v5
         with:
           working_directory: measured
-          install_args: cargo:cargo-nextest@0.9.150
+          install_args: cargo:cargo-nextest@0.9.150 cargo:cargo-nextest@0.9.148
           env: false
       - name: Native Cargo path
         working-directory: measured
@@ -245,6 +245,10 @@ jobs:
           REFERENCE: ${{ inputs.paired_ref }}
         run: |
           $reference = @()
+          if ($env:PERF_RELEASE_OVERLAP -eq 'engine-compare') {
+            python scripts/perf/residency.py --source ../measured --reference-source ../reference --target $env:CARGO_TARGET_DIR --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds $env:PERF_PAIRED_ROUNDS
+            exit $LASTEXITCODE
+          }
           if ($env:REFERENCE) { $reference += @('--reference-source', '../reference') }
           if ($env:PERF_ALLOC_CENSUS -eq 'true') { $reference += '--census' }
           if ($env:PERF_RESIDENCY_CASES) { $reference += @('--cases', $env:PERF_RESIDENCY_CASES) }
@@ -260,6 +264,7 @@ jobs:
             ${{ runner.temp }}/residency-output/*.csv
             ${{ runner.temp }}/residency-output/*.patch
             ${{ runner.temp }}/residency-output/census-module.rs
+            ${{ runner.temp }}/residency-output/engine-*.txt
           retention-days: 30
       - name: Clean owned target
         if: always()
