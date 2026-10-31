@@ -1152,7 +1152,7 @@ def engine_ci_suites(source, target, output):
     env = environment(target)
     env.pop("MISE_IGNORED_CONFIG_PATHS", None)
     env.update(MISE_TRUSTED_CONFIG_PATHS=str(source), MISE_YES="1", MISE_AUTO_INSTALL="false",
-               NEXTEST_PROFILE="windows", MBX_CACHE_DIR=str(output / "mbx"))
+               NEXTEST_PROFILE="windows", MBX_CACHE_DIR=str(target.parent / "mbx"))
     env["A_TEST_POWERSHELL"] = ";".join([shutil.which("pwsh.exe"),
         str(Path(env["SYSTEMROOT"]) / "System32/WindowsPowerShell/v1.0/powershell.exe")])
     path = source / "crates/engine/src/tests.rs"

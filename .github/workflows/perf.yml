@@ -147,6 +147,16 @@ jobs:
         with:
           ref: ${{ inputs.paired_ref }}
           path: reference
+      - name: Restore the failing CI cache
+        if: inputs.release_overlap == 'engine-ci-trace'
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ${{ runner.temp }}/mbx/actions
+          key: cargo-Windows-X64-windows-be7e19ee7a26678748b87651c80ae60840c5da610785f3d62b3ae1ceba732264-5610d9e021bbf83044a80974c7f6eac147fa2564
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
