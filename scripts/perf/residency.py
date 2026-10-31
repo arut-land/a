@@ -1167,6 +1167,8 @@ def engine_ci_suites(source, target, output):
         ["git", "diff", "--", "crates/engine/src/tests.rs"], cwd=source))
     identity = dict(revision=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip(),
                     cpu_count=os.cpu_count(), machine=platform.machine(), platform=platform.platform(),
+                    ci=env.get("CI"), github_actions=env.get("GITHUB_ACTIONS"),
+                    cache_auth_available="ACTIONS_RUNTIME_TOKEN" in env,
                     build="ci wrapped clippy, build, full workspace nextest; native nextest 0.9.148")
     (output / "engine-ci-source.json").write_text(json.dumps(identity, indent=2))
     for command in [
@@ -1215,6 +1217,15 @@ def main():
         "MISE_IGNORED_CONFIG_PATHS", "MISE_CARGO_BINSTALL_NATIVE",
         "RUNNER_TEMP", "RUNNER_OS", "RUNNER_ARCH", "GITHUB_STEP_SUMMARY",
     }
+    if "--engine-ci-suites" in sys.argv:
+        keep.update({
+            "CI", "GITHUB_ACTIONS", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_JOB",
+            "GITHUB_WORKFLOW", "GITHUB_REF", "GITHUB_SHA", "GITHUB_REPOSITORY",
+            "GITHUB_REPOSITORY_ID", "GITHUB_REPOSITORY_OWNER", "GITHUB_WORKSPACE",
+            "GITHUB_SERVER_URL", "GITHUB_API_URL", "GITHUB_GRAPHQL_URL",
+            "ACTIONS_CACHE_URL", "ACTIONS_RESULTS_URL", "ACTIONS_RUNTIME_URL",
+            "ACTIONS_RUNTIME_TOKEN", "ACTIONS_CACHE_SERVICE_V2",
+        })
     clean = {key: value for key, value in os.environ.items() if key.upper() in keep}
     clean.update(MISE_NO_ENV="1", CARGO_BUILD_JOBS="2", PYTHONDONTWRITEBYTECODE="1",
                  OPENAI_API_KEY="loopback-dummy", OPENAI_BASE_URL="http://127.0.0.1:1/v1",
