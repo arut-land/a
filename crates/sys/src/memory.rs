@@ -33,7 +33,11 @@ impl PendingRelease {
 
 fn release_idle() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    release();
+    {
+        // Retain the main arena's top; glibc still discards free interior pages.
+        // SAFETY: pad controls retained capacity and never invalidates live blocks.
+        unsafe { libc::malloc_trim(usize::MAX) };
+    }
 
     #[cfg(target_os = "macos")]
     {
