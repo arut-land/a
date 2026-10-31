@@ -178,8 +178,16 @@ jobs:
       - uses: jdx/mise-action@v5
         with:
           working_directory: measured
-          install_args: cargo:cargo-nextest@0.9.150 cargo:cargo-nextest@0.9.148
+          install_args: ${{ inputs.release_overlap == 'engine-ci-trace' && 'mr-boxington@1.28.0' || 'cargo:cargo-nextest@0.9.150 cargo:cargo-nextest@0.9.148' }}
           env: false
+      - name: CI native nextest
+        if: inputs.release_overlap == 'engine-ci-trace'
+        shell: pwsh
+        run: |
+          $platform = if ($env:RUNNER_ARCH -eq 'ARM64') { 'windows-arm' } else { 'windows' }
+          $archive = "$env:RUNNER_TEMP/nextest.zip"
+          Invoke-WebRequest "https://get.nexte.st/0.9.148/$platform" -OutFile $archive
+          Expand-Archive $archive -DestinationPath "$env:USERPROFILE/.cargo/bin" -Force
       - name: Native Cargo path
         working-directory: measured
         run: echo "$(dirname "$(rustup which cargo)")" >> "$GITHUB_PATH"
@@ -245,6 +253,10 @@ jobs:
           REFERENCE: ${{ inputs.paired_ref }}
         run: |
           $reference = @()
+          if ($env:PERF_RELEASE_OVERLAP -eq 'engine-ci-trace') {
+            python scripts/perf/residency.py --source ../measured --target $env:CARGO_TARGET_DIR --output "$env:RUNNER_TEMP/residency-output" --rounds 5 --engine-ci-suites
+            exit $LASTEXITCODE
+          }
           if ($env:PERF_RELEASE_OVERLAP -eq 'engine-trace-contended') {
             python scripts/perf/residency.py --source ../measured --target $env:CARGO_TARGET_DIR --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 5 --suite-trial 0 --depth-trace --depth-load 8
             exit $LASTEXITCODE

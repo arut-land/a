@@ -1148,6 +1148,55 @@ def engine_suites(source, reference, target, output, rounds, prepare, trial, sco
                 raise SystemExit(result.returncode)
 
 
+def engine_ci_suites(source, target, output):
+    env = environment(target)
+    env.pop("MISE_IGNORED_CONFIG_PATHS", None)
+    env.update(MISE_TRUSTED_CONFIG_PATHS=str(source), MISE_YES="1", MISE_AUTO_INSTALL="false",
+               NEXTEST_PROFILE="windows", MBX_CACHE_DIR=str(output / "mbx"))
+    env["A_TEST_POWERSHELL"] = ";".join([shutil.which("pwsh.exe"),
+        str(Path(env["SYSTEMROOT"]) / "System32/WindowsPowerShell/v1.0/powershell.exe")])
+    path = source / "crates/engine/src/tests.rs"
+    text = path.read_text()
+    begin = text.index("fn inherited_task_cannot_reset_an_exhausted_depth_budget()")
+    end = text.index("\n#[test]", begin)
+    body = text[begin:end]
+    assert body.count("    settle(&daemon);\n") == 1
+    path.write_text(text[:begin] + body.replace("    settle(&daemon);\n", DEPTH_TRACE) + text[end:])
+    (output / "depth-trace-branch.patch").write_bytes(subprocess.check_output(
+        ["git", "diff", "--", "crates/engine/src/tests.rs"], cwd=source))
+    identity = dict(revision=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip(),
+                    cpu_count=os.cpu_count(), machine=platform.machine(), platform=platform.platform(),
+                    build="ci wrapped clippy, build, full workspace nextest; native nextest 0.9.148")
+    (output / "engine-ci-source.json").write_text(json.dumps(identity, indent=2))
+    for command in [
+        ["cargo", "clippy", "--workspace", "--all-targets", "--features", "a/lua", "--", "-D", "warnings"],
+        ["cargo", "build", "-p", "a"],
+    ]:
+        subprocess.run(["mise", "exec", "--", *command], cwd=source, env=env, check=True)
+    failed = False
+    for round in range(5):
+        result = subprocess.run(["mise", "exec", "--", "cargo", "nextest", "run", "--workspace",
+            "--features", "a/lua", "--no-tests=fail", "--no-fail-fast", "--retries", "0",
+            "--success-output", "final"], cwd=source, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        log = output / f"engine-branch-{round:02}.txt"
+        log.write_bytes(result.stdout)
+        row = dict(round=round, label="branch", returncode=result.returncode, log=log.name)
+        with (output / "engine-trials.jsonl").open("a") as stream:
+            stream.write(json.dumps(row) + "\n")
+        print(json.dumps(row), flush=True)
+        print(result.stdout.decode("utf-8", errors="replace")[-5000:], flush=True)
+        if result.returncode not in (0, 100) or b"tests run:" not in result.stdout:
+            raise SystemExit(result.returncode or 1)
+        failed |= result.returncode != 0
+        if re.search(rb"depth-trace first-window elapsed=\S+ result=false", result.stdout):
+            break
+    identity["working_tree"] = subprocess.check_output(["git", "status", "--short"], cwd=source, text=True)
+    (output / "engine-ci-source.json").write_text(json.dumps(identity, indent=2))
+    if failed:
+        raise SystemExit(100)
+
+
 def main():
     sys.stdout.reconfigure(encoding="utf-8")
     # The workload only talks to fixture daemons and loopback diagnostics.
@@ -1185,6 +1234,7 @@ def main():
     parser.add_argument("--census", action="store_true", help="instrumented native allocator cohort; excluded from timing claims")
     parser.add_argument("--overlap", choices=["reopen", "turn"], help="fixture call-entry overlap, paired native release versus no-op")
     parser.add_argument("--engine-suites", action="store_true")
+    parser.add_argument("--engine-ci-suites", action="store_true")
     parser.add_argument("--prepare-engine", action="store_true")
     parser.add_argument("--suite-trial", type=int)
     parser.add_argument("--suite-scope", choices=["engine", "workspace"], default="engine")
@@ -1222,6 +1272,9 @@ def main():
         parser.error("select a fresh output directory; existing samples must not be mixed")
     output.mkdir(parents=True, exist_ok=True)
     os.environ["A_HOME"] = str(output / "test-home")
+    if args.engine_ci_suites:
+        engine_ci_suites(source, target, output)
+        return
     if args.engine_suites:
         engine_suites(source, args.reference_source.resolve() if args.reference_source else None,
                       target, output, args.rounds, args.prepare_engine, args.suite_trial, args.suite_scope, args.depth_trace, args.suite_threads, args.depth_load)
