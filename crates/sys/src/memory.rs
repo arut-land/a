@@ -1,242 +1,27 @@
 //! Process allocator policy for the small daemon and its clients.
 
-/// Authority for a queued release. Loading a session abandons work not yet started.
+/// Owns optional maintenance work. No target currently meets the measured latency bound.
 #[derive(Debug, Default)]
-pub struct ReleaseLease(idle::Lease);
+pub struct ReleaseLease(Option<PendingRelease>);
 
-/// A release that can start only while its idle generation still exists.
+/// No measured native policy can currently issue release authority.
 #[derive(Debug)]
-pub struct PendingRelease(idle::Pending);
+pub struct PendingRelease(std::convert::Infallible);
 
 impl ReleaseLease {
     /// Whether this target has a measured policy, so owners can omit scheduling entirely.
-    pub const ENABLED: bool = idle::ENABLED;
+    pub const ENABLED: bool = false;
 
-    /// Replaces the previous idle generation on platforms with a measured benefit.
+    /// Takes the current generation, if this target can issue one.
     pub fn pending(&mut self) -> Option<PendingRelease> {
-        self.0.pending().map(PendingRelease)
+        self.0.take()
     }
 }
 
 impl PendingRelease {
-    /// Returns whether maintenance was attempted. A started call cannot be interrupted.
+    /// Runs an authorized release; disabled policies cannot construct this value.
     pub fn run(self) -> bool {
-        idle::run(&self.0)
-    }
-}
-
-#[cfg(any(
-    all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"),
-    all(target_os = "macos", target_arch = "x86_64")
-))]
-mod idle {
-    #[cfg(target_os = "linux")]
-    use std::marker::PhantomData;
-    #[cfg(target_os = "linux")]
-    use std::rc::Rc;
-    use std::sync::{Arc, Weak};
-
-    // The one-session controls retained at most 3.49 MiB; waves retained over
-    // 8 MiB. Round the control ceiling up, not the workload minimum down.
-    #[cfg(target_os = "linux")]
-    const MIN_RETAINED: usize = 4 << 20;
-
-    pub const ENABLED: bool = true;
-
-    #[derive(Debug, Default)]
-    pub struct Lease(Option<Arc<()>>);
-
-    #[derive(Debug)]
-    pub struct Pending(Weak<()>);
-
-    impl Lease {
-        pub fn pending(&mut self) -> Option<Pending> {
-            self.0 = Some(Arc::new(()));
-            self.0.as_ref().map(|lease| Pending(Arc::downgrade(lease)))
-        }
-    }
-
-    pub fn run(pending: &Pending) -> bool {
-        if pending.0.upgrade().is_none() {
-            return false;
-        }
-        #[cfg(target_os = "linux")]
-        let Some(_priority) = Batch::new() else {
-            return false;
-        };
-        #[cfg(target_os = "macos")]
-        let _priority = crate::resources::Priority::utility();
-        // SAFETY: the snapshot retains no pointers and takes allocator locks itself.
-        #[cfg(target_os = "linux")]
-        if unsafe { libc::mallinfo2() }.fordblks < MIN_RETAINED {
-            return false;
-        }
-        if pending.0.upgrade().is_none() {
-            return false;
-        }
-        #[cfg(target_os = "linux")]
-        {
-            // Keep the main arena warm for replay; interior pages still return.
-            // SAFETY: pad retains capacity without invalidating any live allocation.
-            unsafe { libc::malloc_trim(usize::MAX) };
-        }
-        #[cfg(target_os = "macos")]
-        super::release();
-        true
-    }
-
-    #[cfg(target_os = "linux")]
-    struct Batch {
-        restore: Option<libc::c_int>,
-        _thread: PhantomData<Rc<()>>,
-    }
-
-    #[cfg(target_os = "linux")]
-    impl Batch {
-        fn new() -> Option<Self> {
-            // SAFETY: zero selects the current worker thread.
-            let previous = unsafe { libc::sched_getscheduler(0) };
-            let restore = match previous {
-                libc::SCHED_BATCH => None,
-                libc::SCHED_OTHER => {
-                    let param = libc::sched_param { sched_priority: 0 };
-                    // SAFETY: BATCH requires priority zero; param lives through the call.
-                    if unsafe { libc::sched_setscheduler(0, libc::SCHED_BATCH, &raw const param) }
-                        != 0
-                    {
-                        return None;
-                    }
-                    Some(previous)
-                }
-                _ => return None,
-            };
-            Some(Self {
-                restore,
-                _thread: PhantomData,
-            })
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    impl Drop for Batch {
-        fn drop(&mut self) {
-            if let Some(previous) = self.restore {
-                let param = libc::sched_param { sched_priority: 0 };
-                // SAFETY: restore this thread's original OTHER policy and priority.
-                unsafe { libc::sched_setscheduler(0, previous, &raw const param) };
-            }
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn dropping_the_lease_abandons_queued_allocator_work() {
-            let mut lease = Lease::default();
-            let pending = lease.pending().unwrap();
-            let (send, receive) = std::sync::mpsc::channel();
-            let worker = std::thread::spawn(move || {
-                receive.recv().unwrap();
-                run(&pending)
-            });
-            drop(lease);
-            send.send(()).unwrap();
-            assert!(!worker.join().unwrap());
-        }
-
-        #[test]
-        fn a_new_release_abandons_the_previous_generation() {
-            let mut lease = Lease::default();
-            let previous = lease.pending().unwrap();
-            let _next = lease.pending();
-            assert!(!run(&previous));
-        }
-
-        #[test]
-        #[cfg_attr(miri, ignore)]
-        #[cfg(target_os = "linux")]
-        fn only_retired_capacity_above_the_measured_floor_is_released() {
-            if std::env::var_os("A_RELEASE_TEST_CHILD").is_none() {
-                let output = std::process::Command::new(std::env::current_exe().unwrap())
-                    .args(["--exact", "memory::idle::tests::only_retired_capacity_above_the_measured_floor_is_released", "--nocapture", "--test-threads=1"])
-                    .env("A_RELEASE_TEST_CHILD", "1")
-                    .output().unwrap();
-                assert!(
-                    output.status.success(),
-                    "{}{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                return;
-            }
-            let mut lease = Lease::default();
-            // SAFETY: the allocator owns the snapshot; no pointers escape.
-            assert!(unsafe { libc::mallinfo2() }.fordblks < MIN_RETAINED);
-            assert!(!run(&lease.pending().unwrap()));
-            let mut buffers = Vec::with_capacity(256);
-            let mut anchors = Vec::with_capacity(256);
-            for _ in 0..256 {
-                buffers.push(vec![17_u8; 96 << 10]);
-                anchors.push(vec![29_u8; 8 << 10]);
-            }
-            std::hint::black_box(&buffers);
-            drop(buffers);
-            // SAFETY: as above; live anchors keep the retired chunks below the top.
-            assert!(unsafe { libc::mallinfo2() }.fordblks >= MIN_RETAINED);
-            let before = crate::process_memory::charged_bytes(std::process::id()).unwrap();
-            assert!(run(&lease.pending().unwrap()));
-            let after = crate::process_memory::charged_bytes(std::process::id()).unwrap();
-            assert!(
-                after < before,
-                "retired pages remain charged: {before} -> {after}"
-            );
-            assert!(anchors.iter().flatten().all(|byte| *byte == 29));
-        }
-
-        #[test]
-        #[cfg_attr(miri, ignore)]
-        #[cfg(target_os = "linux")]
-        fn allocator_maintenance_restores_the_workers_scheduling_policy() {
-            std::thread::spawn(|| {
-                // SAFETY: zero selects the current test worker.
-                let previous = unsafe { libc::sched_getscheduler(0) };
-                {
-                    let _priority = Batch::new().expect("normal worker can enter batch policy");
-                    // SAFETY: querying the same live thread.
-                    assert_eq!(unsafe { libc::sched_getscheduler(0) }, libc::SCHED_BATCH);
-                }
-                // SAFETY: querying the same live thread after scoped maintenance.
-                assert_eq!(unsafe { libc::sched_getscheduler(0) }, previous);
-            })
-            .join()
-            .unwrap();
-        }
-    }
-}
-
-#[cfg(not(any(
-    all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"),
-    all(target_os = "macos", target_arch = "x86_64")
-)))]
-mod idle {
-    pub const ENABLED: bool = false;
-
-    #[derive(Debug, Default)]
-    pub struct Lease(Option<Pending>);
-
-    #[derive(Debug)]
-    pub struct Pending(std::convert::Infallible);
-
-    impl Lease {
-        pub fn pending(&mut self) -> Option<Pending> {
-            self.0.take()
-        }
-    }
-
-    pub fn run(pending: &Pending) -> bool {
-        match pending.0 {}
+        match self.0 {}
     }
 }
 

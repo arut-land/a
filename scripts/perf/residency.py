@@ -64,6 +64,8 @@ OVERLAP_HOOK = r'''
 def instrument_overlap(source, output):
     path = source / "crates/sys/src/memory.rs"
     text = path.read_text()
+    if "pub fn run(pending: &Pending)" not in text:
+        raise ValueError("overlap requires a source revision with a native release policy; use the measured experiment revision")
     begin = text.index('        #[cfg(target_os = "linux")]\n        {\n            // Keep the main arena')
     end = text.index('        true\n', begin)
     release = text[begin:end]

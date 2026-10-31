@@ -1,4 +1,100 @@
-# Native allocator release at hibernation
+# Native allocator release: phase 2 decisions
+
+Automatic allocator release is disabled on every target. GNU x64 exceeded the
+declared 3 ms turn-latency ceiling; Intel macOS exceeded the reopen ceiling.
+The other targets remain disabled from phase 1.
+
+Independent review found foreground CPU-pool contention and an unmeasured native
+call overlap window. Maintenance now has its own on-demand worker through rt,
+which exits with the job. The regression holds it blocked while a single-worker
+CPU job completes; routing it through the old shared pool fails that assertion.
+
+The enabled native backends were removed. Release authority is uninhabited and
+the compile-time policy omits engine scheduling entirely. The independent
+execution seam and regression remain. The measured experiments used GNU batch
+scheduling or Intel utility QoS.
+
+| Target | Final decision | Reason |
+| --- | --- | --- |
+| GNU Linux x64 | Disable | Turn latency exceeds the declared 3 ms ceiling |
+| Intel macOS | Disable | Reopen latency exceeds the declared 3 ms ceiling |
+| GNU Linux ARM64 | Disable | Phase-1 turn/reopen criteria failed |
+| Windows x64 / ARM64 | Disable | Phase-1 charged-memory/latency criteria failed |
+| Hosted Apple Silicon and local M3 | Disable | Phase-1 charged-memory consistency failed |
+| Other targets, including musl | Disable | No qualifying native evidence |
+
+## Forced native-call overlap
+
+The 3 ms ceiling was declared before inspecting results. Each action has five
+alternating no-release/native-release pairs on one native hosted runner. All numbers
+below are milliseconds, median [min, max]; worst added is the maximum paired change.
+Full CI does not supply these measurements.
+
+| Target / action | No release | Native release | Paired added | Worst added | Native call | Write starts inside call |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| gnu-x64 / reopen | 31.581 [31.188, 31.909] | 32.152 [32.073, 33.461] | 0.886 [0.244, 1.869] | 1.869 | 0.404 [0.302, 0.456] | 5/5 |
+| gnu-x64 / turn | 33.007 [32.680, 34.859] | 35.878 [34.293, 36.426] | 1.285 [1.248, 3.539] | 3.539 | 0.409 [0.263, 0.480] | 4/5 |
+| intel-macos / reopen | 44.632 [42.794, 49.239] | 48.070 [47.110, 57.135] | 4.582 [-2.129, 12.502] | 12.502 | 1.460 [0.987, 1.578] | 5/5 |
+| intel-macos / turn | 56.809 [44.450, 86.133] | 50.272 [48.168, 67.961] | -7.709 [-35.860, 19.472] | 19.472 | 1.695 [1.274, 1.993] | 5/5 |
+
+Source and harness: c4e9ce57c2547682d60f535132cda502e0ec51e5. Each cohort deliberately
+uses one identical fixture executable for both commands; this is a controlled
+native-call/no-op comparison, not two production builds. The exact generated
+instrumentation patch and binary identities accompany every cohort. Earlier automatic
+relief is suppressed equally in both arms to retain the largest heap from two normal 32
+stored / 8 active waves, four 64 KiB echo turns per active session. No synthetic
+allocator balloon is added.
+
+Only the maintenance worker is held after the real policy gate and final lease check. A
+one-byte call-entry marker wakes the prepared probe immediately before the native API.
+Native duration uses Instant around the actual call, excluding the socket wake and held
+interval. Unix timestamps bracket the call and the real Attach/Input write; strict entry
+counts require the write to begin inside the native-call interval. All five GNU turn
+request intervals intersected the call; one write began 0.238 microseconds before entry.
+Even the strictly after-entry subset reached +3.198 ms, so the negative decision does
+not rely on that early write. Connection and durable-log preparation finish before the
+marker. The 64 KiB turn frame is also encoded beforehand with the real protocol codec;
+the small Attach message keeps its normal encoding path. Reopen latency includes replay;
+turn latency includes a real completed echo reply. The turn cohort prepares its attached
+session while the uncancellable boundary is held, forcing the already-started side of
+the race without adding any pause inside the allocator API.
+
+Overlap cohorts omit idle-worker retirement waits so the request races the freshly
+retired heap while foreground workers are warm. The original steady-idle residency
+cohorts retain their waits. These are empirical maxima from five pairs, not universal
+tail bounds or an estimate of overlap probability. Request-dispatch overlap does not
+prove which individual allocator mutex was contended. No allocation-domain isolation
+redesign or speculative hardening was added.
+
+| Cohort | Diagnostic perf run |
+| --- | --- |
+| gnu-x64 / reopen | [41182262839](https://github.com/arut-land/a/actions/runs/41182262839) |
+| gnu-x64 / turn | [41182263786](https://github.com/arut-land/a/actions/runs/41182263786) |
+| intel-macos / reopen | [41182264951](https://github.com/arut-land/a/actions/runs/41182264951) |
+| intel-macos / turn | [41182266559](https://github.com/arut-land/a/actions/runs/41182266559) |
+
+The first 32:4 probes were cancelled when the default workload maximum was confirmed as
+32:8. The first 32:8 attempt stopped after a control sample because the summary expected
+charge counters in a timing-only record; that bug was fixed and replayed against its
+captured record before collecting these complete cohorts. Partial/superseded cohorts are
+excluded. Full source identities, run IDs, raw timestamps, analysis, failed diagnostics
+and check logs are retained in scratchpad/r/native-release.
+
+## Verification and completion
+
+Local macOS nextest for sys, rt and engine: 711 passed, 18 skipped after disabling the
+backends and removing the now-vacuous queued-release engine test. Native clippy, Rust
+documentation, formatting and the workspace Windows lint passed. The public rt
+integration suite also passed after relocating the regression. The CI identity and final
+target cleanup are recorded in the phase-2 report.
+
+## Phase-1 evidence (historical)
+
+The following measurements and provisional decisions predate the independent review. The
+phase-2 table above supersedes their enablement decisions and CPU-pool scheduling
+description.
+
+### Native allocator release at hibernation
 
 Keep release on **GNU Linux x64 and Intel macOS**. Disable it on GNU Linux
 ARM64, Windows x64/ARM64 and Apple Silicon. Every decision uses native evidence;
@@ -15,7 +111,7 @@ no full CI was dispatched in phase 1.
 | Local M3 | Disable | Inconsistent charge; active relief raises reopen and turn medians |
 | Other targets, including musl | Disable | No qualifying native evidence |
 
-## Implementation
+### Implementation
 
 The actor and mailbox leave their existing aggregate scope first. Its completion
 reference and retirement guard form a second aggregate: Rust destroys the session
@@ -37,7 +133,8 @@ The five-round quiet one-session controls stayed below 3.49 MiB; active post-wav
 cases exceeded 8 MiB. These are allocator capacity counters, not physical charge.
 Batch scheduling is scoped to the current worker and restored before reuse.
 The selected GNU x64 policy retains the main arena's top but still releases
-free interior pages across arenas. The public API cannot select a retired session's arena or
+free interior pages across arenas. The public API cannot select a retired session's
+arena or
 trim only the top; pad does not limit interior-page discard.
 
 Intel macOS uses its native whole-process pressure-relief API at utility QoS.
@@ -46,7 +143,7 @@ reservation statistics overlap between the control and active cases, so there
 is no invented reservation threshold. Without a useful counter predictor,
 whole-process enablement requires the control and active cases both to pay.
 
-## Method and decision rule
+### Method and decision rule
 
 Each release build uses the shipped recipe: size optimization, fat LTO, one
 codegen unit and rebuilt std. Every Cargo command goes through mise with two
@@ -72,7 +169,7 @@ must not increase paired median reopen latency. Intel's ungated policy must
 also consistently reduce control-case charge. All spreads remain visible;
 five rounds cannot establish a universal zero-latency-cost theorem.
 
-## Selected uninstrumented policies
+### Selected uninstrumented policies
 
 Charge rows use KiB; latency and CPU rows use milliseconds. Each row has five
 paired rounds. The worst session's four-turn batch is not a single model turn.
@@ -102,7 +199,7 @@ unchanged from c50ce7fb: paired reopen -0.600 [-2.496, 4.686] ms, charge +23
 closed-gate population. Intel uses source c50ce7fb; later GNU-only changes do
 not change its production path.
 
-## Separate selected allocator census
+### Separate selected allocator census
 
 These instrumented results establish allocator/charge behavior, not latency.
 Allocated/free capacity is not a partition of physical charge. In particular,
@@ -124,7 +221,7 @@ Apple reservation statistics must not be subtracted from process footprint.
 | intel-macos / whole process / 32:4 / wave2_allocated_kib | 560.359 [546.266, 568.516] | 560.516 [551.891, 570.266] | 4.156 [-16.625, 14.250] |
 | intel-macos / whole process / 32:4 / wave2_free_kib | 37359.641 [37315.891, 37389.734] | 37352.109 [37323.484, 37365.734] | -13.906 [-62.250, 49.844] |
 
-## Rejected targets and variants
+### Rejected targets and variants
 
 These complete uninstrumented candidate cohorts fail the stated criteria.
 
@@ -174,7 +271,7 @@ Its mixed spreads do not establish a consistent latency regression or any
 reclamation benefit. Its binary does not import malloc_zone_pressure_relief;
 no charged-memory saving is credited to a backend that cannot schedule relief.
 
-## Native API constraints
+### Native API constraints
 
 [glibc source](https://github.com/bminor/glibc/blob/release/2.39/master/malloc/malloc.c)
 shows that trim walks every arena under its allocator mutex and discards free
@@ -182,7 +279,8 @@ interior pages. Pad applies only to the main arena top. It does not select the
 retired session's arena or create a top-only trim. Mallinfo2 also traverses bins
 under locks. No private arena traversal or allocator tunable was introduced.
 
-[Apple's allocator](https://github.com/apple-oss-distributions/libmalloc/blob/main/src/malloc.c)
+[Apple's
+allocator](https://github.com/apple-oss-distributions/libmalloc/blob/main/src/malloc.c)
 supports one-zone or whole-process relief. Default-zone relief did not recover
 the whole-process Intel gain. Reservation/free-capacity ranges overlap between
 control and active cases, so no capacity threshold was invented. Both measured
@@ -196,7 +294,7 @@ failed the Windows benefit/latency conditions.
 is primarily a debugging facility; ordinary frees already coalesce blocks.
 No global decommit thresholds, working-set trick or allocator tunable was added.
 
-## Source and workflow identities
+### Source and workflow identities
 
 Reference source: 5610d9e021bbf83044a80974c7f6eac147fa2564. All accepted paired
 executables have distinct hashes. Source revisions, native identities,
@@ -219,7 +317,7 @@ not change release flags or measured production paths.
 | Selected x64 timing/census | 10209ee2 / 5610d9e | [timing 41161615499](https://github.com/arut-land/a/actions/runs/41161615499), [census 41161617261](https://github.com/arut-land/a/actions/runs/41161617261) |
 | Retained-top ARM64 timing/census | 10209ee2 / 5610d9e | [timing 41161618522](https://github.com/arut-land/a/actions/runs/41161618522), [census 41161619822](https://github.com/arut-land/a/actions/runs/41161619822) |
 
-## Local verification
+### Local verification
 
 Final local M3 sys/engine nextest: 631 passed, 17 skipped. Native clippy,
 formatting and the workspace Windows lint passed after disabling ARM64 release;
@@ -230,7 +328,7 @@ Intel native run passed 633 sys/engine tests, 17 skipped, clippy and two probe
 tests. Earlier full-trim GNU runs also passed 639 tests on each architecture.
 No full CI was dispatched.
 
-## Limits and owner-pending work
+### Limits and owner-pending work
 
 The engine never joins or awaits a release, and the pending generation is
 abandoned on load. A native allocator call that has already started cannot be
@@ -254,7 +352,7 @@ Linux/Windows success, and target cleanup belong to the separately authorized
 phase 2. The assigned target is retained. No files outside ownership, user ~/.a,
 .env.local, recorded fixtures or golden outputs were changed.
 
-## Excluded diagnostics
+### Excluded diagnostics
 
 The first local baseline attempt raced source editing and failed; it produced
 no accepted sample. The rebuilt baseline and staged identities replace it.
