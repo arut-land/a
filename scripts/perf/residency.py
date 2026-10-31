@@ -1047,7 +1047,7 @@ DEPTH_TRACE = r'''
 
 
 
-def engine_suites(source, reference, target, output, rounds, prepare, trial, scope, trace, threads, load):
+def engine_suites(source, reference, target, output, rounds, prepare, trial, scope, trace, threads, load, one_core):
     env = environment(target)
     env["NEXTEST_PROFILE"] = "windows"
     env["A_TEST_POWERSHELL"] = ";".join([shutil.which("pwsh.exe"),
@@ -1060,6 +1060,24 @@ def engine_suites(source, reference, target, output, rounds, prepare, trial, sco
             assert identities[label]["revision"] == subprocess.check_output(
                 ["git", "rev-parse", "HEAD"], cwd=checkout, text=True).strip()
             continue
+        if one_core:
+            path = checkout / "crates/engine/src/tests.rs"
+            text = path.read_text()
+            begin = text.index("fn inherited_task_cannot_reset_an_exhausted_depth_budget()")
+            end = text.index("\n#[test]", begin)
+            body = text[begin:end]
+            constructor = '    let daemon = Daemon::load(&home, &echo()).unwrap();'
+            assert body.count(constructor) == 1
+            body = body.replace(constructor,
+                '    let runtime = std::sync::Arc::new(rt::Threads::configured(rt::Config::for_cores(1)));\n'
+                '    let mut daemon = Daemon::load_on(&home, &echo(), &runtime, Vec::new()).unwrap();\n'
+                '    daemon.1 = Some(runtime);')
+            text = text[:begin] + body + text[end:]
+            marker = '        assert!(held, "never {what}");'
+            assert text.count(marker) == 1
+            path.write_text(text.replace(marker, SETTLE_FAILURE_TRACE + marker))
+            (output / f"one-core-{label}.patch").write_bytes(subprocess.check_output(
+                ["git", "diff", "--", "crates/engine/src/tests.rs"], cwd=checkout))
         if trace:
             path = checkout / "crates/engine/src/tests.rs"
             text = path.read_text()
@@ -1096,9 +1114,9 @@ def engine_suites(source, reference, target, output, rounds, prepare, trial, sco
             command = ["cargo", "nextest", "run", "--archive-file", identities[label]["archive"],
                        "--workspace-remap", str(checkout), "--extract-to", str(target / "engine-run"),
                        "--extract-overwrite", "--no-fail-fast", "--retries", "0", "--no-tests=fail",
-                       *(["--success-output", "final"] if trace else []),
+                       *(["--success-output", "final"] if trace or one_core else []),
                        *(["--test-threads", str(threads)] if threads else []),
-                       *(["-E", "test(=tests::inherited_task_cannot_reset_an_exhausted_depth_budget)"] if load else [])]
+                       *(["-E", "test(=tests::inherited_task_cannot_reset_an_exhausted_depth_budget)"] if load or one_core else [])]
             pressure = []
             if load:
                 listing = cargo_run(["cargo", "nextest", "list", "-p", "engine", "--message-format", "json"],
@@ -1279,6 +1297,7 @@ def main():
     parser.add_argument("--depth-trace", action="store_true")
     parser.add_argument("--suite-threads", type=int)
     parser.add_argument("--depth-load", type=int, default=0)
+    parser.add_argument("--depth-one-core", action="store_true")
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--stored", default="1,8,32")
     parser.add_argument("--active", default="1,4,8")
@@ -1315,7 +1334,7 @@ def main():
         return
     if args.engine_suites:
         engine_suites(source, args.reference_source.resolve() if args.reference_source else None,
-                      target, output, args.rounds, args.prepare_engine, args.suite_trial, args.suite_scope, args.depth_trace, args.suite_threads, args.depth_load)
+                      target, output, args.rounds, args.prepare_engine, args.suite_trial, args.suite_scope, args.depth_trace, args.suite_threads, args.depth_load, args.depth_one_core)
         return
     if args.overlap:
         if args.census or args.reference_source or args.reference_binary or args.binary:
