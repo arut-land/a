@@ -335,11 +335,14 @@ The first completed local n=10 run confirms a deep CPU problem: main
 paired deltas are positive (median +6.11 ms). The original local observations are in `cpu-local-final`.
 Initial hosted cohorts are excluded: the raw identity audit found identical
 before/after executable hashes in the fixed Linux cohort, despite different
-checkout revisions. Those jobs copied the common target executable instead of
-staging Cargo's reported artifact. No hosted timing from that staging method is
+checkout revisions. Cargo reused the first checkout's release artifacts
+when the second checkout shared its target directory; a guarded retry confirmed
+main format 1 where candidate format 2 was expected, after a 0.70-second fresh
+build. Neither the common target name nor the reported artifact alone was a
+source-identity check. No hosted timing from that staging method is
 accepted. Their raw records and logs remain as invalid diagnostics. The revised
-hosted build stages the reported artifact, bypasses command-wrapper ambiguity,
-and requires distinct hashes plus each source revision's expected on-disk log
+hosted build clears the one target's release artifacts between source variants,
+stages the reported artifact, bypasses command-wrapper ambiguity, and requires distinct hashes plus each source revision's expected on-disk log
 format before timing. Local format probes independently confirm main format 1
 and candidate format 2; the final local release rebuild is byte-for-byte
 identical to its measured binary. Results remain per native host, never pooled.

@@ -182,7 +182,9 @@ jobs:
           for source, arm in [('baseline', 'before'), ('candidate', 'after')]:
               root = pathlib.Path(source).resolve()
               with (output / (arm + '-build.log')).open('w') as log:
-                  command = ['mise', 'exec', '--', sys.executable, '-c', 'import os,sys;os.execv(sys.argv[1],sys.argv[1:])', cargo, 'build-release', '-p', 'a', '--features', 'fixtures', '--message-format=json']
+                  launch = ['mise', 'exec', '--', sys.executable, '-c', 'import os,sys;os.environ.update(CARGO=sys.argv[1],RUSTC=sys.argv[2],RUSTDOC=sys.argv[3],CARGO_TARGET_DIR=sys.argv[4],CARGO_BUILD_JOBS="2",RUSTC_WRAPPER="",RUSTC_WORKSPACE_WRAPPER="");[os.environ.pop(k) for k in list(os.environ) if k.startswith("MBX_")];os.execv(sys.argv[1],[sys.argv[1],*sys.argv[5:]])', cargo, env['RUSTC'], env['RUSTDOC'], env['CARGO_TARGET_DIR']]
+                  subprocess.run([*launch, 'clean', '--release'], cwd=root, env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
+                  command = [*launch, 'build-release', '-p', 'a', '--features', 'fixtures', '--message-format=json']
                   result = subprocess.run(command, cwd=root, env=env, stdout=subprocess.PIPE, stderr=log, text=True)
                   (output / (arm + '-cargo-artifacts.jsonl')).write_text(result.stdout)
                   result.check_returncode()
