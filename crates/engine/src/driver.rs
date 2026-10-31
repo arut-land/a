@@ -1524,8 +1524,6 @@ impl Actor {
     }
 
     async fn run(self, mail: channel::Receiver<Msg>, first: StepPlan) {
-        // Session teardown precedes scheduling, including its completion reference.
-        let _retirement;
         let (ended, session) = {
             let mut running = (self, mail);
             let (actor, mail) = &mut running;
@@ -1533,11 +1531,13 @@ impl Actor {
         };
         ended.set();
         session.changed.notify();
-        _retirement = session
+        let retirement = session
             .shared
             .daemon
             .upgrade()
             .map(|daemon| daemon.ended(session.id));
+        // Tuple fields drop in order: release the completion reference before scheduling.
+        let _retired = (session, retirement);
     }
 
     #[allow(clippy::too_many_lines)]

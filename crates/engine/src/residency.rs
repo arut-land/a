@@ -158,7 +158,7 @@ impl Sessions {
         if !self.loaded.is_empty() || !self.pending.is_empty() {
             return None;
         }
-        Some(self.release.pending())
+        self.release.pending()
     }
 
     pub fn changed(&mut self, id: SessionId) {

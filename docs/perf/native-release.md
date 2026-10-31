@@ -53,15 +53,40 @@ counters to investigate refault costs separately from release scheduling.
 
 ## Decision rule
 
-Before completing the cohorts: require lower post-wave charge in every paired
-round, no increase in paired median reopen or turn latency, and zero observed
+For the active 32:4 case: require lower charge after each wave in every paired
+round, no increase in paired median reopen or turn-batch latency, and zero observed
 quiet idle CPU in every uninstrumented candidate sample. Report all paired
 spreads even when their medians pass; five rounds cannot prove a universal
 zero-cost claim. A platform also needs a measured allocator-counter gate and
 verification of the final gated implementation before production enablement.
+The gated GNU control should skip reclamation; report its latency and charge
+spreads and require no paired median reopen increase or observed idle CPU.
 
 A second diagnostic retains the main arena's entire top with
 `malloc_trim(usize::MAX)` and compares directly with the first candidate on
 Linux x64. This isolates pad semantics without changing allocator tunables;
 interior-bin scanning and page discard remain. It does not claim a top-only
 trim mechanism exists.
+
+The pad-only diagnostic did not justify keeping the top: relative to the
+corrected full-trim build, charge increased by 2036 [1526, 2626] KiB and
+reopen latency changed by +0.530 [-0.819, 2.057] ms. The next GNU candidate
+uses full trim with a 4 MiB `mallinfo2().fordblks` floor, derived by rounding
+up the five-round control ceiling (below 3.49 MiB). Both GNU architectures
+still require a final paired verification of that combination. The batch
+scheduler policy is scoped to the maintenance worker and restored before reuse.
+
+The final scheduling owner is an aggregate of the completion reference and
+its retirement guard, constructed after the actor's last await. Tuple field
+destruction releases the reference before the guard submits work. The guard
+is never constructed by the reopen transition. A disabled backend's pending
+type contains `Infallible`; its lease is zero-sized, and its compile-time
+policy constant prevents even taking an extra scheduling lock.
+
+Intel macOS gets one further controlled whole-process relief experiment,
+because default-zone relief did not reproduce the earlier whole-process gain.
+No capacity threshold is guessed for Apple's reservation statistics. Without
+a calibrated predictor, enablement requires consistent benefit in both the
+one-session control and active-wave cohorts, with no paired median latency
+increase. Apple Silicon and Windows remain disabled unless their measured
+criteria are met; the completed corrected timing cohorts currently fail them.

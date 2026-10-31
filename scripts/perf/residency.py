@@ -949,8 +949,12 @@ def main():
     if (output / "residency.jsonl").exists() or (output / "residency-failures.jsonl").exists():
         parser.error("select a fresh output directory; existing samples must not be mixed")
     output.mkdir(parents=True, exist_ok=True)
+    os.environ["A_HOME"] = str(output / "test-home")
     if args.census:
-        cargo_run(["cargo", "nextest", "run", "-p", "sys", "--features", "fixtures"],
+        cargo_run(["cargo", "nextest", "run", "-p", "sys", "-p", "engine", "--features", "sys/fixtures"],
+                  cwd=source, env=environment(target), check=True)
+        cargo_run(["cargo", "clippy", "-p", "sys", "-p", "engine", "--all-targets",
+                   "--features", "sys/fixtures", "--", "-D", "warnings"],
                   cwd=source, env=environment(target), check=True)
     reference = args.reference_binary.resolve() if args.reference_binary else None
     if args.reference_source:

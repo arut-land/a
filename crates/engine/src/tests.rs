@@ -152,10 +152,10 @@ fn queued_allocator_work_never_delays_reloading_and_loses_its_lease() {
     daemon.wait("last actor hibernated", PATIENCE, || {
         daemon.list()[0].residency == Residency::Hibernated
     });
-    let pending = super::lock(&daemon.slots).release().unwrap();
+    let pending = super::lock(&daemon.slots).release();
     let reopened = daemon.attach_to(&Target::Id(id), || "/w".into()).unwrap();
     assert!(
-        !pending.run(),
+        pending.is_none_or(|pending| !pending.run()),
         "loading must abandon the previous idle generation"
     );
     release.send(()).unwrap();

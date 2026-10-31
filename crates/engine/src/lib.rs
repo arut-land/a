@@ -992,11 +992,13 @@ impl Daemon {
         }
         self.changed(id);
         self.pulse.notify();
-        Retirement(
+        Retirement(if sys::ReleaseLease::ENABLED {
             lock(&self.slots)
                 .release()
-                .map(|pending| (Arc::clone(&self.shared.rt), pending)),
-        )
+                .map(|pending| (Arc::clone(&self.shared.rt), pending))
+        } else {
+            None
+        })
     }
 
     /// Every session as it lists, newest first, from memory: no log is
