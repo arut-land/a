@@ -80,6 +80,71 @@ captured record before collecting these complete cohorts. Partial/superseded coh
 excluded. Full source identities, run IDs, raw timestamps, analysis, failed diagnostics
 and check logs are retained in scratchpad/r/native-release.
 
+## Windows engine test stabilization
+
+Two test fixtures changed; production inheritance, depth accounting and settle
+behavior did not. Neither change increases a timeout or enables retries.
+
+`inherited_task_cannot_reset_an_exhausted_depth_budget` now requests an explicit
+two-edge task allowance through the real SDK. It checks the persisted three-session
+chain, inherited remaining depths `1, 0, 0`, both admitted edges, exactly one refusal
+at zero, and absence of the refused child. The old fixture exercised the default
+eight-edge budget through nine durable sessions under one ten-second deadline.
+Removing inherited-budget intersection as a local mutation makes the new invariant
+fail with four sessions instead of three; that mutation was restored.
+
+The pre-fix branch/main comparison ran ten complete engine suites per source,
+interleaved on one native Windows x64 VM: both passed 4,120 executed tests with no
+failures ([41191868431](https://github.com/arut-land/a/actions/runs/41191868431)).
+Main was `5610d9e021bbf83044a80974c7f6eac147fa2564`; branch was
+`3d9148f8642c101b0523f73dfe5141a5a3ddaffa`. No increased branch failure rate was
+observed; ten trials cannot exclude a rare scheduling effect. Automatic release
+is disabled, so the engine cannot launch its maintenance job.
+
+A controlled native reproducer ran five alternating old/candidate pairs alongside
+32 real copies of the existing 1,001-turn fixture in isolated homes
+([41204103915](https://github.com/arut-land/a/actions/runs/41204103915)). All five
+old attempts failed their original deadline with seven or eight sessions busy;
+the same work subsequently reached idle with all nine sessions, one depth refusal,
+and no interrupt, retry or resubmission. Idle was observed 4.473 [3.242, 5.911]
+seconds after the failed deadline, including read-only inspection overhead. All
+five candidates passed. Four pairs retained all 32 load processes through both
+attempts; in the first candidate attempt only four remained. The four strictly
+sustained pairs independently show four old failures and four candidate passes.
+These are debug-build causal observations, not release latency measurements. The
+particular resource burst on the historical CI VM remains unidentified.
+
+`watchers_are_sent_the_session_list_as_it_changes` now joins its existing supervisor
+before the final manual deduplication checks. Attach/detach observations still use
+the real running supervisor. The first ARM64 campaign passed 34 suites, then failed
+this independent assertion in suite 35
+([41201168898](https://github.com/arut-land/a/actions/runs/41201168898)); the depth
+invariant passed. A local failure-only trace reproduced the watcher failure after
+86 passes: the unexpected frame was a legitimate change from zero to one durable
+entry, not a duplicate. The old test raced an active publisher while asserting an
+unchanged snapshot. Joining that publisher passed 1,000 consecutive focused local
+iterations with zero retries. The owner approved this test-only repair.
+
+| Native runner | Source | Complete engine-suite proof |
+| --- | --- | --- |
+| Windows x64 | `155e11812f690c663fc87e5bc3f2210179461572` | [41201166673](https://github.com/arut-land/a/actions/runs/41201166673): 50 consecutive passes, 20,600 executed tests, 750 skips |
+| Windows ARM64 | `efd50d7d6ab29aa62e28426c2d160fdcaef0d040` | [41207819937](https://github.com/arut-land/a/actions/runs/41207819937): 50 consecutive passes, 20,600 executed tests, 750 skips |
+
+The x64 source predates only the watcher join change. Each campaign uses an
+immutable archive, normal engine-suite concurrency, unchanged deadlines and zero
+retries. A failed suite stops the campaign; failures and incomplete campaigns are
+retained and excluded from the consecutive-pass count. The owner requested the
+fresh ARM64 campaign after approving the watcher patch. Raw logs, archive hashes,
+source identities, failed reproductions and analysis are in the phase-2 report.
+
+The subsequent main merge is `66b07cb8`, bringing main
+`ad00daad96bb79f6d11daf80adc895b958719dd5` (conversation/history and app work).
+The consecutive campaigns above precede that merge; their source identities are
+not relabeled. The merge leaves this lane's allocator, runtime, inheritance and
+depth-budget changes intact. On the integrated tree, 547 engine/client tests passed with 15 skips; engine
+clippy and documentation, formatting and the workspace Windows lint also passed.
+The final full CI identity is in the phase-2 report.
+
 ## Verification and completion
 
 Local macOS nextest for sys, rt and engine: 711 passed, 18 skipped after disabling the
