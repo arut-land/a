@@ -188,8 +188,10 @@ jobs:
       - uses: jdx/mise-action@v5
         with:
           working_directory: measured
-          install_args: ${{ inputs.release_overlap == 'engine-ci-trace' && 'mr-boxington@1.28.0' || 'cargo:cargo-nextest@0.9.150 cargo:cargo-nextest@0.9.148' }}
+          install_args: ${{ inputs.release_overlap == 'engine-ci-trace' && 'mr-boxington' || 'cargo:cargo-nextest@0.9.150 cargo:cargo-nextest@0.9.148' }}
           env: false
+        env:
+          MISE_IGNORED_CONFIG_PATHS: ${{ inputs.release_overlap != 'engine-ci-trace' && github.workspace || '' }}
       - name: CI native nextest
         if: inputs.release_overlap == 'engine-ci-trace'
         shell: pwsh

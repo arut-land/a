@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import platform
 import queue
+import re
 import shutil
 import socket
 import subprocess
