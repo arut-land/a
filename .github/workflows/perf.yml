@@ -112,7 +112,7 @@ jobs:
     if: inputs.residency || inputs.alloc_census || inputs.census_vmmap || inputs.release_overlap
     name: residency (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 120
+    timeout-minutes: ${{ inputs.release_overlap == 'engine-verify' && 360 || 120 }}
     strategy:
       fail-fast: false
       matrix:
@@ -245,6 +245,10 @@ jobs:
           REFERENCE: ${{ inputs.paired_ref }}
         run: |
           $reference = @()
+          if ($env:PERF_RELEASE_OVERLAP -eq 'engine-verify') {
+            python scripts/perf/residency.py --source ../measured --target $env:CARGO_TARGET_DIR --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --prepare-engine
+            exit $LASTEXITCODE
+          }
           if ($env:PERF_RELEASE_OVERLAP -eq 'engine-compare') {
             python scripts/perf/residency.py --source ../measured --reference-source ../reference --target $env:CARGO_TARGET_DIR --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds $env:PERF_PAIRED_ROUNDS
             exit $LASTEXITCODE
@@ -254,6 +258,256 @@ jobs:
           if ($env:PERF_RESIDENCY_CASES) { $reference += @('--cases', $env:PERF_RESIDENCY_CASES) }
           if ($env:PERF_VMMAP) { $reference += @('--vmmap', $env:PERF_VMMAP) }
           python scripts/perf/residency.py --source ../measured --target $env:CARGO_TARGET_DIR --output "$env:RUNNER_TEMP/residency-output" --rounds $env:PERF_PAIRED_ROUNDS @reference
+      - name: Full engine suite 01/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 0
+      - name: Full engine suite 02/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 1
+      - name: Full engine suite 03/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 2
+      - name: Full engine suite 04/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 3
+      - name: Full engine suite 05/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 4
+      - name: Full engine suite 06/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 5
+      - name: Full engine suite 07/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 6
+      - name: Full engine suite 08/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 7
+      - name: Full engine suite 09/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 8
+      - name: Full engine suite 10/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 9
+      - name: Full engine suite 11/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 10
+      - name: Full engine suite 12/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 11
+      - name: Full engine suite 13/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 12
+      - name: Full engine suite 14/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 13
+      - name: Full engine suite 15/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 14
+      - name: Full engine suite 16/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 15
+      - name: Full engine suite 17/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 16
+      - name: Full engine suite 18/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 17
+      - name: Full engine suite 19/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 18
+      - name: Full engine suite 20/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 19
+      - name: Full engine suite 21/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 20
+      - name: Full engine suite 22/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 21
+      - name: Full engine suite 23/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 22
+      - name: Full engine suite 24/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 23
+      - name: Full engine suite 25/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 24
+      - name: Full engine suite 26/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 25
+      - name: Full engine suite 27/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 26
+      - name: Full engine suite 28/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 27
+      - name: Full engine suite 29/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 28
+      - name: Full engine suite 30/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 29
+      - name: Full engine suite 31/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 30
+      - name: Full engine suite 32/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 31
+      - name: Full engine suite 33/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 32
+      - name: Full engine suite 34/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 33
+      - name: Full engine suite 35/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 34
+      - name: Full engine suite 36/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 35
+      - name: Full engine suite 37/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 36
+      - name: Full engine suite 38/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 37
+      - name: Full engine suite 39/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 38
+      - name: Full engine suite 40/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 39
+      - name: Full engine suite 41/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 40
+      - name: Full engine suite 42/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 41
+      - name: Full engine suite 43/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 42
+      - name: Full engine suite 44/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 43
+      - name: Full engine suite 45/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 44
+      - name: Full engine suite 46/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 45
+      - name: Full engine suite 47/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 46
+      - name: Full engine suite 48/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 47
+      - name: Full engine suite 49/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 48
+      - name: Full engine suite 50/50
+        if: inputs.release_overlap == 'engine-verify'
+        shell: pwsh
+        working-directory: harness
+        run: python scripts/perf/residency.py --source ../measured --target "$env:CARGO_TARGET_DIR" --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 50 --suite-trial 49
       - uses: actions/upload-artifact@v5
         if: always()
         with:

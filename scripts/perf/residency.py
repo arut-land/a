@@ -1022,14 +1022,19 @@ def table(summary, comparison=False):
     return "\n".join(lines) + "\n"
 
 
-def engine_suites(source, reference, target, output, rounds):
+def engine_suites(source, reference, target, output, rounds, prepare, trial):
     env = environment(target)
     env["NEXTEST_PROFILE"] = "windows"
     env["A_TEST_POWERSHELL"] = ";".join([shutil.which("pwsh.exe"),
         str(Path(env["SYSTEMROOT"]) / "System32/WindowsPowerShell/v1.0/powershell.exe")])
     sources = {"main": reference, "branch": source} if reference else {"branch": source}
-    identities = {}
+    saved = output / "engine-sources.json"
+    identities = json.loads(saved.read_text()) if saved.exists() else {}
     for label, checkout in sources.items():
+        if label in identities:
+            assert identities[label]["revision"] == subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=checkout, text=True).strip()
+            continue
         archive = output / f"engine-{label}.tar.zst"
         cargo_run(["cargo", "nextest", "archive", "-p", "engine", "--archive-file", str(archive)],
                   nextest_version="0.9.148", cwd=checkout, env=env, check=True)
@@ -1040,8 +1045,15 @@ def engine_suites(source, reference, target, output, rounds):
         if reference and label == "main":
             cargo_run(["cargo", "clean"], cwd=checkout, env=env, check=True)
     (output / "engine-sources.json").write_text(json.dumps(identities, indent=2))
+    if prepare:
+        return
     (target / "engine-run").mkdir(parents=True, exist_ok=True)
-    for round in range(rounds):
+    if trial is not None:
+        assert not reference
+        records = output / "engine-trials.jsonl"
+        previous = [json.loads(line) for line in records.read_text().splitlines()] if records.exists() else []
+        assert len(previous) == trial and all(row["returncode"] == 0 for row in previous)
+    for round in ([trial] if trial is not None else range(rounds)):
         labels = list(sources) if round % 2 == 0 else list(reversed(sources))
         for label in labels:
             checkout = sources[label]
@@ -1065,6 +1077,7 @@ def engine_suites(source, reference, target, output, rounds):
 
 
 def main():
+    sys.stdout.reconfigure(encoding="utf-8")
     # The workload only talks to fixture daemons and loopback diagnostics.
     keep = {
         "HOME", "USER", "LOGNAME", "PATH", "SHELL", "TMPDIR", "TMP", "TEMP",
@@ -1100,6 +1113,8 @@ def main():
     parser.add_argument("--census", action="store_true", help="instrumented native allocator cohort; excluded from timing claims")
     parser.add_argument("--overlap", choices=["reopen", "turn"], help="fixture call-entry overlap, paired native release versus no-op")
     parser.add_argument("--engine-suites", action="store_true")
+    parser.add_argument("--prepare-engine", action="store_true")
+    parser.add_argument("--suite-trial", type=int)
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--stored", default="1,8,32")
     parser.add_argument("--active", default="1,4,8")
@@ -1133,7 +1148,7 @@ def main():
     os.environ["A_HOME"] = str(output / "test-home")
     if args.engine_suites:
         engine_suites(source, args.reference_source.resolve() if args.reference_source else None,
-                      target, output, args.rounds)
+                      target, output, args.rounds, args.prepare_engine, args.suite_trial)
         return
     if args.overlap:
         if args.census or args.reference_source or args.reference_binary or args.binary:
