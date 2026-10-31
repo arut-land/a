@@ -682,6 +682,11 @@ def observe(probe, active, idle_seconds):
                 switches=after["ctx_switches"] - before["ctx_switches"])
 
 
+def page_faults(pid):
+    return {key: value for key, value in snapshot(pid).items()
+            if key in ("minor_faults", "major_faults", "pfaults", "pageins", "num_page_faults")}
+
+
 def sample(binary, probe_binary, output, stored, count, turns, size, idle_seconds, census=False, vmmap=None):
     with daemon(str(binary), output) as active:
         # lifecycle owns startup/teardown; restart applies this benchmark's
@@ -754,8 +759,11 @@ def sample(binary, probe_binary, output, stored, count, turns, size, idle_second
                 time.sleep(12)
                 stages[f"wave{wave}_hibernated"] = dict(observe(probe, active, idle_seconds), acknowledgement=ack)
             stages["wave2_hibernated"]["maps"] = memory_maps(active.pid)
+            before = page_faults(active.pid)
             reopened = [probe.call("attach", id=id) for id in ids[:max(1, count)]]
-            stages["reopen"] = dict(observe(probe, active, idle_seconds), attach=reopened)
+            after = page_faults(active.pid)
+            stages["reopen"] = dict(observe(probe, active, idle_seconds), attach=reopened,
+                                    page_faults={key: after[key] - value for key, value in before.items()})
             probe.call("detach")
             hibernate(probe, stored)
             return stages

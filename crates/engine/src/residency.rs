@@ -38,6 +38,7 @@ pub(super) struct Sessions {
     busy: usize,
     jobs: usize,
     after: Duration,
+    release: sys::ReleaseLease,
 }
 
 impl Default for Sessions {
@@ -66,6 +67,7 @@ impl Sessions {
             busy: 0,
             jobs: 0,
             after,
+            release: sys::ReleaseLease::default(),
         }
     }
 
@@ -111,6 +113,7 @@ impl Sessions {
     }
 
     pub fn loading(&mut self, id: SessionId) {
+        self.release = sys::ReleaseLease::default();
         self.pending.insert(id);
         self.changed(id);
     }
@@ -149,6 +152,13 @@ impl Sessions {
     pub fn ended(&mut self, id: SessionId) {
         self.leave(id);
         self.pending.remove(&id);
+    }
+
+    pub fn release(&mut self) -> Option<sys::PendingRelease> {
+        if !self.loaded.is_empty() || !self.pending.is_empty() {
+            return None;
+        }
+        Some(self.release.pending())
     }
 
     pub fn changed(&mut self, id: SessionId) {

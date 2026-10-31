@@ -1,5 +1,74 @@
 //! Process allocator policy for the small daemon and its clients.
 
+use std::sync::{Arc, Weak};
+
+/// Authority for a queued release. Dropping it abandons work not yet started.
+#[derive(Default)]
+pub struct ReleaseLease(Option<Arc<()>>);
+
+/// Allocator maintenance that can start only while its lease still exists.
+pub struct PendingRelease(Weak<()>);
+
+impl ReleaseLease {
+    /// Replaces the previous idle generation, abandoning its pending release.
+    pub fn pending(&mut self) -> PendingRelease {
+        let lease = Arc::new(());
+        let pending = PendingRelease(Arc::downgrade(&lease));
+        self.0 = Some(lease);
+        pending
+    }
+}
+
+impl PendingRelease {
+    /// Returns whether maintenance was attempted. A started call cannot be interrupted.
+    pub fn run(self) -> bool {
+        if self.0.upgrade().is_none() {
+            return false;
+        }
+        let _priority = crate::resources::Priority::utility();
+        release_idle();
+        true
+    }
+}
+
+fn release_idle() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    release();
+
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn malloc_default_zone() -> *mut std::ffi::c_void;
+            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+        }
+        // SAFETY: the default zone lives for the process and owns System's allocations.
+        unsafe { malloc_zone_pressure_relief(malloc_default_zone(), 0) };
+    }
+
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Memory::{
+            GetProcessHeap, HeapOptimizeResources, HeapSetInformation,
+        };
+        use windows_sys::Win32::System::SystemServices::{
+            HEAP_OPTIMIZE_RESOURCES_CURRENT_VERSION, HEAP_OPTIMIZE_RESOURCES_INFORMATION,
+        };
+        let info = HEAP_OPTIMIZE_RESOURCES_INFORMATION {
+            Version: HEAP_OPTIMIZE_RESOURCES_CURRENT_VERSION,
+            Flags: 0,
+        };
+        // SAFETY: the process heap owns Rust System allocations; info lives through the call.
+        unsafe {
+            HeapSetInformation(
+                GetProcessHeap(),
+                HeapOptimizeResources,
+                (&raw const info).cast(),
+                size_of_val(&info),
+            )
+        };
+    }
+}
+
 /// Bounds per-thread arena growth before the process starts workers.
 /// Other allocators already manage their own arena policy.
 pub fn small_footprint() {
@@ -162,6 +231,28 @@ fn unmap(ptr: std::ptr::NonNull<u64>, _: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropping_the_lease_abandons_queued_allocator_work() {
+        let mut lease = ReleaseLease::default();
+        let pending = lease.pending();
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            receive.recv().unwrap();
+            pending.run()
+        });
+        drop(lease);
+        send.send(()).unwrap();
+        assert!(!worker.join().unwrap());
+    }
+
+    #[test]
+    fn a_new_release_abandons_the_previous_generation() {
+        let mut lease = ReleaseLease::default();
+        let previous = lease.pending();
+        let _next = lease.pending();
+        assert!(!previous.run());
+    }
 
     #[test]
     fn mapped_words_start_zeroed_and_hold_what_is_written() {

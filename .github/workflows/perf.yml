@@ -128,7 +128,7 @@ jobs:
       PERF_PAIRED_ROUNDS: ${{ inputs.paired_rounds || '5' }}
     steps:
       - name: External build directory
-        run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/tgt-mem-release" >> "$GITHUB_ENV"
+        run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/tgt-native-release" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.harness_ref || github.sha }}

@@ -305,6 +305,25 @@ enum Residency {
 
 type Loaded = Result<Arc<Live>, (io::ErrorKind, String)>;
 
+#[derive(Default)]
+struct Retirement(Option<(rt::Rt, sys::PendingRelease)>);
+
+impl Drop for Retirement {
+    fn drop(&mut self) {
+        let Some((runtime, pending)) = self.0.take() else {
+            return;
+        };
+        let admitted = runtime.spawn_blocking(
+            rt::BlockingClass::Cpu,
+            0,
+            Box::new(|| {
+                pending.run();
+            }),
+        );
+        runtime.spawn(Box::pin(async move { drop(admitted.await) }));
+    }
+}
+
 impl Slot {
     fn new(header: Header, residency: Residency, daemon: Weak<Daemon>) -> Arc<Self> {
         Arc::new(Self {
@@ -341,6 +360,8 @@ impl Slot {
     /// actor's end makes the transition ([`Daemon::ended`]); whoever waits
     /// for it only reads it.
     fn ending(&self) -> Option<Flag> {
+        // Declared before the residency guard: scheduling follows its unlock.
+        let mut retirement = Retirement::default();
         let mut residency = lock(&self.residency);
         if let Residency::Loading { finished, .. } = &*residency {
             return Some(finished.clone());
@@ -354,7 +375,11 @@ impl Slot {
         let last = hibernated(live.summary());
         *residency = Residency::Hibernated { last };
         if let Some(daemon) = self.daemon.upgrade() {
-            lock(&daemon.slots).ended(self.header.id);
+            let mut slots = lock(&daemon.slots);
+            slots.ended(self.header.id);
+            retirement.0 = slots
+                .release()
+                .map(|pending| (Arc::clone(&daemon.shared.rt), pending));
             daemon.pulse.notify();
         }
         None

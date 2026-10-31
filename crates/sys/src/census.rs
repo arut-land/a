@@ -96,14 +96,17 @@ fn native_snapshot() -> io::Result<serde_json::Value> {
             let info = unsafe { libc::mallinfo2() };
             Ok(serde_json::json!({"allocator": "glibc", "malloc_info": xml,
                 "mallinfo2_allocated_bytes": info.uordblks + info.hblkhd,
-                "mallinfo2_free_bytes": info.fordblks}))
+                "mallinfo2_free_bytes": info.fordblks,
+                "mallinfo2_top_bytes": info.keepcost}))
         } else {
             Err(io::Error::last_os_error())
         }
     }
     #[cfg(windows)]
     {
-        use windows_sys::Win32::System::Memory::{GetProcessHeaps, HEAP_SUMMARY, HeapSummary};
+        use windows_sys::Win32::System::Memory::{
+            GetProcessHeap, GetProcessHeaps, HEAP_SUMMARY, HeapSummary,
+        };
         // SAFETY: zero length permits a null output pointer.
         let count = unsafe { GetProcessHeaps(0, std::ptr::null_mut()) };
         if count == 0 {
@@ -116,6 +119,8 @@ fn native_snapshot() -> io::Result<serde_json::Value> {
             return Err(io::Error::other("process heap list changed during census"));
         }
         let mut rows = Vec::new();
+        // SAFETY: this process's default heap handle needs no ownership transfer.
+        let process_heap = unsafe { GetProcessHeap() };
         for heap in &heaps[..actual as usize] {
             let mut summary = HEAP_SUMMARY {
                 cb: u32::try_from(size_of::<HEAP_SUMMARY>()).expect("HEAP_SUMMARY fits DWORD"),
@@ -126,6 +131,7 @@ fn native_snapshot() -> io::Result<serde_json::Value> {
                 return Err(io::Error::last_os_error());
             }
             rows.push(serde_json::json!({"heap": *heap as usize,
+                "process_heap": *heap == process_heap,
                 "allocated_bytes": summary.cbAllocated, "committed_bytes": summary.cbCommitted,
                 "reserved_bytes": summary.cbReserved}));
         }
@@ -141,6 +147,7 @@ fn native_snapshot() -> io::Result<serde_json::Value> {
             size_allocated: usize,
         }
         unsafe extern "C" {
+            fn malloc_default_zone() -> *mut std::ffi::c_void;
             fn malloc_zone_statistics(zone: *mut std::ffi::c_void, stats: *mut Statistics);
         }
         let mut stats = std::mem::MaybeUninit::<Statistics>::uninit();
@@ -149,10 +156,19 @@ fn native_snapshot() -> io::Result<serde_json::Value> {
             malloc_zone_statistics(std::ptr::null_mut(), stats.as_mut_ptr());
             stats.assume_init()
         };
+        let mut default = std::mem::MaybeUninit::<Statistics>::uninit();
+        // SAFETY: the process-lifetime default zone fills the correctly sized output.
+        let default = unsafe {
+            malloc_zone_statistics(malloc_default_zone(), default.as_mut_ptr());
+            default.assume_init()
+        };
         Ok(
             serde_json::json!({"allocator": "apple-malloc", "statistics": {
                 "blocks_in_use": stats.blocks_in_use, "size_in_use": stats.size_in_use,
                 "max_size_in_use": stats.max_size_in_use, "size_allocated": stats.size_allocated,
+            }, "default_statistics": {
+                "blocks_in_use": default.blocks_in_use, "size_in_use": default.size_in_use,
+                "max_size_in_use": default.max_size_in_use, "size_allocated": default.size_allocated,
             }}),
         )
     }

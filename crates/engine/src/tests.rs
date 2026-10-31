@@ -125,6 +125,47 @@ fn bodies(store: &dyn LogStore, id: SessionId) -> Vec<Body> {
 }
 
 #[test]
+fn queued_allocator_work_never_delays_reloading_and_loses_its_lease() {
+    use rt::Runtime;
+    use std::sync::{Arc, mpsc};
+
+    let (root, home) = home("release-reload");
+    let runtime = Arc::new(rt::Threads::configured(rt::Config::for_cores(1)));
+    let daemon = Daemon::load_on(&home, &echo(), &runtime, Vec::new()).unwrap();
+    let attachment = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
+    let id = attachment.session().id;
+    settle(&daemon);
+    let (entered, running) = mpsc::channel();
+    let (release, held) = mpsc::channel();
+    rt::block_on(runtime.spawn_blocking(
+        rt::BlockingClass::Cpu,
+        0,
+        Box::new(move || {
+            entered.send(()).unwrap();
+            held.recv().unwrap();
+        }),
+    ))
+    .unwrap();
+    running.recv_timeout(PATIENCE).unwrap();
+    drop(attachment);
+    daemon.hibernate(Duration::ZERO);
+    daemon.wait("last actor hibernated", PATIENCE, || {
+        daemon.list()[0].residency == Residency::Hibernated
+    });
+    let pending = super::lock(&daemon.slots).release().unwrap();
+    let reopened = daemon.attach_to(&Target::Id(id), || "/w".into()).unwrap();
+    assert!(
+        !pending.run(),
+        "loading must abandon the previous idle generation"
+    );
+    release.send(()).unwrap();
+    drop(reopened);
+    drop(daemon);
+    drop(runtime);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn idle_sessions_hibernate_and_reload_on_attach() {
     let (root, home) = home("hibernate");
     let daemon = Daemon::load(&home, &echo()).unwrap();
