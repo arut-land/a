@@ -233,10 +233,6 @@ jobs:
           reference=()
           if [[ -n "$REFERENCE" ]]; then reference+=(--reference-source ../reference); fi
           if [[ "$PERF_ALLOC_CENSUS" == true ]]; then reference+=(--census); fi
-          if [[ "$PERF_RELEASE_OVERLAP" == main-attach-budget || "$PERF_RELEASE_OVERLAP" == main-windows-suite ]]; then
-            python scripts/perf/residency.py --source ../measured --target "$CARGO_TARGET_DIR" --output "$RUNNER_TEMP/residency-output" --reference-check "${PERF_RELEASE_OVERLAP#main-}"
-            exit
-          fi
           if [[ -n "$PERF_RELEASE_OVERLAP" ]]; then reference+=(--overlap "$PERF_RELEASE_OVERLAP"); fi
           if [[ -n "$PERF_RESIDENCY_CASES" ]]; then reference+=(--cases "$PERF_RESIDENCY_CASES"); fi
           if [[ -n "${PERF_VMMAP:-}" ]]; then reference+=(--vmmap "$PERF_VMMAP"); fi
@@ -249,10 +245,6 @@ jobs:
           REFERENCE: ${{ inputs.paired_ref }}
         run: |
           $reference = @()
-          if ($env:PERF_RELEASE_OVERLAP -eq 'main-windows-suite') {
-            python scripts/perf/residency.py --source ../measured --target $env:CARGO_TARGET_DIR --output "$env:RUNNER_TEMP/residency-output" --reference-check windows-suite
-            exit $LASTEXITCODE
-          }
           if ($env:REFERENCE) { $reference += @('--reference-source', '../reference') }
           if ($env:PERF_ALLOC_CENSUS -eq 'true') { $reference += '--census' }
           if ($env:PERF_RESIDENCY_CASES) { $reference += @('--cases', $env:PERF_RESIDENCY_CASES) }
@@ -268,7 +260,6 @@ jobs:
             ${{ runner.temp }}/residency-output/*.csv
             ${{ runner.temp }}/residency-output/*.patch
             ${{ runner.temp }}/residency-output/census-module.rs
-            ${{ runner.temp }}/residency-output/main-proof-*.txt
           retention-days: 30
       - name: Clean owned target
         if: always()
