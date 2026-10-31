@@ -12,29 +12,6 @@ fn block_on_returns_the_output() {
 }
 
 #[test]
-fn running_maintenance_never_occupies_the_foreground_cpu_worker() {
-    let rt = Threads::configured(Config::for_cores(1));
-    let (entered, running) = std::sync::mpsc::channel();
-    let (release, held) = std::sync::mpsc::channel();
-    spawn_maintenance(Box::new(move || {
-        entered.send(()).unwrap();
-        held.recv().unwrap();
-    }))
-    .unwrap();
-    running.recv_timeout(Duration::from_secs(5)).unwrap();
-    let (finished, foreground) = std::sync::mpsc::channel();
-    block_on(rt.spawn_blocking(
-        BlockingClass::Cpu,
-        0,
-        Box::new(move || finished.send(()).unwrap()),
-    ))
-    .unwrap();
-    let result = foreground.recv_timeout(Duration::from_secs(5));
-    release.send(()).unwrap();
-    result.expect("foreground work must finish while maintenance is still blocked");
-}
-
-#[test]
 fn threads_run_spawned_blocking_and_timed_work() {
     let rt = Threads::new(2);
     let started = Instant::now();

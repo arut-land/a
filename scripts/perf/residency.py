@@ -99,6 +99,11 @@ use protocol::{Activity, ClientMsg, DaemonMsg, Decode, Entry, HostPath, SessionI
 use std::io::{BufRead, BufReader, Write};
 use std::time::{Duration, Instant};
 
+fn unix_ns() -> u64 {
+    u64::try_from(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()).unwrap()
+}
+
 fn durable(home: &sys::Home, id: SessionId) -> Vec<Entry> {
     let text = std::fs::read_to_string(home.sessions_dir().join(id.to_string()).join("log.jsonl"))
         .unwrap();
@@ -274,19 +279,21 @@ impl Client {
         } else {
             0
         };
-        let mut client = Self::connect(home);
+        let (client, ms, items, _) = Self::attach_on(home, target, Self::connect(home), committed);
+        (client, ms, items)
+    }
+
+    fn attach_on(home: &sys::Home, target: Target, mut client: Self, committed: u64) -> (Self, f64, usize, u64) {
         let started = Instant::now();
-        protocol::write_frame(
-            &mut client.stream,
-            &ClientMsg::Attach {
+        let message = ClientMsg::Attach {
                 target,
                 workspace: Some(std::env::current_dir().unwrap().try_into().unwrap()),
                 since: 0,
                 env: None,
                 decl: Default::default(),
-            },
-        )
-        .unwrap();
+            };
+        let sent_ns = unix_ns();
+        protocol::write_frame(&mut client.stream, &message).unwrap();
         let seq = loop {
             if let DaemonMsg::Synced { seq } = client.receive() {
                 break seq;
@@ -303,7 +310,7 @@ impl Client {
         );
         let items = client.replay(home, &head);
         let ms = started.elapsed().as_secs_f64() * 1000.;
-        (client, ms, items.len())
+        (client, ms, items.len(), sent_ns)
     }
 
     fn replay(&mut self, home: &sys::Home, head: &Head) -> Vec<Located> {
@@ -434,31 +441,38 @@ fn main() {
                 use std::io::Read;
                 let id: SessionId = serde_json::from_value(value["id"].clone()).unwrap();
                 let turn = value["action"] == "turn";
-                let prepared = turn.then(|| Client::attach(&home, Target::Id(id)).0);
+                let committed = durable(&home, id).last().map_or(0, |entry| entry.seq.get());
+                let mut prepared = if turn {
+                    Client::attach(&home, Target::Id(id)).0
+                } else {
+                    Client::connect(&home)
+                };
                 let input = "overlap: ".to_owned() + &"x".repeat(value["bytes"].as_u64().unwrap() as usize);
+                let message = ClientMsg::Input {
+                    segments: input.clone().into(), mode: Default::default(),
+                    force: false, client_seq: None,
+                };
+                let mut frame = Vec::new();
+                protocol::write_frame(&mut frame, &message).unwrap();
                 let mut stream = std::net::TcpStream::connect(("127.0.0.1", value["port"].as_u64().unwrap() as u16)).unwrap();
                 stream.set_nodelay(true).unwrap();
                 stream.write_all(if value["release"] == true { b"R" } else { b"C" }).unwrap();
                 let mut marker = [0];
                 stream.read_exact(&mut marker).unwrap();
                 assert_eq!(marker, *b"B");
-                let now = || u64::try_from(std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()).unwrap();
-                let begin_ns = now();
                 let started = Instant::now();
-                let client = if let Some(mut client) = prepared {
-                    let since = client.head.as_ref().unwrap().cut.seq;
-                    protocol::write_frame(&mut client.stream, &ClientMsg::Input {
-                        segments: input.clone().into(), mode: Default::default(),
-                        force: false, client_seq: None,
-                    }).unwrap();
-                    client.reply(&home, since, &input);
-                    client
+                let (client, begin_ns) = if turn {
+                    let since = prepared.head.as_ref().unwrap().cut.seq;
+                    let sent_ns = unix_ns();
+                    prepared.stream.write_all(&frame).unwrap();
+                    prepared.reply(&home, since, &input);
+                    (prepared, sent_ns)
                 } else {
-                    Client::attach(&home, Target::Id(id)).0
+                    let (client, _, _, sent_ns) = Client::attach_on(&home, Target::Id(id), prepared, committed);
+                    (client, sent_ns)
                 };
                 let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-                let end_ns = now();
+                let end_ns = unix_ns();
                 let mut native = String::new();
                 BufReader::new(stream).read_line(&mut native).unwrap();
                 let native: serde_json::Value = serde_json::from_str(&native).unwrap();
@@ -825,7 +839,8 @@ def sample(binary, probe_binary, output, stored, count, turns, size, idle_second
                 probe.call("detach")
             stages = {}
             hibernate(probe, stored)
-            time.sleep(12)  # existing blocking workers retire after ten seconds
+            if not overlap:
+                time.sleep(12)  # existing blocking workers retire after ten seconds
             stages["catalog"] = observe(probe, active, idle_seconds)
             for wave in (1, 2):
                 latencies = [probe.call("attach", id=id) for id in ids[:count]]
@@ -848,7 +863,8 @@ def sample(binary, probe_binary, output, stored, count, turns, size, idle_second
                 if overlap and wave == 2:
                     (active.home / "release-overlap/arm").touch()
                 ack = hibernate(probe, stored)
-                time.sleep(12)
+                if not overlap:
+                    time.sleep(12)
                 stages[f"wave{wave}_hibernated"] = dict(observe(probe, active, idle_seconds), acknowledgement=ack)
             stages["wave2_hibernated"]["maps"] = memory_maps(active.pid)
             if overlap:
@@ -884,6 +900,11 @@ def summarize(records):
     groups = {}
     for r in records:
         for name, s in r["stages"].items():
+            if name == "overlap":
+                key = f'{r["label"]}/stored={r["stored"]}/active={r["active"]}/{name}'
+                for metric, value in dict(request_ms=s["ms"], native_call_ms=s["native"]["native_ns"] / 1e6).items():
+                    groups.setdefault(key, {}).setdefault(metric, []).append(value)
+                continue
             values = dict(charged_kib=s["charged_bytes"] / 1024, rss_kib=s["before"]["rss_kib"],
                           sampled_peak_charged_kib=s["sampled_peak_charged_bytes"] / 1024,
                           cpu_ms=s["cpu_ms"], threads=s["after"]["thread_count"], switches=s["switches"])
@@ -947,6 +968,9 @@ def paired(records):
         for stage, value in r["stages"].items():
             key = f"stored={stored}/active={active}/{stage}"
             group = groups.setdefault(key, {})
+            if stage == "overlap":
+                group.setdefault("request_ms", []).append(value["ms"] - other["stages"][stage]["ms"])
+                continue
             if "census" in value:
                 for metric in ("allocated_bytes", "retained_free_bytes", "allocator_bytes"):
                     group.setdefault(metric.removesuffix("_bytes") + "_kib", []).append(
@@ -968,13 +992,22 @@ def table(summary, comparison=False):
              "| case/stage | charge KiB | RSS KiB | CPU ms | threads | reattach ms (slowest session/run) | slowest turn batch ms |",
              "| --- | ---: | ---: | ---: | ---: | ---: | ---: |"]
     for key, row in summary.items():
-        if "minus" in key:
+        if "minus" in key or key.endswith("/overlap"):
             continue
         cells = []
         for metric in ("charged_kib", "rss_kib", "cpu_ms", "threads", "reattach_ms", "turn_batch_ms"):
             value = row.get(metric)
             cells.append("" if value is None else "{median:.3f} [{min:.3f}, {max:.3f}]".format(**value))
         lines.append("| " + key + " | " + " | ".join(cells) + " |")
+    overlap = {key: row for key, row in summary.items() if key.endswith("/overlap")}
+    if overlap:
+        lines.extend(["", "Call-entry overlap timings (A=no native release, A2=native release; one identical executable).",
+                      "Raw timestamps must also confirm request/call overlap.", "",
+                      "| case | request ms | native call ms |", "| --- | ---: | ---: |"])
+        for key, row in overlap.items():
+            cells = ["{median:.3f} [{min:.3f}, {max:.3f}]".format(**row[metric])
+                     for metric in ("request_ms", "native_call_ms")]
+            lines.append("| " + key + " | " + " | ".join(cells) + " |")
     census = {key: row for key, row in summary.items() if "allocated_kib" in row}
     if census:
         lines.extend(["", "Instrumented native allocator observations; timings above are diagnostic only.", "",
