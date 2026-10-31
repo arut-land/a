@@ -135,7 +135,7 @@ jobs:
       - name: External build directory
         run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/tgt-native-release" >> "$GITHUB_ENV"
       - name: CI checkout line endings
-        if: inputs.release_overlap == 'engine-ci-trace'
+        if: startsWith(inputs.release_overlap, 'engine-ci-')
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
         with:
@@ -151,7 +151,7 @@ jobs:
           ref: ${{ inputs.paired_ref }}
           path: reference
       - name: Restore the failing CI cache
-        if: inputs.release_overlap == 'engine-ci-trace'
+        if: startsWith(inputs.release_overlap, 'engine-ci-')
         uses: actions/cache/restore@v6
         with:
           path: |
@@ -191,12 +191,12 @@ jobs:
       - uses: jdx/mise-action@v5
         with:
           working_directory: measured
-          install_args: ${{ inputs.release_overlap == 'engine-ci-trace' && 'mr-boxington' || 'cargo:cargo-nextest@0.9.150 cargo:cargo-nextest@0.9.148' }}
+          install_args: ${{ startsWith(inputs.release_overlap, 'engine-ci-') && 'mr-boxington' || 'cargo:cargo-nextest@0.9.150 cargo:cargo-nextest@0.9.148' }}
           env: false
         env:
-          MISE_IGNORED_CONFIG_PATHS: ${{ inputs.release_overlap != 'engine-ci-trace' && github.workspace || '' }}
+          MISE_IGNORED_CONFIG_PATHS: ${{ !startsWith(inputs.release_overlap, 'engine-ci-') && github.workspace || '' }}
       - name: CI native nextest
-        if: inputs.release_overlap == 'engine-ci-trace'
+        if: startsWith(inputs.release_overlap, 'engine-ci-')
         shell: pwsh
         run: |
           $platform = if ($env:RUNNER_ARCH -eq 'ARM64') { 'windows-arm' } else { 'windows' }
@@ -268,8 +268,10 @@ jobs:
           REFERENCE: ${{ inputs.paired_ref }}
         run: |
           $reference = @()
-          if ($env:PERF_RELEASE_OVERLAP -eq 'engine-ci-trace') {
-            python scripts/perf/residency.py --source ../measured --target $env:CARGO_TARGET_DIR --output "$env:RUNNER_TEMP/residency-output" --rounds 5 --engine-ci-suites
+          if ($env:PERF_RELEASE_OVERLAP -like 'engine-ci-*') {
+            $cold = @()
+            if ($env:PERF_RELEASE_OVERLAP -eq 'engine-ci-cold') { $cold = @('--suite-trial', '0') }
+            python scripts/perf/residency.py --source ../measured --target $env:CARGO_TARGET_DIR --output "$env:RUNNER_TEMP/residency-output" --rounds 5 --engine-ci-suites @cold
             exit $LASTEXITCODE
           }
           if ($env:PERF_RELEASE_OVERLAP -eq 'engine-trace-contended') {

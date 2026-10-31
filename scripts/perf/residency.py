@@ -1149,7 +1149,28 @@ def engine_suites(source, reference, target, output, rounds, prepare, trial, sco
                 raise SystemExit(result.returncode)
 
 
-def engine_ci_suites(source, target, output):
+SETTLE_FAILURE_TRACE = r'''
+        if !held && std::thread::current().name() == Some("tests::inherited_task_cannot_reset_an_exhausted_depth_budget") {
+            let observed = Instant::now();
+            eprintln!("depth-timeout window={within:?} graph={:#?}", self.loaded().iter()
+                .map(|live| (live.id, live.has_work(), live.has_jobs())).collect::<Vec<_>>());
+            eprintln!("depth-timeout ready={} parallelism={:?} effective={}", ready(),
+                std::thread::available_parallelism(), sys::resources::effective_parallelism());
+            eprintln!("depth-timeout events={:#?}", crate::lock(&super::EVENTS.0));
+            for header in self.shared.store.headers().unwrap() {
+                eprintln!("depth-timeout log {} {:#?}", header.id, bodies(&*self.shared.store, header.id));
+            }
+            rt::block_on(rt::or(self.pulse.until(&ready),
+                rt::or(self.jobs.until(&ready), super::EVENTS.1.until(&ready))));
+            eprintln!("depth-timeout eventual-idle after={:?}", observed.elapsed());
+            for header in self.shared.store.headers().unwrap() {
+                eprintln!("depth-timeout final-log {} {:#?}", header.id, bodies(&*self.shared.store, header.id));
+            }
+        }
+'''
+
+
+def engine_ci_suites(source, target, output, cold):
     env = environment(target)
     env.pop("MISE_IGNORED_CONFIG_PATHS", None)
     env.update(MISE_TRUSTED_CONFIG_PATHS=str(source), MISE_YES="1", MISE_AUTO_INSTALL="false",
@@ -1158,11 +1179,16 @@ def engine_ci_suites(source, target, output):
         str(Path(env["SYSTEMROOT"]) / "System32/WindowsPowerShell/v1.0/powershell.exe")])
     path = source / "crates/engine/src/tests.rs"
     text = path.read_text()
-    begin = text.index("fn inherited_task_cannot_reset_an_exhausted_depth_budget()")
-    end = text.index("\n#[test]", begin)
-    body = text[begin:end]
-    assert body.count("    settle(&daemon);\n") == 1
-    path.write_text(text[:begin] + body.replace("    settle(&daemon);\n", DEPTH_TRACE) + text[end:])
+    if cold:
+        marker = '        assert!(held, "never {what}");'
+        assert text.count(marker) == 1
+        path.write_text(text.replace(marker, SETTLE_FAILURE_TRACE + marker))
+    else:
+        begin = text.index("fn inherited_task_cannot_reset_an_exhausted_depth_budget()")
+        end = text.index("\n#[test]", begin)
+        body = text[begin:end]
+        assert body.count("    settle(&daemon);\n") == 1
+        path.write_text(text[:begin] + body.replace("    settle(&daemon);\n", DEPTH_TRACE) + text[end:])
     (output / "depth-trace-branch.patch").write_bytes(subprocess.check_output(
         ["git", "diff", "--", "crates/engine/src/tests.rs"], cwd=source))
     identity = dict(revision=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip(),
@@ -1177,7 +1203,7 @@ def engine_ci_suites(source, target, output):
     ]:
         subprocess.run(["mise", "exec", "--", *command], cwd=source, env=env, check=True)
     failed = False
-    for round in range(5):
+    for round in range(1 if cold else 5):
         result = subprocess.run(["mise", "exec", "--", "cargo", "nextest", "run", "--workspace",
             "--features", "a/lua", "--no-tests=fail", "--no-fail-fast", "--retries", "0",
             "--success-output", "final"], cwd=source, env=env,
@@ -1285,7 +1311,7 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     os.environ["A_HOME"] = str(output / "test-home")
     if args.engine_ci_suites:
-        engine_ci_suites(source, target, output)
+        engine_ci_suites(source, target, output, args.suite_trial is not None)
         return
     if args.engine_suites:
         engine_suites(source, args.reference_source.resolve() if args.reference_source else None,
