@@ -1100,12 +1100,17 @@ def engine_suites(source, reference, target, output, rounds, prepare, trial, sco
                        *(["-E", "test(=tests::inherited_task_cannot_reset_an_exhausted_depth_budget)"] if load else [])]
             pressure = []
             if load:
-                binaries = list((target / "debug/deps").glob("engine-*.exe"))
-                assert len(binaries) == 1, binaries
+                listing = cargo_run(["cargo", "nextest", "list", "-p", "engine", "--message-format", "json"],
+                    nextest_version="0.9.148", cwd=checkout, env=env, stdout=subprocess.PIPE, check=True)
+                suites = [suite for suite in json.loads(listing.stdout)["rust-suites"].values()
+                          if suite["binary-name"] == "engine" and suite["kind"] == "lib"]
+                assert len(suites) == 1, suites
+                binary = suites[0]["binary-path"]
+                (output / "cold-load-binary.json").write_text(json.dumps(suites[0], indent=2))
                 for index in range(load):
                     path = output / f"cold-load-{round:02}-{index:02}.txt"
                     stream = path.open("wb")
-                    child = subprocess.Popen([str(binaries[0]), "--exact",
+                    child = subprocess.Popen([binary, "--exact",
                         "tests::cold_start_does_not_grow_with_session_count", "--nocapture"],
                         cwd=checkout, env=env, stdout=stream, stderr=subprocess.STDOUT)
                     pressure.append((child, stream, path))
