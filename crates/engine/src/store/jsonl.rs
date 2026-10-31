@@ -3,7 +3,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard};
+use std::sync::{Arc, OnceLock, PoisonError, RwLock, RwLockReadGuard};
 
 use protocol::{Decode, Entry, Json, ReadOnly, SessionId};
 use serde::{Deserialize, Serialize};
@@ -14,7 +14,7 @@ use super::{
 };
 
 /// A different header format makes the log read-only.
-pub(crate) const FORMAT: u32 = 1;
+pub(crate) const FORMAT: u32 = 2;
 
 /// Owned children nest below their parent's conversation directory.
 /// The daemon lock excludes concurrent writers; sessions share a cache flusher.
@@ -29,6 +29,7 @@ pub struct Jsonl {
     leases: Local,
     flusher: Arc<rt::Flusher>,
     domain: sys::fs::FlushDomain,
+    retention: OnceLock<()>,
 }
 
 impl Jsonl {
@@ -45,6 +46,7 @@ impl Jsonl {
             leases: Local::default(),
             flusher: Arc::default(),
             domain,
+            retention: OnceLock::new(),
         })
     }
 
@@ -107,6 +109,10 @@ impl Jsonl {
         if root.is_file() {
             return Ok(root);
         }
+        let retained = self.retained(id);
+        if retained.is_file() {
+            return Ok(retained);
+        }
         let found = discover(&self.dir)?;
         let path = found.get(&id).cloned().ok_or(io::ErrorKind::NotFound)?;
         self.paths
@@ -114,6 +120,10 @@ impl Jsonl {
             .unwrap_or_else(PoisonError::into_inner)
             .extend(found);
         Ok(path)
+    }
+
+    fn retained(&self, id: SessionId) -> PathBuf {
+        self.dir.join("retained").join(format!("{id}.jsonl"))
     }
 
     fn prepare(&self, header: &Header) -> io::Result<PathBuf> {
@@ -195,6 +205,77 @@ fn beside(log: &Path, ext: &str) -> PathBuf {
 }
 
 impl LogStore for Jsonl {
+    fn retain(&self, cut: protocol::publication::LogCut) -> io::Result<()> {
+        let retained = self.retained(cut.session);
+        if retained.is_file() {
+            return Ok(());
+        }
+        let source = self.path(cut.session)?;
+        let dir = retained.parent().unwrap();
+        if self.retention.get().is_none() {
+            sys::fs::create_dir_all_durable(&self.dir, dir)?;
+            let _ = fs::create_dir_all(dir.join(DERIVED));
+            let _ = self.retention.set(());
+        }
+        match fs::hard_link(&source, &retained) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        // Both names own the same ordinary log bytes, including later appends.
+        // The archive stays outside discovery, so catalog visibility can end independently.
+        let index = beside(&source, "idx");
+        if index.is_file() {
+            let _ = fs::hard_link(index, beside(&retained, "idx"));
+        }
+        // The referring admission's shared store barrier covers this ordered name.
+        sys::fs::order_dir(dir)
+    }
+
+    fn cut(
+        &self,
+        cut: protocol::publication::LogCut,
+    ) -> io::Result<Box<dyn Iterator<Item = io::Result<Entry>> + Send>> {
+        let retained = self.retained(cut.session);
+        let path = if retained.is_file() {
+            retained
+        } else {
+            self.path(cut.session)?
+        };
+        let file = File::open(&path)?;
+        let mut index = Index::new(&file, path, 0)?;
+        if index.header(&file)?.is_some() {
+            return Err(io::Error::other("unreadable context source format"));
+        }
+        index.recall(&file, Some(cut.through))?;
+        if (index.read().ends.len() as u64) < cut.through.get() {
+            let seq = index.read().ends.len() as u64;
+            let epoch = seq
+                .checked_sub(1)
+                .and_then(|at| {
+                    usize::try_from(at)
+                        .ok()
+                        .and_then(|at| index.entry(&file, &index.read().ends, at))
+                })
+                .map_or(0, |entry| entry.epoch.0);
+            let mut history = History { seq, epoch };
+            if index
+                .scan(&file, None, &mut history, cut.through.get(), |_| {})?
+                .is_some()
+                || history.seq != cut.through.get()
+            {
+                return Err(io::Error::other("incomplete or damaged context source"));
+            }
+        }
+        Ok(Box::new(CutReader {
+            file,
+            index,
+            next: usize::try_from(cut.through.get()).map_err(io::Error::other)?,
+            buffer: Vec::new(),
+            from: 0,
+        }))
+    }
+
     fn locate(&self, headers: &[Header]) -> io::Result<()> {
         let mut paths = self.paths.write().unwrap_or_else(PoisonError::into_inner);
         let mut pending: Vec<_> = headers.iter().collect();
@@ -254,7 +335,12 @@ impl LogStore for Jsonl {
         cursor: &mut ext::LogCursor,
         through: u64,
     ) -> io::Result<(bool, Vec<Entry>)> {
-        let file = File::open(self.path(id)?)?;
+        let file = File::open(self.path(id)?).or_else(|error| {
+            if error.kind() != io::ErrorKind::NotFound {
+                return Err(error);
+            }
+            File::open(self.retained(id))
+        })?;
         let mut reader = BufReader::new(&file);
         let mut line = Vec::new();
         let mut reset = false;
@@ -363,7 +449,7 @@ impl LogStore for Jsonl {
         self.domain.check(&file)?;
         let mut index = Index::new(&file, path, 0)?;
         let other = index.header(&file)?;
-        index.recall(&file)?;
+        index.recall(&file, None)?;
         let snapshot = Snap::read(&index.path).filter(|snap| index.places(&file, snap));
         let placed = std::mem::take(&mut index.ends_mut().ends);
         let mut history = History::default();
@@ -451,6 +537,60 @@ struct Index {
     path: PathBuf,
     start: u64,
     ends: RwLock<Ends>,
+}
+
+struct CutReader {
+    file: File,
+    index: Index,
+    next: usize,
+    buffer: Vec<u8>,
+    from: u64,
+}
+
+impl Iterator for CutReader {
+    type Item = io::Result<Entry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next = self.next.checked_sub(1)?;
+        Some(self.entry())
+    }
+}
+
+impl CutReader {
+    fn entry(&mut self) -> io::Result<Entry> {
+        let (from, end) = {
+            let ends = self.index.read();
+            (
+                self.next
+                    .checked_sub(1)
+                    .map_or(self.index.start, |at| ends.ends[at]),
+                ends.ends[self.next],
+            )
+        };
+        if from < self.from || end > self.from + self.buffer.len() as u64 {
+            // Batch adjacent facts without holding a source beyond this operation.
+            const READ_BYTES: u64 = 64 * 1024;
+            self.from = end
+                .saturating_sub(READ_BYTES)
+                .max(self.index.start)
+                .min(from);
+            self.buffer.resize(
+                usize::try_from(end - self.from).map_err(io::Error::other)?,
+                0,
+            );
+            sys::read_exact_at(&self.file, &mut self.buffer, self.from)?;
+        }
+        let line = &mut self.buffer[usize::try_from(from - self.from).map_err(io::Error::other)?
+            ..usize::try_from(end - self.from).map_err(io::Error::other)?];
+        let len = unsealed_len(line)
+            .ok_or_else(|| io::Error::other("unreadable context source entry"))?;
+        line[len - 1] = b'}';
+        let entry = Entry::from_json(&line[..len]).map_err(io::Error::other)?;
+        if entry.seq.get() != self.next as u64 + 1 {
+            return Err(io::Error::other("unordered context source entry"));
+        }
+        Ok(entry)
+    }
 }
 
 struct Ends {
@@ -551,7 +691,7 @@ impl Index {
 
     /// Offsets must rise within the file and end at the claimed sealed entry.
     /// This validates positions, not log ordering.
-    fn recall(&mut self, file: &File) -> io::Result<()> {
+    fn recall(&mut self, file: &File, through: Option<protocol::Seq>) -> io::Result<()> {
         let path = beside(&self.path, "idx");
         let mut ends: Vec<u64> = fs::read(&path).map_or_else(
             |_| Vec::new(),
@@ -564,6 +704,10 @@ impl Index {
                     .collect()
             },
         );
+        if let Some(through) = through {
+            // A shared index may know later entries outside this reader's authority.
+            ends.truncate(usize::try_from(through.get()).map_err(io::Error::other)?);
+        }
         let len = file.metadata()?.len();
         let rising = ends.first().is_none_or(|&first| first > self.start)
             && ends.windows(2).all(|w| w[0] < w[1])
@@ -889,18 +1033,21 @@ pub(crate) fn seal(line: &mut Vec<u8>, at: usize) {
 /// Whether `line`, newline included, is sealed; if it is, it becomes the
 /// JSON object it seals.
 pub(crate) fn unseal(line: &mut Vec<u8>) -> bool {
-    let Some(fields) = line.len().checked_sub(SEAL + 1) else {
+    let Some(len) = unsealed_len(line) else {
         return false;
     };
+    line.truncate(len - 1);
+    line.push(b'}');
+    true
+}
+
+fn unsealed_len(line: &[u8]) -> Option<usize> {
+    let fields = line.len().checked_sub(SEAL + 1)?;
     let (object, seal) = line.split_at(fields);
     let sealed = seal.starts_with(CRC)
         && seal.ends_with(b"\"}\n")
         && seal[CRC.len()..][..8] == hex(crc32c::crc32c(object));
-    if sealed {
-        line.truncate(fields);
-        line.push(b'}');
-    }
-    sealed
+    sealed.then_some(fields + 1)
 }
 
 /// The lines of `out` from `at` on, each sealed, as the objects they seal:

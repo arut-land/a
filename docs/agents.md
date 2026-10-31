@@ -127,37 +127,39 @@ existing positive token limit and duration types; they are not currency caps.
 
 A prefix child inherits the effective conversation through the chosen seq,
 including context edits and skill publications, but does not acquire the
-parent's executable ledger. Admission freezes a `ContextImage`: a content-store
-root and effective publication identities, separate from execution authority.
-Immutable `ContextNode` segments refer to the preceding local segment and to
-inherited cuts. A new admission writes only the local suffix; ancestor payloads
-are neither flattened into its intent nor read again at admission. Natural model
-result boundaries divide segments. The content store orders their sealed bytes
-before the intent's durable barrier, and a child retains the referenced closure
-independently of the source log's lifetime.
+parent's executable ledger. Admission freezes a `ContextCut`: an ordinary
+source session id and sequence, runner interpretation and effective publication
+identities, separate from execution authority. Presentation authority names a
+source position whose extension or spawn fact reconstructs the admitted
+registrations. No second durable transcript or projection codec is written.
 
-Nodes contain projection inputs and edits in their local sequence space. They
-never contain executable ledgers, tool intents, process groups or watches.
-Nonprojecting entries retain only their positions, so a later edit can still
-replace their range. Reading a cut applies only edits within that cut, excludes
-unfinished queue/tool exchanges, and projects through the same transcript reducer
-as live history. Inherited runner kinds keep model-only input interpretation
-intact. Parent appends, edits and compaction cannot change an admitted cut.
+The store pins the source log before the admission becomes durable. JSONL
+retention gives the same file a durable name under
+`sessions/retained/<id>.jsonl`, outside catalog discovery. These names share
+the original file's bytes, including later appends; each reader stops at its
+frozen sequence. Removing a visible source name or its catalog entry cannot
+remove bytes needed by a referenced cut. References in those prefixes retain
+their own sources recursively. No ordinary daemon work currently collects
+unreferenced retained logs or blobs.
 
-Graph nodes are engine-private content, not fetchable attachments. A client may
-fetch only payloads in its effective inherited projection; knowing a graph hash
-gives no access to stored older/edited-out inputs. A content collector follows
-`ContextNode::blobs` transitively from the roots named by durable admission links and spawn facts.
-The same references retain provider payloads and tool blobs after ancestor-log
-removal. No content collector currently runs during ordinary daemon work.
+Projection reads ordinary entries backwards through operation-scoped handles.
+It applies only edits within the cut, excludes unfinished queue/tool exchanges,
+and uses the same transcript reducer as live history. Each inherited scope keeps
+its own sequence positions and runner interpretation. Parent appends, edits and
+compaction cannot change an admitted cut. Bounded model-only history stops after
+a sufficient complete local suffix without reading unrequested ancestors;
+queue/tool dependencies can require older entries.
+
+A client may fetch only payloads in its effective inherited projection. Source
+log references are not attachments. A collector follows `Body::cuts` through
+ordinary retained prefixes and then `Body::blobs` for payloads in those logs;
+knowing a source id or payload hash does not bypass projection access checks.
 
 Effective publication identities travel with the cut for protocol/view reducers,
 so a child does not republish an inherited skill merely because its sequence
-space differs. Context projection for bounded model-only history can stop after
-a sufficient complete local suffix, without materializing unrequested ancestors.
-It continues into older segments whenever queue or tool dependencies require it.
-Extension generation images accompany the prefix; only
-explicitly inheritable state is restored into the child.
+space differs. Only explicitly inheritable extension state is restored into the
+child. Provider compiler prefixes remain disposable shared caches, independent
+of the durable source-log representation.
 
 ## Inheritance
 
@@ -425,20 +427,20 @@ fresh exchanges and cannot address a source-owned log.
 
 ### Context and bounds
 
-`Fresh` supplies only the extension's messages. `Owner` freezes an immutable
-content cut strictly before the owning call. Each input carries that cut,
-independently of earlier inputs in the same thread. Admission extends only the
-new local log suffix; execution reads the recent graph exchanges its existing
+`Fresh` supplies only the extension's messages. `Owner` freezes an ordinary
+log cut strictly before the owning call. Each input carries that cut,
+independently of earlier inputs in the same thread. Admission records the source
+reference; execution reads the recent source exchanges its existing
 bounds request. Taken inbox inputs count as exchanges too. Rich messages and
 opaque provider state remain intact. Only extension instructions and replies
 enter thread history; owner prefixes never accumulate there.
 
 A live input borrows its producer's admitted presentation registry until
 settlement or cancellation, including registrations excluded from the child;
-it grants no execution authority. A separate immutable presentation edge on
-the cut records the installed sources and selected registrations. Cold
-pending-input recovery restores that generation from this witness, without
-reading the owner's log. The witness keeps history in its original projection
+it grants no execution authority. A separate presentation reference names the
+logged extension or spawn fact supplying the installed sources and selected
+registrations. Cold pending-input recovery reads that exact fact from the
+retained owner log. Context keeps history in its original projection
 scope, preserving pending provider exchanges. Compaction's `OwnerPrefix`
 requests all effective context, and a full-context agent fork remains unbounded.
 

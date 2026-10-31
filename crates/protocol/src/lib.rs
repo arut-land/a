@@ -18,7 +18,7 @@ pub use question::{
 };
 
 /// The exact protocol this build speaks.
-pub const PROTO: u32 = 45;
+pub const PROTO: u32 = 46;
 
 /// Ordinary payloads leave 4 KiB per reserved control slot for cancellation.
 #[derive(Clone, Copy)]
@@ -557,26 +557,48 @@ impl Body {
         }
     }
 
-    /// Every reference the entry holds outside the log: what its `held`
-    /// fields list, a tool outcome held as a blob (logged, replaced by a
-    /// `post_tool` decision, a child's, or carried by an envelope), input
-    /// pasted or attached by reference, and engine-private context roots a child is spawned with. A collector
-    /// follows those roots through `publication::ContextNode::blobs`; fetching
-    /// payloads additionally checks the effective projection.
-    pub fn blobs(&self) -> Vec<Held> {
-        let mut found = Vec::new();
-        match self {
+    /// Source cuts retained by admitted work, including queued side-turn input.
+    /// A collector follows these ordinary log prefixes recursively before their blobs.
+    pub fn cuts(&self) -> Vec<publication::LogCut> {
+        let image = match self {
+            Self::Link { intent, .. } | Self::Spawned { intent } => {
+                publication::SpawnImage::from_json(intent)
+                    .ok()
+                    .map(|image| image.image)
+            }
             Self::ModelCall {
                 request: Some(request),
                 ..
-            } => {
-                if let Ok(thread) = publication::ThreadImage::from_json(request)
-                    && let Ok(spawn) = publication::SpawnImage::from_json(&thread.authority)
-                    && let Some(root) = spawn.image.root
-                {
-                    found.push(Held::Blob(root));
-                }
-            }
+            } => publication::ThreadImage::from_json(request)
+                .ok()
+                .and_then(|thread| publication::SpawnImage::from_json(&thread.authority).ok())
+                .map(|image| image.image),
+            Self::Enqueue { envelope } => match envelope.payload() {
+                Carried::Message(text) => serde_json::from_str::<Json>(text)
+                    .ok()
+                    .and_then(|input| publication::ThreadInput::from_json(&input).ok())
+                    .map(|input| input.context),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(image) = image else {
+            return Vec::new();
+        };
+        let mut cuts: Vec<_> = image.source.into_iter().collect();
+        if let Some(presentation) = image.presentation
+            && !cuts.contains(&presentation)
+        {
+            cuts.push(presentation);
+        }
+        cuts
+    }
+
+    /// Payload references held outside the log. Inherited payloads are resolved
+    /// through retained source-log cuts, not stored as context attachments.
+    pub fn blobs(&self) -> Vec<Held> {
+        let mut found = Vec::new();
+        match self {
             Self::ToolResult { outcome, held, .. } => {
                 found.extend(held.iter().cloned());
                 outcome_blob(outcome, &mut found);
@@ -588,14 +610,6 @@ impl Body {
             Self::Fired { outcome, .. } => outcome_blob(outcome, &mut found),
             Self::Enqueue { envelope } => envelope_blobs(envelope, &mut found),
             Self::Input { segments, .. } => segment_blobs(segments, &mut found),
-            // A malformed image is refused where the child is restored.
-            Self::Link { intent, .. } | Self::Spawned { intent } => {
-                if let Ok(image) = publication::SpawnImage::from_json(intent)
-                    && let Some(root) = image.image.root
-                {
-                    found.push(Held::Blob(root));
-                }
-            }
             _ => {}
         }
         found
@@ -2553,30 +2567,23 @@ mod tests {
         }
     }
 
-    /// What a child is spawned with references what its parent's entries
-    /// did: the sweep keeps it, and no projection names it on the actor.
     #[test]
-    fn a_spawn_image_lists_the_blobs_its_context_holds() {
-        use publication::{RunnerKind, SpawnImage};
-        let blob = BlobRef {
-            id: BlobId([0x5a; 32]),
-            size: 1,
-            media_type: "text/plain".into(),
-            origin: BlobOrigin::ToolOutput(CallId::new(1).unwrap()),
-        };
-        let image = SpawnImage {
-            runner: RunnerKind::Agent,
+    fn inherited_log_cuts_are_not_blob_attachments() {
+        let image = publication::SpawnImage {
+            runner: publication::RunnerKind::Agent,
             authority: Json::null(),
-            image: publication::ContextImage {
-                runner: RunnerKind::Agent,
-                root: Some(blob.clone()),
-                publications: publication::Publications::default(),
+            image: publication::ContextCut {
+                source: Some(publication::LogCut {
+                    session: SessionId::new(),
+                    through: Seq::new(1).unwrap(),
+                }),
+                ..Default::default()
             },
         };
         let spawned = Body::Spawned {
             intent: image.to_json().unwrap(),
         };
-        assert_eq!(spawned.blobs(), [Held::Blob(blob)]);
+        assert_eq!(spawned.blobs(), []);
     }
 
     /// A tool's outcome is in its line or in a blob, and only a tool's is

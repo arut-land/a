@@ -2011,6 +2011,7 @@ fn bounded_owner_context_keeps_presentations_excluded_from_the_thread() {
         .unwrap()
         .with(&TitleHistory(Arc::clone(&captured)))
         .unwrap();
+    let installed = registry.installed();
     let dir = tempfile::tempdir().unwrap();
     let fixture = Fixture::on(
         Arc::new(crate::store::Jsonl::open(dir.path()).unwrap()),
@@ -2021,7 +2022,7 @@ fn bounded_owner_context_keeps_presentations_excluded_from_the_thread() {
             ..openai(&Script::new(&[]))
         },
     );
-    let session = fixture.start(&[]);
+    let session = fixture.start(&[entry(1, Body::Extensions { installed })]);
     session.submit("Call the tool, then answer.").unwrap();
     settle(&session);
     session.submit("/title after the tool").unwrap();
@@ -2068,7 +2069,10 @@ fn bounded_owner_context_keeps_presentations_excluded_from_the_thread() {
     let (_, prefix) = ext::ModelTurn::from_intent(input.turn.raw()).unwrap();
     session.halt();
     std::fs::remove_file(dir.path().join(session.id.to_string()).join("log.jsonl")).unwrap();
-    assert!(fixture.0.store.prefix(session.id, 1).is_err());
+    assert!(
+        fixture.0.store.prefix(session.id, 1).is_ok(),
+        "the retained source survives removal of its visible name"
+    );
     assert!(prefix.is_some());
     let cold = rt::block_on(thread.session.thread_context(&key, input.context, Some(2))).unwrap();
     assert!(

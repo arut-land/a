@@ -1,7 +1,7 @@
 //! Compiler checkpoints cross a spawn; mutable transcript and execution state do not.
 
 use super::{Actor, Arc, Body, CallId, Entry, FrameLog, Json, Registry, Transcript};
-use ext::blob::Places;
+use crate::context::Source;
 use std::io;
 
 pub(super) fn scope(registry: &Registry) -> Json {
@@ -18,7 +18,7 @@ pub(super) fn scope(registry: &Registry) -> Json {
 }
 
 pub(crate) struct Seed {
-    pub(crate) root: protocol::BlobId,
+    pub(crate) root: protocol::publication::LogCut,
     pub(crate) prefix: llm::Prefix,
     pub(crate) tail: llm::Messages,
 }
@@ -37,12 +37,12 @@ pub(super) struct Projection {
 impl Actor {
     pub(super) async fn fork_seed(
         &mut self,
-        image: &protocol::publication::ContextImage,
+        image: &protocol::publication::ContextCut,
         call: CallId,
         registry: Arc<Registry>,
         model: &super::Model,
     ) -> io::Result<Option<Seed>> {
-        let Some(root) = image.root.as_ref().map(|root| root.id) else {
+        let Some(root) = image.source else {
             return Ok(None);
         };
         let scope = scope(&registry);
@@ -54,7 +54,10 @@ impl Actor {
             .map_or(0, |seq| seq.get() - 1);
         let frames = Arc::clone(&self.live.frames);
         let pending: Vec<_> = self.pending_entries().collect();
-        let places = self.live.session.blobs.places();
+        let places = Source::new(
+            Arc::clone(&self.live.session.shared.store),
+            self.live.session.blobs.places(),
+        );
         let active = self
             .projection
             .model
@@ -132,7 +135,7 @@ impl Projection {
         pending: &[Entry],
         stable: u64,
         registry: &Arc<Registry>,
-        places: &Places,
+        places: &Source,
         model: &super::Model,
     ) -> io::Result<Option<llm::Prefix>> {
         let suffix = entries(frames, pending, self.transcript.through(), stable)?;
@@ -209,7 +212,7 @@ fn replay(
     pending: &[Entry],
     through: u64,
     registry: &Arc<Registry>,
-    places: &Places,
+    places: &Source,
 ) -> io::Result<Transcript> {
     let entries = entries(frames, pending, 0, through)?;
     Transcript::replay(

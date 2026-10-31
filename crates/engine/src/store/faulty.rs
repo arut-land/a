@@ -158,6 +158,10 @@ impl Faulty {
 }
 
 impl LogStore for Faulty {
+    fn retain(&self, cut: protocol::publication::LogCut) -> io::Result<()> {
+        self.inner.retain(cut)
+    }
+
     fn create(&self, header: &Header) -> io::Result<Loaded> {
         let loaded = self.inner.create(header)?;
         Ok(self.wrap(header.id, loaded))

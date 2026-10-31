@@ -5,6 +5,7 @@ use super::{
 };
 use crate::store::Header;
 use ext::{DepthBudget, SpawnRefusal};
+use serde::de::IgnoredAny;
 use std::io;
 
 #[cfg(test)]
@@ -21,13 +22,37 @@ pub(crate) struct SpawnIntent {
     pub model: String,
     pub routing: Result<crate::model::FrozenRoute, String>,
     pub installed: Vec<protocol::Installed>,
-    pub image: protocol::publication::ContextImage,
+    pub image: protocol::publication::ContextCut,
     pub extensions: Vec<String>,
     pub settings: ext::Checkpoint,
     pub refusal: Option<SpawnRefusal>,
 }
 
 impl SpawnIntent {
+    pub(crate) fn description(
+        json: &Json,
+    ) -> Result<(std::time::SystemTime, ext::Spawn), serde_json::Error> {
+        // Conversation metadata does not interpret context or execution authority.
+        type Description = (
+            IgnoredAny,
+            (
+                IgnoredAny,
+                std::time::SystemTime,
+                IgnoredAny,
+                Json,
+                IgnoredAny,
+                IgnoredAny,
+                IgnoredAny,
+                IgnoredAny,
+                IgnoredAny,
+                IgnoredAny,
+            ),
+            IgnoredAny,
+        );
+        let (_, (_, admitted_at, _, request, _, _, _, _, _, _), _) = json.parse::<Description>()?;
+        Ok((admitted_at, ext::Spawn::from_json(&request)?))
+    }
+
     pub(crate) fn into_json(self) -> Result<Json, serde_json::Error> {
         protocol::publication::SpawnImage {
             runner: if matches!(self.request.runner, ext::Runner::ModelOnly { .. }) {
@@ -346,7 +371,7 @@ impl Actor {
             .models
             .model(&session.workspace, env.as_deref(), &model)
             .map(|m| m.freeze());
-        let mut image = protocol::publication::ContextImage::default();
+        let mut image = protocol::publication::ContextCut::default();
         let installed = registry.installed();
         match request.placement {
             ext::Placement::Here => {}

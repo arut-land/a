@@ -431,8 +431,7 @@ pub enum Open {
 struct Session {
     services: Arc<SessionServices>,
     spawn: Mutex<Option<spawn::SpawnIntent>>,
-    context_cuts: Mutex<crate::context::Cuts>,
-    presentation: Mutex<crate::context::Presentation>,
+    context_head: Mutex<crate::context::Cursor>,
     child_owners: Mutex<ChildOwners>,
     incoming_prefix: Mutex<Option<prefix::Seed>>,
     input_registries: Mutex<std::collections::HashMap<protocol::EnvelopeId, Arc<Registry>>>,
@@ -753,7 +752,10 @@ impl Live {
         let image = lock(&self.session.spawn)
             .as_ref()
             .map(|spawn| spawn.image.clone());
-        let places = self.session.blobs.places();
+        let places = crate::context::Source::new(
+            Arc::clone(&self.session.shared.store),
+            self.session.blobs.places(),
+        );
         rt::unblock(&*self.session.shared.rt, move || {
             if frames.references(&blob)? {
                 return Ok(true);
@@ -2937,8 +2939,8 @@ impl Actor {
             .expect("committed spawn intent");
         let seed = spawn::SpawnIntent::from_json(&intent)
             .ok()
-            .and_then(|intent| intent.image.root)
-            .and_then(|root| self.projection.model.seeds.get_mut(&root.id))
+            .and_then(|intent| intent.image.source)
+            .and_then(|root| self.projection.model.seeds.get_mut(&root))
             .and_then(Vec::pop);
         let env = lock(&self.live.session.env).clone();
         if let Some(daemon) = shared.daemon.upgrade() {
@@ -3473,8 +3475,7 @@ impl Session {
                 }
             }),
             spawn: Mutex::default(),
-            context_cuts: Mutex::default(),
-            presentation: Mutex::default(),
+            context_head: Mutex::default(),
             child_owners: Mutex::default(),
             input_registries: Mutex::default(),
             incoming_prefix: Mutex::default(),

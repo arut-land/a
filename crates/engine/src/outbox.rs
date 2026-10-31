@@ -138,10 +138,8 @@ impl FrameLog {
                         .blobs()
                         .into_iter()
                         .filter_map(|held| match held {
-                            Held::Blob(blob) if blob.origin != protocol::BlobOrigin::Context => {
-                                Some(blob.id)
-                            }
-                            Held::Blob(_) | Held::Stream(_) => None,
+                            Held::Blob(blob) => Some(blob.id),
+                            Held::Stream(_) => None,
                         }),
                 );
             }

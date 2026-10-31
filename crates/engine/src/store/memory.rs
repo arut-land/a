@@ -51,6 +51,11 @@ impl Memory {
 }
 
 impl LogStore for Memory {
+    fn retain(&self, _cut: protocol::publication::LogCut) -> io::Result<()> {
+        // This backend owns every log for its entire lifetime.
+        Ok(())
+    }
+
     fn create(&self, header: &Header) -> io::Result<Loaded> {
         let mut sessions = lock(&self.sessions);
         if sessions.contains_key(&header.id) {

@@ -1,6 +1,7 @@
 //! Named model context is recorded with its identity in the same sealed line.
 
-use crate::{BlobRef, Body, CallId, Entry, Json, Mode, Segments, Seq};
+use crate::{Body, CallId, Entry, Json, Mode, Segments, Seq, SessionId};
+use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -24,64 +25,37 @@ pub enum RunnerKind {
 pub struct SpawnImage {
     pub runner: RunnerKind,
     pub authority: Json,
-    pub image: ContextImage,
+    pub image: ContextCut,
 }
 
-/// An immutable context cut. Payload nodes belong to the daemon's content store.
+/// The immutable prefix of an ordinary conversation log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct LogCut {
+    pub session: SessionId,
+    pub through: Seq,
+}
+
+/// Context authority references source facts, never a second transcript representation.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContextImage {
+pub struct ContextCut {
     pub runner: RunnerKind,
-    pub root: Option<BlobRef>,
+    pub source: Option<LogCut>,
+    pub presentation: Option<LogCut>,
     pub publications: Publications,
 }
 
-/// A newly frozen local segment; preceding segments and inherited cuts stay shared.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ContextNode {
-    pub previous: Option<BlobRef>,
-    pub presentation: Option<BlobRef>,
-    pub runner: RunnerKind,
-    pub inputs: Vec<ContextInput>,
-    pub inherited: Vec<ContextImage>,
-    pub edits: Vec<(u64, u64, Option<String>)>,
-}
-
-impl ContextNode {
-    pub fn from_json(bytes: &[u8]) -> serde_json::Result<Self> {
-        let node: Self = serde_json::from_slice(bytes)?;
-        let mut position = 0;
-        for ContextInput(seq, value) in &node.inputs {
-            if seq.get() <= position {
-                return Err(serde::de::Error::custom("invalid context position"));
-            }
-            position = seq.get();
-            if let ContextValue::Inherited(child) = value
-                && *child >= node.inherited.len()
-            {
-                return Err(serde::de::Error::custom("invalid inherited cut"));
-            }
-        }
-        Ok(node)
-    }
-
-    pub fn to_json(&self) -> serde_json::Result<Json> {
-        Json::encode(self)
-    }
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default)]
 pub struct ContextLayer(pub RunnerKind, pub Vec<ContextInput>);
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct ContextInput(pub Seq, pub ContextValue);
 
-/// Only projection facts can cross this boundary; no executable ledger is copied.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Transient projection inputs; durable context contains only ordinary log references.
+#[derive(Clone, Debug)]
 pub enum ContextValue {
     /// An unprojected position can still be the anchor of a later edit.
     Position,
     Inherited(usize),
-    Presentation(Json),
     User(String),
     /// Input waiting to be taken up, as it was given: how a model reads
     /// it depends on who takes it.
@@ -112,7 +86,7 @@ pub enum ContextValue {
 }
 
 impl ContextValue {
-    /// Payload references in a projection fact, excluding engine-private graph edges.
+    /// Payload references in a projected log fact.
     pub fn blobs(&self) -> Vec<crate::Held> {
         let mut found = Vec::new();
         match self {
@@ -125,7 +99,6 @@ impl ContextValue {
             Self::Job(_, _, held) => found.extend(held.iter().cloned()),
             Self::Position
             | Self::Inherited(_)
-            | Self::Presentation(_)
             | Self::User(_)
             | Self::Inbox(..)
             | Self::Taken(_)
@@ -141,28 +114,6 @@ impl ContextValue {
     }
 }
 
-impl ContextNode {
-    /// Direct content-store edges; a collector follows context nodes transitively.
-    pub fn blobs(&self) -> Vec<crate::Held> {
-        self.previous
-            .iter()
-            .chain(self.presentation.iter())
-            .chain(
-                self.inherited
-                    .iter()
-                    .filter_map(|image| image.root.as_ref()),
-            )
-            .cloned()
-            .map(crate::Held::Blob)
-            .chain(
-                self.inputs
-                    .iter()
-                    .flat_map(|ContextInput(_, value)| value.blobs()),
-            )
-            .collect()
-    }
-}
-
 /// Execution identity belongs to the owner, never to copied audit history.
 #[derive(Clone)]
 pub struct ThreadImage {
@@ -173,7 +124,7 @@ pub struct ThreadImage {
 /// One side input names its frozen owner cut; thread authority is admitted separately.
 pub struct ThreadInput {
     pub turn: Json,
-    pub context: ContextImage,
+    pub context: ContextCut,
 }
 
 impl ThreadInput {
@@ -199,7 +150,7 @@ impl ThreadImage {
 
 impl SpawnImage {
     pub fn from_json(json: &Json) -> Result<Self, serde_json::Error> {
-        let (runner, authority, image): (RunnerKind, Json, ContextImage) = json.parse()?;
+        let (runner, authority, image): (RunnerKind, Json, ContextCut) = json.parse()?;
         let image = Self {
             runner,
             authority,
@@ -215,12 +166,18 @@ impl SpawnImage {
 
 impl Publications {
     pub fn apply(&mut self, entry: &Entry) {
+        // Public folds need identities, not execution or source authority.
+        #[derive(Deserialize)]
+        struct InheritedPublications {
+            publications: Publications,
+        }
         if let Body::Spawned { intent } = &entry.body
-            && let Ok(image) = SpawnImage::from_json(intent)
+            && let Ok((_, _, image)) =
+                intent.parse::<(IgnoredAny, IgnoredAny, InheritedPublications)>()
         {
             self.0.insert(
                 entry.seq.get(),
-                image.image.publications.0.into_values().flatten().collect(),
+                image.publications.0.into_values().flatten().collect(),
             );
         }
         if let Body::Edit { target, upto, .. } = &entry.body {
@@ -285,7 +242,3 @@ mod tests {
         }
     }
 }
-
-#[cfg(test)]
-#[path = "publication/context_tests.rs"]
-mod context_tests;

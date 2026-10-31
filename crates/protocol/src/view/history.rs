@@ -288,7 +288,7 @@ impl Index {
                     page.end = page.end.max(index + 1);
                 }
             }
-            let bytes = if selected {
+            let bytes = if selected && page.fragment.is_none() {
                 serde_json::to_vec(&item).map_err(io::Error::other)?.len()
             } else {
                 0
@@ -614,7 +614,7 @@ mod tests {
     fn public_heads_never_carry_internal_envelope_payloads() {
         let mut index = Index::new(SessionId::new(), HostPath::default());
         let entry = Entry::from_json(include_bytes!(
-            "../../../../fixtures/wire/v40/daemon/entry_thread_input.json"
+            "../../../../fixtures/wire/v46/daemon/entry_thread_input.json"
         ))
         .unwrap();
         index.apply(&entry);
@@ -623,7 +623,7 @@ mod tests {
         let encoded = serde_json::to_string(&head).unwrap();
         assert!(!encoded.contains("published context"));
         assert!(!encoded.contains("publications"));
-        assert!(!encoded.contains("application/vnd.a.context"));
+        assert!(!encoded.contains("\"through\""));
     }
 
     #[test]

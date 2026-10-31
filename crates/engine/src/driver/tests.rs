@@ -591,6 +591,10 @@ impl Log for Probed {
 }
 
 impl LogStore for Probe {
+    fn retain(&self, cut: protocol::publication::LogCut) -> io::Result<()> {
+        self.store.retain(cut)
+    }
+
     fn read_snapshot(&self, id: SessionId, covers: u64) -> Option<Snapshot> {
         lock(&self.snapshot_reads).push(covers);
         self.store.read_snapshot(id, covers)

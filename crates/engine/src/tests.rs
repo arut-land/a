@@ -458,7 +458,7 @@ pub(crate) fn spawn_intent(call: u64, prompt: &str) -> Json {
         installed: extensions(&ext_policy::Policy::default())
             .unwrap()
             .installed(),
-        image: protocol::publication::ContextImage::default(),
+        image: protocol::publication::ContextCut::default(),
         extensions: extensions(&ext_policy::Policy::default())
             .unwrap()
             .inherited()
@@ -1881,7 +1881,8 @@ fn a_prefix_child_is_admitted_inside_its_unfinished_owning_turn() {
         std::sync::Arc::clone(&daemon.shared.blobs),
         std::sync::Arc::clone(&daemon.shared.tree),
     );
-    let layers = crate::context::expand(&image.image, &places).unwrap();
+    let layers =
+        crate::context::expand(&image.image, &crate::context::Source::from(&places)).unwrap();
     assert!(layers.iter().flat_map(|layer| &layer.1).any(
         |e| matches!(&e.1, protocol::publication::ContextValue::User(text) if text == "before")
     ));

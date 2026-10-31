@@ -184,9 +184,13 @@ that holds one does not decode. What an envelope carries is typed
 fixes the purpose it is sent under and where it comes from: one under
 another payload's purpose does not decode. A child's result held as a blob
 is read back for its parent as a tool's is. `Body::blobs` lists every
-reference an entry holds, wherever in it, a spawn's context image included:
-what a projection must not name on the session's actor, and what a sweep
-keeps. Tool result images are held blob references; their bytes are loaded
+payload reference an entry holds: what a projection must not name on the
+session's actor, and what a sweep keeps. Inherited context names retained
+ordinary session-log cuts, not blobs; `Body::cuts` supplies their recursive
+retention edges. JSONL pins those files under `sessions/retained/<id>.jsonl`
+before admission. These durable names share the source file's bytes and stay
+outside catalog discovery. Readers stop at their frozen sequence and preserve
+the admitted presentation generation from logged extension/spawn facts. Tool result images are held blob references; their bytes are loaded
 outside the session actor and projected as `llm::Source::Bytes`, becoming
 base64 only at the provider codec boundary. PNG/JPEG/WebP held blobs become
 image parts alongside existing media. Models that accept images inside tool
@@ -594,7 +598,7 @@ changed heads and live deltas. Committed transcript data arrives only through
 `History` requests at stable session/generation/log cuts, as chunked immutable
 pages. A log-derived fact/ordinal index replaces the full-view far-attach cache;
 clients retain their requested ranges rather than the whole transcript. Internal
-spawn authority and context images never enter the public head or pages. `Query { id, service, scope, body }` is
+spawn authority and retained context cuts never enter the public head or pages. `Query { id, service, scope, body }` is
 answered by `Update`s, if it streams, then exactly one `Reply { id,
 outcome }`, on any connection, attached or not; `Cancel { id }` makes the
 reply interrupted. `Fetch { id, session, blob, offset, len }` shares the
@@ -646,6 +650,8 @@ Do not treat a historical result as a current budget pass.
   memory and commit costs for the two durability settings.
 - [Lua](perf/lua.md): runtime choice, optional-build cost and sandbox budgets.
 - [Skills](perf/skills.md): frontmatter parser comparison and shipped size.
+- [Retained log cuts](perf/log-cuts.md): ordinary source-log retention,
+  inherited projection invariants and the interleaved release comparison.
 
 `mise run size` checks shipped bytes and fixture exclusion. `budgets` checks
 cold first reply, attach latency, idle RSS and quiet shell execution on an

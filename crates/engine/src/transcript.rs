@@ -28,7 +28,7 @@ pub struct Transcript {
     /// the context before it.
     context: usize,
     context_encoded: bool,
-    seeded_root: Option<protocol::BlobId>,
+    seeded_root: Option<protocol::publication::LogCut>,
     context_cut: Option<u64>,
     /// The model's id and the tool of each call the model made and that is
     /// not yet answered, by seq.
@@ -54,7 +54,7 @@ pub struct Transcript {
     through: u64,
     registry: Arc<Registry>,
     /// How references are named for the model.
-    places: Places,
+    places: crate::context::Source,
     /// Streams awaiting their final detached or job completion.
     streams: HashMap<CallId, OutputStream>,
 }
@@ -307,7 +307,7 @@ impl Transcript {
             },
             registry,
             system,
-            &Places::default(),
+            crate::context::Source::default(),
         )
         .expect("in-memory transcript replay cannot fail")
     }
@@ -322,7 +322,7 @@ impl Transcript {
         entries: &[Entry],
         registry: Arc<Registry>,
         system: &str,
-        places: &Places,
+        places: impl Into<crate::context::Source>,
     ) -> io::Result<Self> {
         Self::replay(
             |each| {
@@ -338,17 +338,18 @@ impl Transcript {
     }
 
     pub(super) fn cut(
-        image: &protocol::publication::ContextImage,
+        image: &protocol::publication::ContextCut,
         registry: Arc<Registry>,
         system: &str,
-        places: &Places,
+        places: impl Into<crate::context::Source>,
         exchanges: Option<u16>,
     ) -> io::Result<Self> {
+        let places = places.into();
         let layers = match exchanges {
-            Some(exchanges) => crate::context::expand_bounded(image, places, exchanges)?,
-            None => crate::context::expand(image, places)?,
+            Some(exchanges) => crate::context::expand_bounded(image, &places, exchanges)?,
+            None => crate::context::expand(image, &places)?,
         };
-        Ok(project(layers, registry, system, places))
+        Ok(project(layers, registry, system, &places))
     }
 
     /// Replays a stable history twice, retaining edits and background call identities between passes.
@@ -356,7 +357,7 @@ impl Transcript {
         entries: impl FnMut(&mut dyn FnMut(&Entry)) -> io::Result<()>,
         registry: Arc<Registry>,
         system: &str,
-        places: &Places,
+        places: impl Into<crate::context::Source>,
     ) -> io::Result<Self> {
         Self::replay_bounded(entries, registry, system, places, None)
     }
@@ -365,9 +366,10 @@ impl Transcript {
         mut entries: impl FnMut(&mut dyn FnMut(&Entry)) -> io::Result<()>,
         registry: Arc<Registry>,
         system: &str,
-        places: &Places,
+        places: impl Into<crate::context::Source>,
         context_exchanges: Option<u16>,
     ) -> io::Result<Self> {
+        let places = places.into();
         let mut edits = Vec::new();
         let mut background = HashSet::new();
         let mut jobs = HashSet::new();
@@ -395,7 +397,7 @@ impl Transcript {
             }
         })?;
         let edits = Edits::new(edits);
-        let mut transcript = Self::empty(registry, system, places);
+        let mut transcript = Self::empty(registry, system, &places);
         transcript.context_exchanges = context_exchanges;
         entries(&mut |entry| {
             transcript.through = entry.seq.get();
@@ -425,7 +427,12 @@ impl Transcript {
         Ok(transcript)
     }
 
-    pub(crate) fn empty(registry: Arc<Registry>, system: &str, places: &Places) -> Self {
+    pub(crate) fn empty(
+        registry: Arc<Registry>,
+        system: &str,
+        places: impl Into<crate::context::Source>,
+    ) -> Self {
+        let places = places.into();
         let messages = Messages::from_iter((!system.is_empty()).then(|| Message::system(system)));
         Self {
             context: messages.len(),
@@ -476,9 +483,10 @@ impl Transcript {
 
     pub(crate) fn seeded(
         registry: Arc<Registry>,
-        places: &Places,
+        places: impl Into<crate::context::Source>,
         seed: crate::driver::prefix::Seed,
     ) -> Self {
+        let places = places.into();
         let mut transcript = Self::empty(registry, "", places);
         transcript.resident = seed.prefix.into();
         transcript.messages = seed.tail;
@@ -491,10 +499,11 @@ impl Transcript {
         entries: &[Entry],
         registry: Arc<Registry>,
         system: &str,
-        places: &Places,
+        places: impl Into<crate::context::Source>,
         seed: crate::driver::prefix::Seed,
     ) -> io::Result<Self> {
-        let mut transcript = Self::seeded(Arc::clone(&registry), places, seed);
+        let places = places.into();
+        let mut transcript = Self::seeded(Arc::clone(&registry), &places, seed);
         if entries.iter().all(|entry| transcript.apply(entry, None)) {
             return Ok(transcript);
         }
@@ -507,7 +516,7 @@ impl Transcript {
             },
             registry,
             system,
-            places,
+            &places,
         )
     }
 
@@ -518,8 +527,8 @@ impl Transcript {
         if let (Some(root), Body::Spawned { intent }) = (self.seeded_root, &e.body) {
             if protocol::publication::SpawnImage::from_json(intent)
                 .ok()
-                .and_then(|spawn| spawn.image.root)
-                .is_none_or(|image| image.id != root)
+                .and_then(|spawn| spawn.image.source)
+                .is_none_or(|image| image != root)
             {
                 return false;
             }
@@ -661,7 +670,7 @@ impl Transcript {
             ContextValue::ToolResult(call, outcome, held) => {
                 return self.answer(seq, call, &outcome, &held);
             }
-            ContextValue::Presentation(_) | ContextValue::Inherited(_) | ContextValue::Position => {
+            ContextValue::Inherited(_) | ContextValue::Position => {
                 return;
             }
         };
@@ -1007,7 +1016,7 @@ fn project(
     image: Vec<ContextLayer>,
     registry: Arc<Registry>,
     system: &str,
-    places: &Places,
+    places: &crate::context::Source,
 ) -> Transcript {
     let mut inherited = HashMap::new();
     for (scope, ContextLayer(runner, inputs)) in image.into_iter().enumerate().rev() {
@@ -1248,7 +1257,7 @@ mod tests {
                 inputs(runner),
                 Arc::new(Registry::default()),
                 "",
-                &Places::default(),
+                &crate::context::Source::default(),
             );
             said(&transcript.into_messages())
         };

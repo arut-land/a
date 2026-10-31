@@ -12,6 +12,100 @@ use protocol::{Body, Decode, Entry, Epoch, Json, ReadOnly, Seq, SessionId};
 use super::jsonl::{FORMAT, seal, unseal};
 use super::*;
 
+#[test]
+fn frozen_reads_cross_buffer_boundaries_without_skipping_or_reordering_facts() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Jsonl::open(dir.path()).unwrap();
+    let header = Header {
+        id: SessionId::new(),
+        workspace: dir.path().into(),
+        parent: None,
+    };
+    let mut loaded = store.create(&header).unwrap();
+    let expected: Vec<_> = (1..=200)
+        .map(|seq| {
+            let text = format!(
+                "{seq}:{}",
+                "x".repeat(if seq % 17 == 0 { 128 * 1024 } else { 64 })
+            );
+            loaded.append(Body::Assistant { text }).unwrap()
+        })
+        .collect();
+    let cut = protocol::publication::LogCut {
+        session: header.id,
+        through: Seq::new(173).unwrap(),
+    };
+    store.retain(cut).unwrap();
+    assert_eq!(
+        store
+            .cut(cut)
+            .unwrap()
+            .collect::<io::Result<Vec<_>>>()
+            .unwrap(),
+        expected[..173].iter().rev().cloned().collect::<Vec<_>>()
+    );
+    assert_eq!(store.prefix(header.id, 200).unwrap(), expected);
+}
+
+#[test]
+fn reading_unreferenced_logs_never_publishes_retention_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Jsonl::open(dir.path()).unwrap();
+    let header = Header {
+        id: SessionId::new(),
+        workspace: dir.path().into(),
+        parent: None,
+    };
+    let mut loaded = store.create(&header).unwrap();
+    let entry = loaded
+        .append(Body::Assistant {
+            text: "ordinary log".into(),
+        })
+        .unwrap();
+    drop((loaded, store));
+    let store = Jsonl::open(dir.path()).unwrap();
+    let cut = protocol::publication::LogCut {
+        session: header.id,
+        through: entry.seq,
+    };
+    assert_eq!(store.cut(cut).unwrap().next().unwrap().unwrap(), entry);
+    assert!(!dir.path().join("retained").exists());
+}
+
+#[test]
+fn a_source_cut_is_retained_before_its_child_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Jsonl::open(dir.path()).unwrap();
+    let header = Header {
+        id: SessionId::new(),
+        workspace: dir.path().into(),
+        parent: None,
+    };
+    let mut loaded = store.create(&header).unwrap();
+    let entry = loaded
+        .append(Body::Assistant {
+            text: "frozen".into(),
+        })
+        .unwrap();
+    let cut = protocol::publication::LogCut {
+        session: header.id,
+        through: entry.seq,
+    };
+    store.retain(cut).unwrap();
+    drop((loaded, store));
+    fs::remove_dir_all(dir.path().join(header.id.to_string())).unwrap();
+    let store = Jsonl::open(dir.path()).unwrap();
+    assert_eq!(store.headers().unwrap(), []);
+    assert_eq!(
+        store
+            .cut(cut)
+            .unwrap()
+            .collect::<io::Result<Vec<_>>>()
+            .unwrap(),
+        [entry]
+    );
+}
+
 /// A fresh store, and the directory to remove once the test is done.
 struct Fixture {
     store: Box<dyn LogStore>,
@@ -695,7 +789,10 @@ fn jsonl_files_are_a_header_line_then_one_line_per_entry() {
     expected.extend(sealed(&written));
     assert_eq!(fs::read(&path).unwrap(), expected);
     let header = String::from_utf8(expected).unwrap();
-    assert!(header.starts_with(r#"{"format":1,"id":""#), "{header}");
+    assert!(
+        header.starts_with(format!(r#"{{"format":{FORMAT},"id":""#).as_str()),
+        "{header}"
+    );
     assert!(
         header
             .lines()

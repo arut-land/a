@@ -1820,9 +1820,10 @@ fn inherited_publications() -> Entry {
             },
         ));
     }
-    let inherited = protocol::publication::ContextImage {
+    let inherited = protocol::publication::ContextCut {
         runner: protocol::publication::RunnerKind::Agent,
-        root: None,
+        source: None,
+        presentation: None,
         publications,
     };
 

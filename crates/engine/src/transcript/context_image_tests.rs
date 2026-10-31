@@ -1,6 +1,6 @@
 use super::*;
 use protocol::{Epoch, Json, Mode, SessionId};
-fn spawn_image(image: protocol::publication::ContextImage) -> Json {
+fn spawn_image(image: protocol::publication::ContextCut) -> Json {
     let intent = crate::tests::spawn_intent(1, "");
     let mut intent = crate::driver::spawn::SpawnIntent::from_json(&intent).unwrap();
     intent.image = image;
@@ -488,7 +488,7 @@ fn recorded_provider_cases() -> [(llm::Provider, &'static str); 4] {
 }
 
 #[test]
-fn incremental_graph_cuts_preserve_provider_bytes_across_segment_edits() {
+fn frozen_log_cuts_preserve_provider_bytes_across_edits() {
     for (provider, cassette) in recorded_provider_cases() {
         let response = recorded_response(&provider, cassette);
         let entries = [
@@ -530,7 +530,7 @@ fn incremental_graph_cuts_preserve_provider_bytes_across_segment_edits() {
                     &cut,
                     Arc::clone(&registry),
                     "",
-                    &crate::context::test_places(),
+                    crate::context::test_places(),
                     None,
                 )
                 .unwrap()
@@ -677,7 +677,13 @@ fn identical_local_sequences_and_provider_ids_remain_in_their_scopes() {
             ),
         ]
     };
-    let mut entries = exchange("ancestor answer");
+    let mut entries = vec![entry(
+        1,
+        Body::Extensions {
+            installed: Vec::new(),
+        },
+    )];
+    entries.extend(exchange("ancestor answer"));
     let mut expected = Transcript::of(&entries, registry.clone(), "").into_context();
     for text in ["child answer", "grandchild answer"] {
         let mut child = vec![entry(
@@ -851,7 +857,7 @@ fn batch_replay_preserves_inherited_layers_and_latest_overlapping_edits() {
         },
         Arc::new(Registry::default()),
         "system",
-        &Places::default(),
+        crate::context::Source::default(),
     )
     .unwrap();
     assert_eq!(passes, 2);
@@ -982,7 +988,7 @@ fn measure_reconstruction(pipeline: Reconstruction) {
             crate::context::expand(&image, &crate::context::test_places()).unwrap(),
             Arc::clone(&registry),
             "",
-            &Places::default(),
+            &crate::context::Source::default(),
         );
         elapsed += start.elapsed();
         sampled_peak = sampled_peak.max(resident_kib());
@@ -1000,7 +1006,7 @@ fn measure_reconstruction(pipeline: Reconstruction) {
             },
             Arc::clone(&registry),
             "",
-            &Places::default(),
+            crate::context::Source::default(),
         )
         .unwrap();
         elapsed += start.elapsed();
@@ -1051,14 +1057,27 @@ fn forked_provider_bytes_need_no_projection_of_their_settled_ancestry() {
         );
         let registry = Arc::new(Registry::default());
         let source = [taken_text(1, "settled input"), response_entry(2, &response)];
-        let cut = crate::context::append(
-            protocol::publication::ContextImage::default(),
-            source.clone(),
-            &*store,
+        let logs = Arc::new(crate::store::Jsonl::open(dir.path().join("logs")).unwrap());
+        let header = crate::store::Header {
+            id: SessionId::new(),
+            workspace: dir.path().into(),
+            parent: None,
+        };
+        let local = taken_text(3, "owner private tail");
+        crate::store::LogStore::import(
+            &*logs,
+            &header,
+            &[source[0].clone(), source[1].clone(), local.clone()],
         )
         .unwrap();
-        let local = taken_text(3, "owner private tail");
-        let image = crate::context::append(cut, [local.clone()], &*store).unwrap();
+        let places = crate::context::Source::new(logs, places);
+        let image = protocol::publication::ContextCut {
+            source: Some(protocol::publication::LogCut {
+                session: header.id,
+                through: Seq::new(3).unwrap(),
+            }),
+            ..Default::default()
+        };
         let child = [
             entry(
                 1,
@@ -1089,18 +1108,15 @@ fn forked_provider_bytes_need_no_projection_of_their_settled_ancestry() {
             ..llm::Request::default()
         };
         provider.request(&request.model, &request).unwrap();
-        let prefix = request
-            .messages
-            .prefix()
-            .expect("recorded completed prefix");
+        let prefix = request.messages.prefix().expect("recorded prefix");
         let tail = Transcript::placed(&[local], Arc::clone(&registry), "", &places)
             .unwrap()
             .into_context();
-        let root = image.root.as_ref().unwrap().id;
-        std::fs::remove_dir_all(dir.path().join("blobs")).unwrap();
+        let root = image.source.unwrap();
+        std::fs::remove_dir_all(dir.path().join("logs")).unwrap();
         assert!(
             crate::context::expand(&image, &places).is_err(),
-            "the ordinary path must need the removed nodes"
+            "the ordinary path must need the source log"
         );
         let transcript = Transcript::replay_seeded(
             &child,

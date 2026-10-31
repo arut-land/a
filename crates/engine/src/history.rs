@@ -40,15 +40,11 @@ impl Indexed {
         let meta = &mut self.conversation;
         match &entry.body {
             Body::Spawned { intent } | Body::Link { intent, .. } => {
-                if let Ok(spawn) = crate::driver::spawn::SpawnIntent::from_json(intent) {
-                    let agent = spawn
-                        .request
-                        .runner
-                        .agent()
-                        .unwrap_or("model_only")
-                        .to_owned();
-                    let title = spawn
-                        .request
+                if let Ok((admitted_at, request)) =
+                    crate::driver::spawn::SpawnIntent::description(intent)
+                {
+                    let agent = request.runner.agent().unwrap_or("model_only").to_owned();
+                    let title = request
                         .prompt
                         .lines()
                         .next()
@@ -57,8 +53,7 @@ impl Indexed {
                         .take(96)
                         .collect();
                     let admitted = u64::try_from(
-                        spawn
-                            .admitted_at
+                        admitted_at
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_millis(),

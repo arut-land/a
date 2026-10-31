@@ -290,6 +290,24 @@ pub enum ImportStep {
 /// Where session logs live. Each `create` or `load` hands out the log's
 /// writer under a lease newer than every one before.
 pub trait LogStore: Send + Sync {
+    /// Orders retained source names before the referring admission's durability barrier.
+    /// References must be published through this same store's log barriers.
+    fn retain(&self, cut: protocol::publication::LogCut) -> io::Result<()>;
+
+    /// Reads a frozen prefix backwards without acquiring its writer lease.
+    /// The reader owns operation-scoped handles; retained logs remain the source.
+    fn cut(
+        &self,
+        cut: protocol::publication::LogCut,
+    ) -> io::Result<Box<dyn Iterator<Item = io::Result<Entry>> + Send>> {
+        Ok(Box::new(
+            self.prefix(cut.session, cut.through.get())?
+                .into_iter()
+                .rev()
+                .map(Ok),
+        ))
+    }
+
     /// Seeds id lookup from the derived catalog without scanning the directory tree.
     fn locate(&self, _headers: &[Header]) -> io::Result<()> {
         Ok(())

@@ -12,8 +12,8 @@ impl super::Shared {
     pub(super) fn presentation_registry(
         &self,
         workspace: &std::path::Path,
-        cut: &protocol::publication::ContextImage,
-        places: &ext::blob::Places,
+        cut: &protocol::publication::ContextCut,
+        places: &crate::context::Source,
     ) -> io::Result<Arc<ext::host::Registry>> {
         let image: crate::context::PresentationImage = crate::context::presentation(cut, places)?
             .parse()
@@ -62,7 +62,8 @@ pub(super) struct Model {
     pub(super) transcript: Option<Transcript>,
     pub(super) active: Option<super::prefix::Active>,
     pub(super) forks: Option<super::prefix::Projection>,
-    pub(super) seeds: std::collections::BTreeMap<protocol::BlobId, Vec<super::prefix::Seed>>,
+    pub(super) seeds:
+        std::collections::BTreeMap<protocol::publication::LogCut, Vec<super::prefix::Seed>>,
     pub(super) compiler: Option<(std::sync::Weak<ext::host::Registry>, super::Json)>,
 }
 
@@ -361,12 +362,13 @@ impl Actor {
             // goes on from there on a blocking worker; as it does from
             // any entry it stopped short of before.
             if self
-                .projection.model
+                .projection
+                .model
                 .transcript
                 .as_mut()
                 .is_some_and(|transcript| {
                     transcript.through() + 1 == e.seq.get()
-                        && (e.body.blobs().iter().all(|held| matches!(held, protocol::Held::Blob(blob) if blob.origin == protocol::BlobOrigin::Context)))
+                        && e.body.blobs().is_empty()
                         && !transcript.apply(e, replied.map(|(_, m)| m))
                 })
             {
@@ -489,7 +491,10 @@ impl Actor {
             Arc::clone(&self.live.frames),
             &self.registry,
             self.pending_entries().collect(),
-            self.live.session.blobs.places(),
+            crate::context::Source::new(
+                Arc::clone(&self.live.session.shared.store),
+                self.live.session.blobs.places(),
+            ),
             self.live.session.model_only(),
             HistoryCut {
                 through: self.journal.ordered.seq(),
@@ -506,7 +511,10 @@ impl Actor {
     ) -> io::Result<llm::Messages> {
         let cut = self.context_cut(call.get() - 1).await?;
         let registry = Arc::clone(&self.registry);
-        let places = self.live.session.blobs.places();
+        let places = crate::context::Source::new(
+            Arc::clone(&self.live.session.shared.store),
+            self.live.session.blobs.places(),
+        );
         rt::unblock(&*self.live.session.shared.rt, move || {
             Transcript::cut(&cut, registry, "", &places, Some(exchanges))
                 .map(Transcript::into_messages)
@@ -517,17 +525,17 @@ impl Actor {
     pub(super) async fn context_cut(
         &mut self,
         through: u64,
-    ) -> io::Result<protocol::publication::ContextImage> {
+    ) -> io::Result<protocol::publication::ContextCut> {
         let session = Arc::clone(&self.live.session);
         let frames = Arc::clone(&self.live.frames);
         let pending: Vec<_> = self.pending_entries().collect();
         rt::unblock(&*self.live.session.shared.rt, move || {
             #[cfg(test)]
-            crate::context::register_test_places(session.blobs.places());
-            let mut cuts = lock(&session.context_cuts);
-            let (after, previous) = cuts.before(through);
+            crate::context::register_test_logs(Arc::clone(&session.shared.store));
+            let mut cuts = lock(&session.context_head);
+            let (after, image) = cuts.before(through);
             if after == through {
-                return Ok(previous);
+                return Ok(image);
             }
             let mut entries = Vec::new();
             'committed: for batch in frames.batches_after(after) {
@@ -544,7 +552,10 @@ impl Actor {
                     .into_iter()
                     .filter(|entry| entry.seq.get() > committed && entry.seq.get() <= through),
             );
-            let image = crate::context::append(previous, entries, &*session.shared.blobs)?;
+            let image = crate::context::freeze(session.id, through, image, &entries)?;
+            if let Some(source) = image.source {
+                session.shared.store.retain(source)?;
+            }
             cuts.insert(through, image.clone());
             Ok(image)
         })
@@ -567,7 +578,10 @@ impl Actor {
         let registry = Arc::clone(&self.registry);
         let pending: Vec<_> = self.pending_entries().collect();
         let model_only = self.live.session.model_only();
-        let places = self.live.session.blobs.places();
+        let places = crate::context::Source::new(
+            Arc::clone(&self.live.session.shared.store),
+            self.live.session.blobs.places(),
+        );
         let kept = self.projection.model.transcript.take();
         let seed = lock(&self.live.session.incoming_prefix).take();
         let (transcript, messages) = rt::try_unblock_with(
@@ -653,7 +667,7 @@ fn replay_frames(
     pending: &[Entry],
     registry: Arc<ext::host::Registry>,
     system: &str,
-    places: &ext::blob::Places,
+    places: &crate::context::Source,
     before: Option<CallId>,
 ) -> io::Result<Transcript> {
     Transcript::replay(
@@ -693,7 +707,7 @@ fn history_reader(
     source_frames: Arc<super::FrameLog>,
     registry: &Arc<ext::host::Registry>,
     source_pending: Vec<Entry>,
-    source_places: ext::blob::Places,
+    source_places: crate::context::Source,
     model_only: bool,
     cut: HistoryCut,
 ) -> Arc<dyn Fn() -> Result<llm::Messages, llm::Error> + Send + Sync> {
@@ -792,7 +806,7 @@ mod tests {
             Arc::clone(&frames),
             &registry,
             pending.to_vec(),
-            ext::blob::Places::default(),
+            crate::context::Source::default(),
             true,
             HistoryCut {
                 through: pending[0].seq.get(),

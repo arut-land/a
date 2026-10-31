@@ -136,18 +136,9 @@ impl Actor {
         let mut authority = super::spawn::SpawnIntent::from_json(&thread.authority).ok()?;
         authority.image = match side.context {
             ext::Context::Owner | ext::Context::OwnerPrefix => {
-                let cut = self.context_cut(of.get() - 1).await.ok()?;
-                let session = Arc::clone(&self.live.session);
-                let registry = Arc::clone(&registry);
-                rt::unblock(&*self.live.session.shared.rt, move || {
-                    let presentation =
-                        lock(&session.presentation).freeze(&registry, &*session.shared.blobs)?;
-                    crate::context::with_presentation(cut, presentation, &*session.shared.blobs)
-                })
-                .await
-                .ok()?
+                self.context_cut(of.get() - 1).await.ok()?
             }
-            ext::Context::Fresh => protocol::publication::ContextImage::default(),
+            ext::Context::Fresh => protocol::publication::ContextCut::default(),
         };
         thread.authority = authority.into_json().ok()?;
         let model = super::spawn::SpawnIntent::from_json(&thread.authority)
@@ -618,7 +609,8 @@ async fn prepare_ephemeral(
     let context_mode = side.context;
     let image = authority.image;
     let registry = Arc::clone(registry);
-    let places = session.blobs.places();
+    let places =
+        crate::context::Source::new(Arc::clone(&session.shared.store), session.blobs.places());
     let exchanges = (side.context != ext::Context::OwnerPrefix).then_some(side.bounds().exchanges);
     let context = rt::unblock(&*session.shared.rt, move || {
         if context_mode == ext::Context::Fresh {
@@ -757,15 +749,9 @@ impl super::Daemon {
                 turn: image.turn,
                 context: authority.image.clone(),
             };
-            let held = input
-                .context
-                .root
-                .iter()
-                .cloned()
-                .map(protocol::Held::Blob)
-                .collect();
+            let held = Vec::new();
             let mut spawned = authority;
-            spawned.image = protocol::publication::ContextImage::default();
+            spawned.image = protocol::publication::ContextCut::default();
             let live = self
                 .owned_conversation(
                     header,
@@ -805,7 +791,7 @@ impl Session {
     pub(super) async fn thread_context(
         self: &Arc<Self>,
         key: &protocol::EnvelopeId,
-        context: protocol::publication::ContextImage,
+        context: protocol::publication::ContextCut,
         exchanges: Option<u16>,
     ) -> std::io::Result<llm::Messages> {
         let registry = lock(&self.input_registries).get(key).cloned();
@@ -813,9 +799,11 @@ impl Session {
         let session = Arc::clone(self);
         rt::unblock(&*self.shared.rt, move || {
             let shared = &session.shared;
-            let places =
+            let places = crate::context::Source::new(
+                Arc::clone(&shared.store),
                 ext::blob::Blobs::new(Arc::clone(&shared.blobs), Arc::clone(&shared.tree), owner)
-                    .places();
+                    .places(),
+            );
             let registry = match registry {
                 Some(registry) => registry,
                 None => shared.presentation_registry(&session.workspace, &context, &places)?,
@@ -865,7 +853,7 @@ impl Actor {
                 let spawn = spawn.as_ref()?;
                 Some((
                     ext::ModelTurn::typed(&spawn.request, call, text)?,
-                    protocol::publication::ContextImage::default(),
+                    protocol::publication::ContextCut::default(),
                     None,
                 ))
             })

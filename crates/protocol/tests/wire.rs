@@ -73,7 +73,7 @@ fn segments() -> protocol::Segments {
     ])
 }
 
-fn context_image() -> protocol::publication::ContextImage {
+fn context_image() -> protocol::publication::ContextCut {
     let mut publications = protocol::publication::Publications::default();
     publications.apply(&Entry::new(
         Seq::new(2).unwrap(),
@@ -86,13 +86,15 @@ fn context_image() -> protocol::publication::ContextImage {
             }),
         },
     ));
-    protocol::publication::ContextImage {
+    protocol::publication::ContextCut {
         runner: protocol::publication::RunnerKind::Agent,
-        root: Some(protocol::BlobRef {
-            id: protocol::BlobId([0x37; 32]),
-            size: 1234,
-            media_type: "application/vnd.a.context+json".into(),
-            origin: protocol::BlobOrigin::Context,
+        source: Some(protocol::publication::LogCut {
+            session: SESSION,
+            through: Seq::new(2).unwrap(),
+        }),
+        presentation: Some(protocol::publication::LogCut {
+            session: SESSION,
+            through: Seq::new(2).unwrap(),
         }),
         publications,
     }
@@ -1079,7 +1081,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
             protocol::EnvelopeId { sender: SESSION, call: CallId::new(1).unwrap(), purpose: "example".into() },
             SessionId(Uuid::from_u128(0xb)), protocol::Carried::Message(protocol::publication::ThreadInput {
                 turn: protocol::Json::null(), context: context_image(),
-            }.to_json().unwrap().raw().into()), context_image().root.into_iter().map(protocol::Held::Blob).collect(),
+            }.to_json().unwrap().raw().into()), Vec::new(),
         ).unwrap() })),
         sample("entry_enqueue", entry(1, Body::Enqueue { envelope: envelope() })),
         sample("entry_enqueue_detached", entry(19, Body::Enqueue { envelope: protocol::Envelope::own(SESSION, CallId::new(4).unwrap(), protocol::Carried::Detached(protocol::ToolOutcome::Interrupted { output: None })).holding(vec![protocol::Held::Blob(protocol::BlobRef { id: protocol::BlobId([0x0f; 32]), size: 9000, media_type: "text/plain".into(), origin: protocol::BlobOrigin::ToolOutput(CallId::new(4).unwrap()) })]) })),
@@ -1092,7 +1094,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
         sample("entry_detached", entry(7, Body::Detached { call: CallId::new(4).unwrap() })),
         sample("entry_tool_result_spilled", entry(9, Body::ToolResult { call: CallId::new(4).unwrap(), outcome: Outcome::Done { output: protocol::Payload::Blob(Box::new(protocol::BlobRef { id: protocol::BlobId([0x5a; 32]), size: 9000, media_type: "text/plain".into(), origin: protocol::BlobOrigin::ToolOutput(CallId::new(4).unwrap()) })) }, card: None, held: Vec::new() })),
         sample("entry_placeholder", entry(8, Body::ToolResult { call: CallId::new(4).unwrap(), outcome: Outcome::detached(), card: None, held: vec![protocol::Held::Stream(protocol::OutputStream { session: SESSION, call: CallId::new(4).unwrap() })] })),
-        sample("entry_spawned_model_only", entry(1, Body::Spawned { intent: protocol::publication::SpawnImage { runner: protocol::publication::RunnerKind::ModelOnly, authority: protocol::Json::null(), image: protocol::publication::ContextImage::default() }.to_json().unwrap() })),
+        sample("entry_spawned_model_only", entry(1, Body::Spawned { intent: protocol::publication::SpawnImage { runner: protocol::publication::RunnerKind::ModelOnly, authority: protocol::Json::null(), image: protocol::publication::ContextCut::default() }.to_json().unwrap() })),
         sample("entry_model_thread", entry(2, Body::ModelCall { model: "example:model".into(), attempt: 0, choice: protocol::ToolChoice::None, r#for: CallId::new(1), purpose: Some("example".into()), request: Some(protocol::publication::ThreadImage { turn: protocol::Json::null(), authority: protocol::Json::null() }.to_json().unwrap()) })),
         sample("entry_spawned", entry(1, Body::Spawned { intent: protocol::publication::SpawnImage { runner: protocol::publication::RunnerKind::Agent, authority: protocol::Json::null(), image: context_image() }.to_json().unwrap() })),
         sample(

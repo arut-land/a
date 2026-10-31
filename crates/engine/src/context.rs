@@ -1,80 +1,151 @@
-//! Frozen cuts share immutable content nodes, independently of source-log lifetimes.
+//! Frozen context reads ordinary source logs; only projections exist in memory.
 
 use std::collections::{BTreeMap, HashSet};
-use std::io::{self, Write};
+use std::io;
+use std::sync::Arc;
 
-use ext::blob::{BlobStore, Places};
+use ext::blob::Places;
 use protocol::publication::{
-    ContextImage, ContextInput, ContextLayer, ContextNode, ContextValue, RunnerKind, SpawnImage,
+    ContextCut, ContextInput, ContextLayer, ContextValue, LogCut, RunnerKind, SpawnImage,
 };
-use protocol::{BlobOrigin, BlobRef, Body, Entry};
+use protocol::{Body, Entry};
 
+use crate::store::LogStore;
+
+/// Publication checkpoints avoid refolding prefixes when side turns freeze an older cut.
 #[derive(Default)]
-pub(crate) struct Cuts(BTreeMap<u64, ContextImage>);
+pub(crate) struct Cursor(BTreeMap<u64, ContextCut>);
 
-impl Cuts {
-    pub(crate) fn before(&self, through: u64) -> (u64, ContextImage) {
+impl Cursor {
+    pub(crate) fn before(&self, through: u64) -> (u64, ContextCut) {
         self.0
             .range(..=through)
             .next_back()
-            .map_or((0, ContextImage::default()), |(&seq, cut)| {
-                (seq, cut.clone())
-            })
+            .map_or((0, ContextCut::default()), |(&seq, cut)| (seq, cut.clone()))
     }
-
-    pub(crate) fn insert(&mut self, through: u64, cut: ContextImage) {
-        self.0.insert(through, cut);
+    pub(crate) fn insert(&mut self, through: u64, image: ContextCut) {
+        self.0.insert(through, image);
     }
 }
 
-pub(crate) fn append(
-    previous: ContextImage,
-    entries: impl IntoIterator<Item = Entry>,
-    store: &dyn BlobStore,
-) -> io::Result<ContextImage> {
-    let mut publications = previous.publications.clone();
-    let mut node = ContextNode {
-        previous: previous.root,
-        presentation: None,
-        runner: previous.runner,
-        inputs: Vec::new(),
-        inherited: Vec::new(),
-        edits: Vec::new(),
-    };
+pub(crate) fn freeze(
+    session: protocol::SessionId,
+    through: u64,
+    mut image: ContextCut,
+    entries: &[Entry],
+) -> io::Result<ContextCut> {
     for entry in entries {
-        publications.apply(&entry);
-        let value = if let Body::Spawned { intent } = &entry.body {
-            let spawn = SpawnImage::from_json(intent)?;
-            node.runner = spawn.runner;
-            let at = node.inherited.len();
-            node.inherited.push(spawn.image);
-            ContextValue::Inherited(at)
-        } else {
-            if let Some(edit) = crate::transcript::context_edit(&entry) {
-                node.edits.push(edit);
+        image.publications.apply(entry);
+        match &entry.body {
+            Body::Spawned { intent } => {
+                image.runner = SpawnImage::from_json(intent)?.runner;
+                image.presentation = Some(LogCut {
+                    session,
+                    through: entry.seq,
+                });
             }
-            crate::transcript::context_fact(&entry.body).unwrap_or(ContextValue::Position)
-        };
-        node.inputs.push(ContextInput(entry.seq, value));
-        if matches!(entry.body, Body::ModelResult { r#for: None, .. }) {
-            node.previous = Some(write(&node, store)?);
-            node.inputs.clear();
-            node.inherited.clear();
-            node.edits.clear();
+            Body::Extensions { .. } => {
+                image.presentation = Some(LogCut {
+                    session,
+                    through: entry.seq,
+                });
+            }
+            _ => {}
         }
     }
-    if node.inputs.is_empty() {
-        return Ok(ContextImage {
-            runner: node.runner,
-            root: node.previous,
-            publications,
-        });
+    image.source = protocol::Seq::new(through).map(|through| LogCut { session, through });
+    Ok(image)
+}
+
+/// The log and blob readers share one lifetime across a projection.
+#[derive(Clone)]
+pub(crate) struct Source {
+    logs: Arc<dyn LogStore>,
+    places: Places,
+}
+
+impl Source {
+    pub(crate) fn new(logs: Arc<dyn LogStore>, places: Places) -> Self {
+        Self { logs, places }
     }
-    Ok(ContextImage {
-        runner: node.runner,
-        root: Some(write(&node, store)?),
-        publications,
-    })
+
+    fn suffix(
+        &self,
+        cut: LogCut,
+        window: Option<usize>,
+        runner: RunnerKind,
+    ) -> io::Result<(Vec<Segment>, Option<protocol::Seq>)> {
+        let mut entries = self.open(cut)?;
+        let mut nodes = Vec::new();
+        let mut node = Segment::default();
+        let mut start = None;
+        for entry in &mut entries {
+            let entry = entry?;
+            let boundary = matches!(entry.body, Body::ModelResult { r#for: None, .. });
+            node.push(&entry)?;
+            if !boundary && node.inputs.len() < 64 {
+                continue;
+            }
+            node.finish();
+            nodes.push(std::mem::take(&mut node));
+            if let Some(window) = window
+                && let Some(seq) = suffix_start(&nodes, window, runner)
+            {
+                start = Some(seq);
+                break;
+            }
+        }
+        if !node.inputs.is_empty() {
+            node.finish();
+            nodes.push(node);
+        }
+        let start =
+            start.or_else(|| window.and_then(|window| suffix_start(&nodes, window, runner)));
+        Ok((nodes, start))
+    }
+
+    fn open(&self, cut: LogCut) -> io::Result<Box<dyn Iterator<Item = io::Result<Entry>> + Send>> {
+        let reader = self.logs.cut(cut);
+        #[cfg(test)]
+        if reader.is_err() {
+            for logs in crate::lock(&TEST_LOGS).iter() {
+                if let Ok(reader) = logs.cut(cut) {
+                    return Ok(reader);
+                }
+            }
+        }
+        reader
+    }
+}
+
+impl std::ops::Deref for Source {
+    type Target = Places;
+    fn deref(&self) -> &Places {
+        &self.places
+    }
+}
+
+impl From<&Source> for Source {
+    fn from(source: &Source) -> Self {
+        source.clone()
+    }
+}
+
+#[cfg(test)]
+impl Default for Source {
+    fn default() -> Self {
+        TEST_STORE.with(|(_, logs, source)| Self::new(logs.clone(), source.places.clone()))
+    }
+}
+
+#[cfg(test)]
+impl From<&Places> for Source {
+    fn from(places: &Places) -> Self {
+        Self {
+            places: places.clone(),
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -83,166 +154,97 @@ pub(crate) struct PresentationImage {
     pub(crate) extensions: Vec<String>,
 }
 
-impl PresentationImage {
-    pub(crate) fn of(registry: &ext::host::Registry) -> io::Result<protocol::Json> {
-        protocol::Json::encode(&Self {
-            installed: registry.installed(),
-            extensions: registry
-                .extensions()
-                .map(|(name, _)| name.to_owned())
-                .collect(),
-        })
-        .map_err(io::Error::other)
+pub(crate) fn presentation(image: &ContextCut, source: &Source) -> io::Result<protocol::Json> {
+    let cut = image
+        .presentation
+        .ok_or_else(|| io::Error::other("missing presentation cut"))?;
+    let entry = source
+        .open(cut)?
+        .next()
+        .transpose()?
+        .ok_or_else(|| io::Error::other("missing presentation authority"))?;
+    match entry.body {
+        Body::Extensions { installed } => {
+            return protocol::Json::encode(&PresentationImage {
+                extensions: installed
+                    .iter()
+                    .map(|installed| installed.name.clone())
+                    .collect(),
+                installed,
+            })
+            .map_err(io::Error::other);
+        }
+        Body::Spawned { intent } => {
+            let authority =
+                crate::driver::spawn::SpawnIntent::from_json(&intent).map_err(io::Error::other)?;
+            return protocol::Json::encode(&PresentationImage {
+                installed: authority.installed,
+                extensions: authority.extensions,
+            })
+            .map_err(io::Error::other);
+        }
+        _ => {}
     }
+    Err(io::Error::other("missing presentation authority"))
 }
 
 #[derive(Default)]
-pub(crate) struct Presentation {
-    registry: std::sync::Weak<ext::host::Registry>,
-    root: Option<BlobRef>,
+struct Segment {
+    inputs: Vec<ContextInput>,
+    inherited: Vec<ContextCut>,
+    edits: Vec<(u64, u64, Option<String>)>,
 }
 
-impl Presentation {
-    pub(crate) fn freeze(
-        &mut self,
-        registry: &std::sync::Arc<ext::host::Registry>,
-        store: &dyn BlobStore,
-    ) -> io::Result<BlobRef> {
-        if self
-            .registry
-            .upgrade()
-            .is_some_and(|kept| std::sync::Arc::ptr_eq(&kept, registry))
-            && let Some(root) = &self.root
-        {
-            return Ok(root.clone());
-        }
-        let metadata = PresentationImage::of(registry)?;
-        let root = write(
-            &ContextNode {
-                previous: None,
-                presentation: None,
-                runner: RunnerKind::Agent,
-                inputs: vec![ContextInput(
-                    protocol::Seq::new(1).unwrap(),
-                    ContextValue::Presentation(metadata),
-                )],
-                inherited: Vec::new(),
-                edits: Vec::new(),
-            },
-            store,
-        )?;
-        self.registry = std::sync::Arc::downgrade(registry);
-        self.root = Some(root.clone());
-        Ok(root)
+impl Segment {
+    fn push(&mut self, entry: &Entry) -> io::Result<()> {
+        let value = if let Body::Spawned { intent } = &entry.body {
+            let spawn = SpawnImage::from_json(intent)?;
+            let at = self.inherited.len();
+            self.inherited.push(spawn.image);
+            ContextValue::Inherited(at)
+        } else {
+            if let Some(edit) = crate::transcript::context_edit(entry) {
+                self.edits.push(edit);
+            }
+            crate::transcript::context_fact(&entry.body).unwrap_or(ContextValue::Position)
+        };
+        self.inputs.push(ContextInput(entry.seq, value));
+        Ok(())
+    }
+
+    fn finish(&mut self) {
+        self.inputs.reverse();
+        self.edits.reverse();
     }
 }
 
-/// Presentation metadata is a separate edge, so history keeps its original projection scope.
-pub(crate) fn with_presentation(
-    image: ContextImage,
-    presentation: BlobRef,
-    store: &dyn BlobStore,
-) -> io::Result<ContextImage> {
-    Ok(ContextImage {
-        runner: image.runner,
-        publications: image.publications,
-        root: Some(write(
-            &ContextNode {
-                previous: image.root,
-                presentation: Some(presentation),
-                runner: image.runner,
-                inputs: Vec::new(),
-                inherited: Vec::new(),
-                edits: Vec::new(),
-            },
-            store,
-        )?),
-    })
-}
-
-pub(crate) fn presentation(image: &ContextImage, places: &Places) -> io::Result<protocol::Json> {
-    let root = image
-        .root
-        .as_ref()
-        .ok_or_else(|| io::Error::other("missing presentation cut"))?;
-    let node = read(root, places)?;
-    let metadata = node
-        .presentation
-        .ok_or_else(|| io::Error::other("missing presentation witness"))?;
-    read(&metadata, places)?
-        .inputs
-        .into_iter()
-        .find_map(|ContextInput(_, value)| {
-            if let ContextValue::Presentation(image) = value {
-                Some(image)
-            } else {
-                None
-            }
-        })
-        .ok_or_else(|| io::Error::other("missing presentation witness"))
-}
-
-fn write(node: &ContextNode, store: &dyn BlobStore) -> io::Result<BlobRef> {
-    let json = node.to_json()?;
-    let mut writer = store.writer(json.raw().len() as u64)?;
-    writer.write_all(json.raw().as_bytes())?;
-    writer.finish("application/vnd.a.context+json", BlobOrigin::Context)
-}
-
-fn read(blob: &BlobRef, places: &Places) -> io::Result<ContextNode> {
-    let bytes = places.bytes(blob);
-    #[cfg(test)]
-    let bytes = bytes.or_else(|| {
-        crate::lock(&TEST_READERS)
-            .iter()
-            .find_map(|places| places.bytes(blob))
-    });
-    let bytes = bytes.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("missing context node {}", blob.id),
-        )
-    })?;
-    ContextNode::from_json(&bytes).map_err(Into::into)
-}
-
-pub(crate) fn expand(image: &ContextImage, places: &Places) -> io::Result<Vec<ContextLayer>> {
-    expand_with(image, places, None)
+pub(crate) fn expand(image: &ContextCut, source: &Source) -> io::Result<Vec<ContextLayer>> {
+    expand_with(image, source, None)
 }
 
 pub(crate) fn expand_bounded(
-    image: &ContextImage,
-    places: &Places,
+    image: &ContextCut,
+    source: &Source,
     exchanges: u16,
 ) -> io::Result<Vec<ContextLayer>> {
     if exchanges == 0 {
         return Ok(Vec::new());
     }
-    expand_with(image, places, Some(usize::from(exchanges) + 1))
+    expand_with(image, source, Some(usize::from(exchanges) + 1))
 }
 
 fn expand_with(
-    image: &ContextImage,
-    places: &Places,
+    image: &ContextCut,
+    source: &Source,
     window: Option<usize>,
 ) -> io::Result<Vec<ContextLayer>> {
     if window == Some(0) {
         return Ok(Vec::new());
     }
-    let mut nodes = Vec::new();
-    let mut next = image.root.clone();
-    let mut start = None;
-    while let Some(blob) = next {
-        let mut node = read(&blob, places)?;
-        next = node.previous.take();
-        nodes.push(node);
-        if let Some(window) = window
-            && let Some(seq) = suffix_start(&nodes, window, image.runner)
-        {
-            start = Some(seq);
-            break;
-        }
-    }
+    let Some(cut) = image.source else {
+        return Ok(Vec::new());
+    };
+    let (nodes, start) = source.suffix(cut, window, image.runner)?;
     let edits = crate::transcript::Edits::new(
         nodes
             .iter()
@@ -281,7 +283,7 @@ fn expand_with(
                 let remaining = window.map(|window| {
                     window.saturating_sub(local_users.iter().filter(|user| **user > seq).count())
                 });
-                let mut inherited = expand_with(&node.inherited[at], places, remaining)?;
+                let mut inherited = expand_with(&node.inherited[at], source, remaining)?;
                 if inherited.is_empty() {
                     continue;
                 }
@@ -321,7 +323,7 @@ fn expand_with(
 
 /// Keep one extra exchange so selection never starts within a tool group.
 /// An older call/queue dependency forces the reader to continue into the preceding segment.
-fn suffix_start(nodes: &[ContextNode], window: usize, runner: RunnerKind) -> Option<protocol::Seq> {
+fn suffix_start(nodes: &[Segment], window: usize, runner: RunnerKind) -> Option<protocol::Seq> {
     let edits = crate::transcript::Edits::new(
         nodes
             .iter()
@@ -356,7 +358,7 @@ fn suffix_start(nodes: &[ContextNode], window: usize, runner: RunnerKind) -> Opt
 }
 
 fn user_boundaries(
-    nodes: &[ContextNode],
+    nodes: &[Segment],
     edits: &crate::transcript::Edits,
     runner: RunnerKind,
 ) -> Vec<protocol::Seq> {
@@ -409,56 +411,72 @@ fn user_boundaries(
         .collect()
 }
 
-#[cfg(test)]
-static TEST_READERS: std::sync::Mutex<Vec<Places>> = std::sync::Mutex::new(Vec::new());
+/// Attachment access follows the effective projection, including inherited payloads.
+pub(crate) fn references(
+    image: &ContextCut,
+    source: &Source,
+    blob: protocol::BlobId,
+) -> io::Result<bool> {
+    Ok(expand(image, source)?
+        .into_iter()
+        .flat_map(|ContextLayer(_, inputs)| inputs)
+        .flat_map(|ContextInput(_, value)| value.blobs())
+        .any(|held| matches!(held, protocol::Held::Blob(reference) if reference.id == blob)))
+}
 
 #[cfg(test)]
-pub(crate) fn register_test_places(places: Places) {
-    crate::lock(&TEST_READERS).push(places);
+static TEST_LOGS: std::sync::Mutex<Vec<Arc<dyn LogStore>>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn register_test_logs(logs: Arc<dyn LogStore>) {
+    let mut known = crate::lock(&TEST_LOGS);
+    if !known.iter().any(|old| Arc::ptr_eq(old, &logs)) {
+        known.push(logs);
+    }
 }
 
 #[cfg(test)]
 thread_local! {
-    static TEST_STORE: (tempfile::TempDir, std::sync::Arc<blob_files::Files>, Places) = {
+    static TEST_STORE: (tempfile::TempDir, Arc<crate::store::Jsonl>, Source) = {
         let dir = tempfile::tempdir().unwrap();
-        let store = std::sync::Arc::new(blob_files::Files::open(dir.path().join("blobs"), dir.path()).unwrap());
-        let tree = std::sync::Arc::new(blob_files::CacheDir::new(dir.path().join("tree"), store.clone()));
-        let places = Places::new(store.clone(), tree);
-        register_test_places(places.clone());
-        (dir, store, places)
+        let logs = Arc::new(crate::store::Jsonl::open(dir.path().join("sessions")).unwrap());
+        register_test_logs(logs.clone());
+        let source = Source::new(logs.clone(), Places::default());
+        (dir, logs, source)
     };
 }
 
 #[cfg(test)]
-pub(crate) fn test_places() -> Places {
-    TEST_STORE.with(|(_, _, places)| places.clone())
+pub(crate) fn test_places() -> Source {
+    Source::default()
 }
 
 #[cfg(test)]
-pub(crate) fn test_append(entries: &[Entry]) -> ContextImage {
-    test_append_chunks(entries, 1)
-}
-
-#[cfg(test)]
-pub(crate) fn test_append_chunks(entries: &[Entry], chunk: usize) -> ContextImage {
-    TEST_STORE.with(|(_, store, _)| {
-        entries
-            .chunks(chunk)
-            .fold(ContextImage::default(), |cut, entries| {
-                append(cut, entries.iter().cloned(), &**store).unwrap()
-            })
+pub(crate) fn test_append(entries: &[Entry]) -> ContextCut {
+    TEST_STORE.with(|(_, logs, _)| {
+        let session = protocol::SessionId::new();
+        logs.import(
+            &crate::store::Header {
+                id: session,
+                workspace: std::path::PathBuf::new(),
+                parent: None,
+            },
+            entries,
+        )
+        .unwrap();
+        freeze(
+            session,
+            entries.last().map_or(0, |entry| entry.seq.get()),
+            ContextCut::default(),
+            entries,
+        )
+        .unwrap()
     })
 }
 
-/// Graph storage is private; a client may fetch only effective inherited payloads.
-pub(crate) fn references(
-    image: &ContextImage,
-    places: &Places,
-    blob: protocol::BlobId,
-) -> io::Result<bool> {
-    Ok(expand(image, places)?.into_iter().flat_map(|ContextLayer(_, inputs)| inputs)
-        .flat_map(|ContextInput(_, value)| value.blobs())
-        .any(|held| matches!(held, protocol::Held::Blob(reference) if reference.id == blob && reference.origin != BlobOrigin::Context)))
+#[cfg(test)]
+pub(crate) fn test_append_chunks(entries: &[Entry], _: usize) -> ContextCut {
+    test_append(entries)
 }
 
 #[cfg(test)]
@@ -486,7 +504,7 @@ mod tests {
         )
     }
 
-    fn spawn(seq: u64, image: ContextImage) -> Entry {
+    fn spawn(seq: u64, image: ContextCut) -> Entry {
         entry(
             seq,
             Body::Spawned {
@@ -502,66 +520,50 @@ mod tests {
     }
 
     #[test]
-    fn forking_a_prefix_reuses_existing_content_nodes() {
-        TEST_STORE.with(|(_, store, places)| {
-            let parent = append(
-                ContextImage::default(),
-                [user(1, &"x".repeat(5 << 20))],
-                &**store,
+    fn a_presentation_cut_keeps_its_admitted_generation_after_later_extensions() {
+        TEST_STORE.with(|(_, logs, source)| {
+            let old = append(
+                ContextCut::default(),
+                [entry(
+                    1,
+                    Body::Extensions {
+                        installed: Vec::new(),
+                    },
+                )],
+                logs,
             )
             .unwrap();
-            let children: Vec<_> = (0..3)
-                .map(|_| {
-                    append(
-                        ContextImage::default(),
-                        [spawn(1, parent.clone())],
-                        &**store,
-                    )
-                    .unwrap()
-                })
-                .collect();
-            assert!(children.windows(2).all(|pair| pair[0].root == pair[1].root));
-            for child in children {
-                let node = read(child.root.as_ref().unwrap(), places).unwrap();
-                assert_eq!(node.inherited[0], parent);
-                assert!(child.root.unwrap().size < 2048);
-            }
-        });
-    }
-
-    #[test]
-    fn appending_a_branch_never_copies_its_settled_parent_prefix() {
-        TEST_STORE.with(|(_, store, places)| {
-            let parent = append(
-                ContextImage::default(),
-                [user(1, &"x".repeat(5 << 20))],
-                &**store,
+            let new = append(
+                old.clone(),
+                [entry(
+                    2,
+                    Body::Extensions {
+                        installed: vec![protocol::Installed {
+                            name: "later".into(),
+                            version: 1,
+                            image: None,
+                        }],
+                    },
+                )],
+                logs,
             )
             .unwrap();
-            let branch = append(
-                ContextImage::default(),
-                [spawn(1, parent.clone())],
-                &**store,
-            )
-            .unwrap();
-            let advanced = append(branch.clone(), [user(2, "private tail")], &**store).unwrap();
-            let node = read(advanced.root.as_ref().unwrap(), places).unwrap();
-            assert_eq!(node.previous, branch.root);
-            assert!(advanced.root.unwrap().size < 2048);
             assert_eq!(
-                read(branch.root.as_ref().unwrap(), places)
-                    .unwrap()
-                    .inherited[0],
-                parent
+                old.presentation.unwrap().through,
+                protocol::Seq::new(1).unwrap()
             );
+            let original: PresentationImage = presentation(&old, source).unwrap().parse().unwrap();
+            let changed: PresentationImage = presentation(&new, source).unwrap().parse().unwrap();
+            assert_eq!(original.installed, []);
+            assert_eq!(changed.extensions, ["later"]);
         });
     }
 
     #[test]
     fn a_frozen_child_ignores_later_parent_edits() {
         TEST_STORE.with(|(_, store, places)| {
-            let cut = append(ContextImage::default(), [user(1, "original")], &**store).unwrap();
-            let child = append(ContextImage::default(), [spawn(1, cut.clone())], &**store).unwrap();
+            let cut = append(ContextCut::default(), [user(1, "original")], store).unwrap();
+            let child = append(ContextCut::default(), [spawn(1, cut.clone())], store).unwrap();
             let edited = append(
                 cut,
                 [entry(
@@ -572,7 +574,7 @@ mod tests {
                         replace: Some(Json::encode("changed").unwrap()),
                     },
                 )],
-                &**store,
+                store,
             )
             .unwrap();
             let text = |image| {
@@ -598,17 +600,12 @@ mod tests {
     fn bounded_side_context_does_not_materialize_unrequested_ancestry() {
         TEST_STORE.with(|(_, store, places)| {
             let parent = append(
-                ContextImage::default(),
+                ContextCut::default(),
                 [user(1, &"ancestor".repeat(100_000))],
-                &**store,
+                store,
             )
             .unwrap();
-            let branch = append(
-                ContextImage::default(),
-                [spawn(1, parent.clone())],
-                &**store,
-            )
-            .unwrap();
+            let branch = append(ContextCut::default(), [spawn(1, parent.clone())], store).unwrap();
             let branch = append(
                 branch,
                 [
@@ -616,7 +613,7 @@ mod tests {
                     user(3, "recent local"),
                     user(4, "newest local"),
                 ],
-                &**store,
+                store,
             )
             .unwrap();
             let entries = [spawn(1, branch.clone())];
@@ -631,7 +628,7 @@ mod tests {
                 bytes: 4096,
             };
             let expected = policy.assemble(&full, &[], &current).unwrap();
-            std::fs::remove_file(store.materialize(&parent.root.unwrap().id).unwrap()).unwrap();
+            remove_source(&parent.source.unwrap());
             let recent = crate::transcript::Transcript::replay_bounded(
                 |each| {
                     for entry in &entries {
@@ -664,7 +661,7 @@ mod tests {
                     intent: SpawnImage {
                         runner: RunnerKind::ModelOnly,
                         authority: Json::null(),
-                        image: ContextImage::default(),
+                        image: ContextCut::default(),
                     }
                     .to_json()
                     .unwrap(),
@@ -677,7 +674,7 @@ mod tests {
                     llm::Messages::from_iter([llm::Message::system(format!("system {seq}"))]);
                 let input = protocol::publication::ThreadInput {
                     turn: turn.intent(None).unwrap(),
-                    context: ContextImage::default(),
+                    context: ContextCut::default(),
                 }
                 .to_json()
                 .unwrap();
@@ -707,11 +704,11 @@ mod tests {
                     ),
                 ]);
             }
-            let parent = append(ContextImage::default(), entries, &**store).unwrap();
+            let parent = append(ContextCut::default(), entries, store).unwrap();
             let child = append(
-                ContextImage::default(),
+                ContextCut::default(),
                 [spawn(1, parent), user(2, "first"), user(3, "second")],
-                &**store,
+                store,
             )
             .unwrap();
             let registry = Arc::new(ext::host::Registry::default());
@@ -743,11 +740,11 @@ mod tests {
     #[test]
     fn a_bounded_side_never_walks_past_its_inherited_exchange_budget() {
         TEST_STORE.with(|(_, store, places)| {
-            let mut cut = append(ContextImage::default(), [user(1, "old root")], &**store).unwrap();
+            let mut cut = append(ContextCut::default(), [user(1, "old root")], store).unwrap();
             let mut unrequested = None;
             for depth in 0..24 {
                 cut = append(
-                    ContextImage::default(),
+                    ContextCut::default(),
                     [
                         spawn(1, cut),
                         user(2, &format!("fork {depth}")),
@@ -758,11 +755,11 @@ mod tests {
                             },
                         ),
                     ],
-                    &**store,
+                    store,
                 )
                 .unwrap();
                 if depth == 12 {
-                    unrequested = cut.root.clone();
+                    unrequested = cut.source;
                 }
             }
             let registry = Arc::new(ext::host::Registry::default());
@@ -775,7 +772,7 @@ mod tests {
                 .unwrap()
                 .into_messages();
             let expected = policy.assemble(&[], &full, &current).unwrap();
-            std::fs::remove_file(store.materialize(&unrequested.unwrap().id).unwrap()).unwrap();
+            remove_source(&unrequested.unwrap());
             let recent = crate::transcript::Transcript::cut(
                 &cut,
                 registry,
@@ -793,8 +790,8 @@ mod tests {
     #[test]
     fn a_bounded_side_never_follows_dependencies_of_its_unrequested_leading_exchange() {
         TEST_STORE.with(|(_, store, places)| {
-            let old = append(ContextImage::default(), [user(1, "old")], &**store).unwrap();
-            let mut cut = old.clone();
+            let old = append(ContextCut::default(), [user(1, "old")], store).unwrap();
+            let mut cut = branch(&old, store);
             let sender = SessionId::new();
             for turn in 0..16 {
                 let seq = 10 + turn * 10;
@@ -857,7 +854,7 @@ mod tests {
                         },
                     ),
                 ]);
-                cut = append(cut, entries, &**store).unwrap();
+                cut = append(cut, entries, store).unwrap();
             }
             let registry = Arc::new(ext::host::Registry::default());
             let policy = llm::ContextPolicy {
@@ -869,7 +866,7 @@ mod tests {
                 .unwrap()
                 .into_messages();
             let expected = policy.assemble(&full, &[], &current).unwrap();
-            std::fs::remove_file(store.materialize(&old.root.unwrap().id).unwrap()).unwrap();
+            remove_source(&old.source.unwrap());
             let recent = crate::transcript::Transcript::cut(
                 &cut,
                 registry,
@@ -888,7 +885,7 @@ mod tests {
     fn bounded_thread_history_reads_only_taken_inbox_exchanges() {
         TEST_STORE.with(|(_, store, places)| {
             let old = append(
-                ContextImage::default(),
+                ContextCut::default(),
                 [
                     entry(
                         1,
@@ -896,7 +893,7 @@ mod tests {
                             intent: SpawnImage {
                                 runner: RunnerKind::ModelOnly,
                                 authority: Json::null(),
-                                image: ContextImage::default(),
+                                image: ContextCut::default(),
                             }
                             .to_json()
                             .unwrap(),
@@ -904,10 +901,10 @@ mod tests {
                     ),
                     user(2, "unrequested ancestor"),
                 ],
-                &**store,
+                store,
             )
             .unwrap();
-            let mut cut = old.clone();
+            let mut cut = branch(&old, store);
             let mut entries = Vec::new();
             for seq in [3, 5, 7, 9] {
                 let turn =
@@ -915,7 +912,7 @@ mod tests {
                         .request(CallId::new(seq).unwrap());
                 let text = protocol::publication::ThreadInput {
                     turn: turn.intent(None).unwrap(),
-                    context: ContextImage::default(),
+                    context: ContextCut::default(),
                 }
                 .to_json()
                 .unwrap();
@@ -945,7 +942,7 @@ mod tests {
                     ),
                 ]);
             }
-            cut = append(cut, entries, &**store).unwrap();
+            cut = append(cut, entries, store).unwrap();
             let registry = Arc::new(ext::host::Registry::default());
             let full = crate::transcript::Transcript::cut(&cut, registry.clone(), "", places, None)
                 .unwrap()
@@ -956,7 +953,7 @@ mod tests {
             };
             let current = llm::Messages::from_iter([llm::Message::user("mandatory")]);
             let expected = policy.assemble(&full, &[], &current).unwrap();
-            std::fs::remove_file(store.materialize(&old.root.unwrap().id).unwrap()).unwrap();
+            remove_source(&old.source.unwrap());
             let recent = crate::transcript::Transcript::cut(
                 &cut,
                 registry,
@@ -1013,9 +1010,8 @@ mod tests {
                     .into_messages();
             assert!(expected.iter().any(|message| matches!(message,
                 llm::Message::Assistant(reply) if reply.tool_calls().any(|call| call.id == "pending"))));
-            let base = append(ContextImage::default(), entries, &**store).unwrap();
-            let metadata = Presentation::default().freeze(&registry, &**store).unwrap();
-            let cut = with_presentation(base, metadata, &**store).unwrap();
+            let base = append(ContextCut::default(), entries, store).unwrap();
+            let cut = base;
             let actual =
                 crate::transcript::Transcript::cut(&cut, registry, "system", places, Some(2))
                     .unwrap()
@@ -1024,205 +1020,73 @@ mod tests {
         });
     }
 
-    #[test]
-    fn an_admitted_side_cut_pins_its_presentation_before_delivery() {
-        let dir = tempfile::tempdir().unwrap();
-        let logs = Jsonl::open(dir.path().join("logs")).unwrap();
-        let store =
-            Arc::new(blob_files::Files::open(dir.path().join("blobs"), dir.path()).unwrap());
-        let tree = Arc::new(blob_files::CacheDir::new(
-            dir.path().join("tree"),
-            store.clone(),
-        ));
-        let places = Places::new(store.clone(), tree);
-        let registry = Arc::new(ext::host::Registry::default());
-        let metadata = Presentation::default().freeze(&registry, &*store).unwrap();
-        let cut = with_presentation(ContextImage::default(), metadata.clone(), &*store).unwrap();
-        let header = Header {
-            id: SessionId::new(),
-            workspace: dir.path().into(),
-            parent: None,
-        };
-        let mut loaded = logs.create(&header).unwrap();
-        loaded.append(user(1, "owner input").body).unwrap();
-        loaded
-            .append(Body::ModelCall {
-                model: "recorded".into(),
-                attempt: 0,
-                choice: protocol::ToolChoice::None,
-                r#for: CallId::new(1),
-                purpose: Some("side".into()),
-                request: Some(
-                    protocol::publication::ThreadImage {
-                        turn: Json::null(),
-                        authority: SpawnImage {
-                            runner: RunnerKind::ModelOnly,
-                            authority: Json::null(),
-                            image: cut.clone(),
-                        }
-                        .to_json()
-                        .unwrap(),
-                    }
-                    .to_json()
-                    .unwrap(),
-                ),
-            })
-            .unwrap();
-        drop(loaded);
-        let mut pending: Vec<_> = logs
-            .entries(header.id)
-            .unwrap()
-            .iter()
-            .flat_map(|entry| entry.body.blobs())
-            .collect();
-        let mut live = HashSet::new();
-        while let Some(protocol::Held::Blob(blob)) = pending.pop() {
-            if live.insert(blob.id) && blob.origin == BlobOrigin::Context {
-                pending.extend(read(&blob, &places).unwrap().blobs());
-            }
-        }
-        store.sweep(&|id| live.contains(id)).unwrap();
-        assert!(
-            store.materialize(&metadata.id).is_ok(),
-            "the witness must survive with no delivered child"
-        );
-        assert_eq!(
-            presentation(&cut, &places).unwrap(),
-            PresentationImage::of(&registry).unwrap()
-        );
+    struct RetainedTree {
+        _dir: tempfile::TempDir,
+        source: Source,
+        cut: ContextCut,
+        blobs: Arc<blob_files::Files>,
+        blob: protocol::BlobRef,
+        orphan: protocol::BlobRef,
+        expected: llm::Messages,
     }
 
-    #[test]
-    fn admitted_cuts_pin_their_graph_before_a_child_exists() {
-        let dir = tempfile::tempdir().unwrap();
-        let log_dir = dir.path().join("logs");
-        let logs = Jsonl::open(&log_dir).unwrap();
-        let store = Arc::new(blob_files::Files::open(dir.path().join("blobs"), &log_dir).unwrap());
-        let tree = Arc::new(blob_files::CacheDir::new(
-            dir.path().join("tree"),
-            store.clone(),
-        ));
-        let places = Places::new(store.clone(), tree);
-        let header = Header {
-            id: SessionId::new(),
-            workspace: dir.path().into(),
-            parent: None,
-        };
-        let mut loaded = logs.create(&header).unwrap();
-        loaded
-            .append(user(1, "frozen before the child exists").body)
-            .unwrap();
-        let cut = append(
-            ContextImage::default(),
-            logs.entries(header.id).unwrap(),
-            &*store,
-        )
-        .unwrap();
-        loaded
-            .append(Body::Link {
-                call: CallId::new(1).unwrap(),
-                child: SessionId::new(),
-                input: "child".into(),
-                intent: SpawnImage {
-                    runner: RunnerKind::Agent,
-                    authority: Json::null(),
-                    image: cut.clone(),
-                }
-                .to_json()
-                .unwrap(),
-            })
-            .unwrap();
-        drop(loaded);
-        assert_eq!(
-            logs.headers().unwrap().len(),
-            1,
-            "the child has not been created"
-        );
-        let mut pending: Vec<_> = logs
-            .entries(header.id)
-            .unwrap()
-            .iter()
-            .flat_map(|entry| entry.body.blobs())
-            .collect();
-        let mut live = HashSet::new();
-        while let Some(held) = pending.pop() {
-            if let protocol::Held::Blob(blob) = held
-                && live.insert(blob.id)
-                && blob.origin == BlobOrigin::Context
-            {
-                pending.extend(read(&blob, &places).unwrap().blobs());
-            }
-        }
-        store.sweep(&|id| live.contains(id)).unwrap();
-        assert!(
-            expand(&cut, &places).is_ok(),
-            "a committed admission must retain its entire graph closure"
-        );
-    }
-
-    #[test]
-    fn unreadable_frozen_context_returns_an_io_error() {
-        TEST_STORE.with(|(_, _, places)| {
-            let cut = ContextImage {
-                runner: RunnerKind::Agent,
-                root: Some(BlobRef {
-                    id: protocol::BlobId([0xff; 32]),
-                    size: 10,
-                    media_type: "application/vnd.a.context+json".into(),
-                    origin: BlobOrigin::Context,
-                }),
-                publications: protocol::publication::Publications::default(),
-            };
-            let error = crate::transcript::Transcript::placed(
-                &[spawn(1, cut)],
-                Arc::new(ext::host::Registry::default()),
-                "",
-                places,
-            )
-            .err()
-            .expect("graph read must fail");
-            assert_eq!(error.kind(), io::ErrorKind::NotFound);
-        });
-    }
-
-    #[test]
-    fn frozen_context_and_its_payloads_survive_restart_and_source_log_removal() {
-        let dir = tempfile::tempdir().unwrap();
-        let logs_dir = dir.path().join("logs");
-        let logs = Jsonl::open(&logs_dir).unwrap();
-        let store = Arc::new(blob_files::Files::open(dir.path().join("blobs"), &logs_dir).unwrap());
-        let tree = Arc::new(blob_files::CacheDir::new(
-            dir.path().join("tree"),
-            store.clone(),
-        ));
-        let places = Places::new(store.clone(), tree);
-        let mut writer = store.writer(7).unwrap();
+    fn retained_payloads(
+        dir: &std::path::Path,
+    ) -> (Arc<blob_files::Files>, protocol::BlobRef, protocol::BlobRef) {
+        use ext::blob::BlobStore;
+        use std::io::Write;
+        let blobs = Arc::new(blob_files::Files::open(dir.join("blobs"), dir).unwrap());
+        let mut writer = blobs.writer(7).unwrap();
         writer.write_all(b"payload").unwrap();
         let blob = writer
             .finish(
                 "text/plain",
-                BlobOrigin::ToolOutput(CallId::new(1).unwrap()),
+                protocol::BlobOrigin::ToolOutput(CallId::new(2).unwrap()),
             )
             .unwrap();
-        let header = Header {
+        let mut orphan = blobs.writer(6).unwrap();
+        orphan.write_all(b"orphan").unwrap();
+        let orphan = orphan
+            .finish("text/plain", protocol::BlobOrigin::Paste)
+            .unwrap();
+        (blobs, blob, orphan)
+    }
+
+    fn saved_cut(session: SessionId, through: u64) -> ContextCut {
+        ContextCut {
+            source: Some(LogCut {
+                session,
+                through: protocol::Seq::new(through).unwrap(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn retained_tree() -> RetainedTree {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions");
+        let logs = Arc::new(Jsonl::open(&path).unwrap());
+        let (blobs, blob, orphan) = retained_payloads(dir.path());
+        let parent = Header {
             id: SessionId::new(),
             workspace: dir.path().into(),
             parent: None,
         };
-        let mut loaded = logs.create(&header).unwrap();
+        let mut loaded = logs.create(&parent).unwrap();
+        loaded.append(user(1, "ancestor").body).unwrap();
         loaded
             .append(Body::ToolCall {
-                invoke: None,
                 tool: "read".into(),
                 input: Json::null(),
-                id: Some("provider-id".into()),
+                id: Some("call".into()),
+                invoke: None,
                 card: None,
                 by: protocol::Audience::Model,
             })
             .unwrap();
         loaded
             .append(Body::ToolResult {
-                call: CallId::new(1).unwrap(),
+                call: CallId::new(2).unwrap(),
                 outcome: ToolOutcome::Done {
                     output: Payload::Blob(Box::new(blob.clone())),
                 },
@@ -1230,50 +1094,182 @@ mod tests {
                 held: Vec::new(),
             })
             .unwrap();
-        let cut = append(
-            ContextImage::default(),
-            logs.entries(header.id).unwrap(),
-            &*store,
+        let parent_cut = saved_cut(parent.id, loaded.seq);
+        logs.retain(parent_cut.source.unwrap()).unwrap();
+        let visible = path.join(parent.id.to_string());
+        let retained = path.join("retained");
+        assert_eq!(
+            sys::fs::identity(&visible.join("log.jsonl")).unwrap(),
+            sys::fs::identity(&retained.join(format!("{}.jsonl", parent.id))).unwrap()
+        );
+        loaded.append(user(4, "after the frozen cut").body).unwrap();
+        let child = Header {
+            id: SessionId::new(),
+            parent: Some(crate::store::Parent {
+                session: parent.id,
+                call: 1,
+            }),
+            ..parent.clone()
+        };
+        logs.import(&child, &[spawn(1, parent_cut), user(2, "child")])
+            .unwrap();
+        let child_cut = saved_cut(child.id, 2);
+        logs.retain(child_cut.source.unwrap()).unwrap();
+        let grandchild = Header {
+            id: SessionId::new(),
+            ..parent.clone()
+        };
+        logs.import(&grandchild, &[spawn(1, child_cut), user(2, "grandchild")])
+            .unwrap();
+        let cut = saved_cut(grandchild.id, 2);
+        let places = Places::new(
+            blobs.clone(),
+            Arc::new(blob_files::CacheDir::new(
+                dir.path().join("tree"),
+                blobs.clone(),
+            )),
+        );
+        let source = Source::new(logs.clone(), places.clone());
+        let expected = crate::transcript::Transcript::cut(
+            &cut,
+            Arc::new(ext::host::Registry::default()),
+            "",
+            &source,
+            None,
         )
-        .unwrap();
-        let child = append(ContextImage::default(), [spawn(1, cut)], &*store).unwrap();
-        let expected = Json::encode(&expand(&child, &places).unwrap()).unwrap();
-        drop((loaded, logs));
-        std::fs::remove_dir_all(&logs_dir).unwrap();
-        let mut live = HashSet::new();
-        let mut pending = vec![child.root.clone().unwrap()];
-        while let Some(reference) = pending.pop() {
-            if !live.insert(reference.id) {
+        .unwrap()
+        .into_messages();
+        drop((source, loaded, logs));
+        std::fs::remove_dir_all(visible).unwrap();
+        std::fs::remove_dir_all(retained.join("derived")).unwrap();
+        let logs = Arc::new(Jsonl::open(&path).unwrap());
+        assert_eq!(logs.headers().unwrap(), [grandchild]);
+        let source = Source::new(logs, places);
+        RetainedTree {
+            _dir: dir,
+            source,
+            cut,
+            blobs,
+            blob,
+            orphan,
+            expected,
+        }
+    }
+
+    #[test]
+    fn retained_logs_survive_recursive_parent_removal_and_restart() {
+        let tree = retained_tree();
+        let actual = crate::transcript::Transcript::cut(
+            &tree.cut,
+            Arc::new(ext::host::Registry::default()),
+            "",
+            &tree.source,
+            None,
+        )
+        .unwrap()
+        .into_messages();
+        assert_eq!(actual, tree.expected);
+        assert!(
+            !Json::encode(&actual)
+                .unwrap()
+                .raw()
+                .contains("after the frozen cut")
+        );
+    }
+
+    #[test]
+    fn retained_source_cuts_keep_their_payloads_alive_recursively() {
+        use ext::blob::BlobStore;
+        let tree = retained_tree();
+        let logs = tree.source.logs.as_ref();
+        let mut pending = vec![tree.cut.source.unwrap()];
+        let mut cuts = HashSet::new();
+        let mut held = HashSet::new();
+        while let Some(cut) = pending.pop() {
+            if !cuts.insert(cut) {
                 continue;
             }
-            if reference.origin == BlobOrigin::Context {
-                pending.extend(
-                    read(&reference, &places)
-                        .unwrap()
-                        .blobs()
-                        .into_iter()
-                        .filter_map(|held| match held {
-                            protocol::Held::Blob(blob) => Some(blob),
-                            protocol::Held::Stream(_) => None,
-                        }),
-                );
+            for entry in logs.cut(cut).unwrap() {
+                let body = entry.unwrap().body;
+                pending.extend(body.cuts());
+                held.extend(body.blobs().into_iter().filter_map(|held| match held {
+                    protocol::Held::Blob(blob) => Some(blob.id),
+                    protocol::Held::Stream(_) => None,
+                }));
             }
         }
-        store.sweep(&|id| live.contains(id)).unwrap();
-        drop((places, store));
-        let store =
-            Arc::new(blob_files::Files::open(dir.path().join("blobs"), dir.path()).unwrap());
-        let tree = Arc::new(blob_files::CacheDir::new(
-            dir.path().join("restored-tree"),
-            store.clone(),
-        ));
-        let places = Places::new(store, tree);
-        assert_eq!(
-            Json::encode(&expand(&child, &places).unwrap()).unwrap(),
-            expected
-        );
-        assert_eq!(places.read(&blob).as_deref(), Some("payload"));
-        assert!(references(&child, &places, blob.id).unwrap());
-        assert!(!references(&child, &places, child.root.as_ref().unwrap().id).unwrap());
+        assert_eq!(cuts.len(), 3);
+        tree.blobs.sweep(&|id| held.contains(id)).unwrap();
+        assert!(tree.blobs.open(&tree.orphan.id).is_err());
+        assert_eq!(tree.source.read(&tree.blob).as_deref(), Some("payload"));
+        assert!(references(&tree.cut, &tree.source, tree.blob.id).unwrap());
+    }
+
+    fn branch(parent: &ContextCut, logs: &Jsonl) -> ContextCut {
+        append(
+            ContextCut::default(),
+            [
+                entry(
+                    1,
+                    Body::Spawned {
+                        intent: SpawnImage {
+                            runner: parent.runner,
+                            authority: Json::null(),
+                            image: parent.clone(),
+                        }
+                        .to_json()
+                        .unwrap(),
+                    },
+                ),
+                entry(
+                    2,
+                    Body::Ext {
+                        ext: "test".into(),
+                        state: "position".into(),
+                        data: Json::null(),
+                    },
+                ),
+            ],
+            logs,
+        )
+        .unwrap()
+    }
+
+    fn append(
+        previous: ContextCut,
+        entries: impl IntoIterator<Item = Entry>,
+        logs: &Jsonl,
+    ) -> io::Result<ContextCut> {
+        let entries: Vec<_> = entries.into_iter().collect();
+        let session = previous
+            .source
+            .map_or_else(SessionId::new, |cut| cut.session);
+        let mut loaded = if previous.source.is_none() {
+            logs.create(&Header {
+                id: session,
+                workspace: std::path::PathBuf::new(),
+                parent: None,
+            })?
+        } else {
+            logs.load(session, &mut |_| false, &mut |_| {})?
+        };
+        for entry in &entries {
+            while loaded.seq + 1 < entry.seq.get() {
+                loaded.append(Body::Ext {
+                    ext: "test".into(),
+                    state: "position".into(),
+                    data: Json::null(),
+                })?;
+            }
+            loaded.append(entry.body.clone())?;
+        }
+        freeze(session, loaded.seq, previous, &entries)
+    }
+
+    fn remove_source(cut: &LogCut) {
+        TEST_STORE.with(|(dir, _, _)| {
+            std::fs::remove_dir_all(dir.path().join("sessions").join(cut.session.to_string()))
+                .unwrap();
+        });
     }
 }
