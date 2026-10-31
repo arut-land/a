@@ -1022,7 +1022,46 @@ def table(summary, comparison=False):
     return "\n".join(lines) + "\n"
 
 
-def engine_suites(source, reference, target, output, rounds, prepare, trial):
+DEPTH_TRACE = r'''
+    for live in daemon.loaded() {
+        live.barrier();
+    }
+    let started = Instant::now();
+    let observations = std::sync::Mutex::new(Vec::new());
+    let ready = || {
+        let idle = daemon.idle();
+        let mut graph: Vec<_> = daemon.loaded().iter()
+            .map(|live| (live.id, live.has_work(), live.has_input(), live.has_jobs()))
+            .collect();
+        graph.sort_by_key(|entry| entry.0);
+        let mut rows = crate::lock(&observations);
+        if rows.last().is_none_or(|(_, previous, previous_idle)| previous != &graph || *previous_idle != idle) {
+            rows.push((started.elapsed(), graph, idle));
+        }
+        idle
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        daemon.wait("settled", PATIENCE, &ready);
+    }));
+    eprintln!("depth-trace first-window elapsed={:?} result={}", started.elapsed(), result.is_ok());
+    eprintln!("depth-trace observations={:#?}", crate::lock(&observations));
+    if let Err(panic) = result {
+        for header in daemon.shared.store.headers().unwrap() {
+            eprintln!("depth-trace timeout-log {} {:#?}", header.id, bodies(&*daemon.shared.store, header.id));
+        }
+        rt::block_on(rt::or(daemon.pulse.until(&ready),
+            rt::or(daemon.jobs.until(&ready), super::EVENTS.1.until(&ready))));
+        eprintln!("depth-trace eventual-idle elapsed={:?}", started.elapsed());
+        eprintln!("depth-trace observations={:#?}", crate::lock(&observations));
+        for header in daemon.shared.store.headers().unwrap() {
+            eprintln!("depth-trace final-log {} {:#?}", header.id, bodies(&*daemon.shared.store, header.id));
+        }
+        std::panic::resume_unwind(panic);
+    }
+'''
+
+
+def engine_suites(source, reference, target, output, rounds, prepare, trial, scope, trace):
     env = environment(target)
     env["NEXTEST_PROFILE"] = "windows"
     env["A_TEST_POWERSHELL"] = ";".join([shutil.which("pwsh.exe"),
@@ -1035,8 +1074,19 @@ def engine_suites(source, reference, target, output, rounds, prepare, trial):
             assert identities[label]["revision"] == subprocess.check_output(
                 ["git", "rev-parse", "HEAD"], cwd=checkout, text=True).strip()
             continue
+        if trace:
+            path = checkout / "crates/engine/src/tests.rs"
+            text = path.read_text()
+            begin = text.index("fn inherited_task_cannot_reset_an_exhausted_depth_budget()")
+            end = text.index("\n#[test]", begin)
+            body = text[begin:end]
+            assert body.count("    settle(&daemon);\n") == 1
+            path.write_text(text[:begin] + body.replace("    settle(&daemon);\n", DEPTH_TRACE) + text[end:])
+            (output / f"depth-trace-{label}.patch").write_bytes(subprocess.check_output(
+                ["git", "diff", "--", "crates/engine/src/tests.rs"], cwd=checkout))
         archive = output / f"engine-{label}.tar.zst"
-        cargo_run(["cargo", "nextest", "archive", "-p", "engine", "--archive-file", str(archive)],
+        packages = ["-p", "engine"] if scope == "engine" else ["--workspace", "--features", "a/lua"]
+        cargo_run(["cargo", "nextest", "archive", *packages, "--archive-file", str(archive)],
                   nextest_version="0.9.148", cwd=checkout, env=env, check=True)
         identities[label] = dict(source=str(checkout),
             revision=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=checkout, text=True).strip(),
@@ -1059,7 +1109,8 @@ def engine_suites(source, reference, target, output, rounds, prepare, trial):
             checkout = sources[label]
             command = ["cargo", "nextest", "run", "--archive-file", identities[label]["archive"],
                        "--workspace-remap", str(checkout), "--extract-to", str(target / "engine-run"),
-                       "--extract-overwrite", "--no-fail-fast", "--retries", "0", "--no-tests=fail"]
+                       "--extract-overwrite", "--no-fail-fast", "--retries", "0", "--no-tests=fail",
+                       *(["--success-output", "final"] if trace else [])]
             result = cargo_run(command, nextest_version="0.9.148", cwd=checkout, env=env,
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             log = output / f"engine-{label}-{round:02}.txt"
@@ -1115,6 +1166,8 @@ def main():
     parser.add_argument("--engine-suites", action="store_true")
     parser.add_argument("--prepare-engine", action="store_true")
     parser.add_argument("--suite-trial", type=int)
+    parser.add_argument("--suite-scope", choices=["engine", "workspace"], default="engine")
+    parser.add_argument("--depth-trace", action="store_true")
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--stored", default="1,8,32")
     parser.add_argument("--active", default="1,4,8")
@@ -1148,7 +1201,7 @@ def main():
     os.environ["A_HOME"] = str(output / "test-home")
     if args.engine_suites:
         engine_suites(source, args.reference_source.resolve() if args.reference_source else None,
-                      target, output, args.rounds, args.prepare_engine, args.suite_trial)
+                      target, output, args.rounds, args.prepare_engine, args.suite_trial, args.suite_scope, args.depth_trace)
         return
     if args.overlap:
         if args.census or args.reference_source or args.reference_binary or args.binary:
