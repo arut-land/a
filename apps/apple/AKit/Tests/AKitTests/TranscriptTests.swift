@@ -50,6 +50,11 @@ struct NativeTranscriptTests {
             document.frame.height > scroll.contentView.bounds.height * 3 &&
                 abs(scroll.contentView.bounds.maxY - document.frame.height) <= 1
         }
+        let table = try #require(document as? NSTableView)
+        var realized = 0
+        table.enumerateAvailableRowViews { _, _ in realized += 1 }
+        #expect(realized < 8 && table.numberOfRows > 20,
+                "long history must retain only visible row views, not a laid-out page")
         let target = max(100, scroll.contentView.bounds.minY - 300)
         scroll.contentView.scroll(to: NSPoint(x: 0, y: target))
         scroll.reflectScrolledClipView(scroll.contentView)

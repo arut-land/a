@@ -7,7 +7,10 @@ and an **Open output** action. Native scrolling retains the visible item
 through external updates and adjacent history delivery, and follows new
 output only at the actual viewport bottom.
 
-Phase 1 implementation and local verification are complete. The owner's
+The first phase-1 implementation was pushed as `4d0ac589`. The memory
+follow-up is verified below baseline RSS; the conversation switcher requires
+the additional public-head projection scope listed below. Phase 1 is not ready
+for review until that switcher is implemented and verified. The owner's
 white-space screenshot is still pending: that symptom has not been attributed
 or claimed fixed. Full CI has not been dispatched; phase 2 requires instruction.
 
@@ -65,8 +68,11 @@ attached session's authority. The native app opens a sheet, the TUI opens a
 scrollable output view, and the web opens its authenticated output route.
 All three clients open the child's own transcript from the child affordance.
 
-`TranscriptView` uses AppKit's NSScrollView and NSHostingView. Clip bounds track
-pinning. Stable item/fragment identities and native marker frames retain a
+`TranscriptView` now uses AppKit's NSScrollView and reusable NSTableView rows
+with NSHostingView content. Measured heights retain geometry without retaining
+a full page of laid-out views. Off-screen hosts clear content before entering
+AppKit's reuse cache. Clip bounds track
+pinning. Stable item/fragment identities and native row rectangles retain a
 visible anchor and offset while adjacent pages arrive. The display retains
 the preceding page during delivery; it does not expand SDK history demand.
 Wheel events request adjacent history at the boundary. Later-page delivery
@@ -117,7 +123,7 @@ needed to identify the region before changing layout. Failure mode: an
 unwanted reserved region may remain. Likelihood is owner-observed but not
 locally quantified; repair cost is unknown until its producing view is known.
 
-## Release measurements
+## First implementation: release measurements
 
 Apple M3, 16 GiB, native arm64 macOS 27.2. Both arms used release builds,
 matching diagnostic instrumentation and fixture helpers. Five fresh isolated
@@ -150,13 +156,10 @@ CADisplayLink intervals separately describe callback delivery; median delivery
 remains approximately 60 Hz. The native work and callback tails improved on
 this workload; the store-apply saving is only about six microseconds.
 
-RSS **increased by 30.906 MiB** at the median. The native host eagerly lays out
-the bounded current/preceding display pages; it trades memory for stable native
-geometry and faster scroll work here. This series does not isolate which
-allocation contributes how much of the increase. No heap attribution or memory
-improvement is claimed. Virtualizing that host would be additional work with
-unknown savings and must preserve native anchor behavior; it was not added as
-speculative hardening or as part of the separate child-storage investigation.
+This first implementation increased median RSS by 30.906 MiB. The owner
+requested attribution and recovery; the follow-up below replaces the eager
+full-page host. These original measurements remain for comparison, not as
+the final memory result.
 
 Command-line Instruments Time Profiler successfully recorded both real release
 app PIDs, separately from timing rounds. Production Session update and Transcript
@@ -171,6 +174,131 @@ file I/O inside measured apply calls. Instrumentation is not shipped as a debug
 UI or product startup behavior. Earlier pilot/measured series are retained but
 excluded: setup/clock-boundary corrections preceded the accepted run. There
 are no projected savings.
+
+## Memory follow-up: attribution and recovery
+
+The real release apps were held after the same 32-child/16-external-turn,
+120-scroll workload. macOS `heap --sortBySize --noContent <owned-pid>` and
+`vmmap -summary <owned-pid>` both succeeded. These are separate diagnostic
+captures, not timed benchmark rounds. Original app, first implementation and
+reusable-row implementation used fresh isolated homes. Inspecting a live heap
+can change residency; allocated bytes and physical footprint below are not
+interchangeable with the benchmark's ps RSS.
+
+| Live diagnostic | Original app | First implementation | Reusable rows |
+| --- | ---: | ---: | ---: |
+| CoreText lines / runs, each | 121 | 2,230 | 92 |
+| CoreText lines + runs, bytes | 85,184 | 1,569,920 | 64,768 |
+| NSConcreteAttributedString count | 248 | 2,397 | 187 |
+| NSImage count | 33 | 33 | 33 |
+| CoreUI image data | 384 KiB | 384 KiB | 384 KiB |
+| CoreAnimation resident dirty | 2,784 KiB | 12.3 MiB | 1,520 KiB |
+| Malloc Small resident dirty | 34.3 MiB | 47.0 MiB | 33.7 MiB |
+| Live allocated heap | 23.9 MiB | 35.1 MiB | 25.7 MiB |
+| Physical footprint | 50.6 MiB | 73.2 MiB | 48.0 MiB |
+
+This attributes the regression to eager text layout and its backing layers,
+with allocator residency/fragmentation contributing too. It is not an image
+asset regression or a large NSTextStorage buffer: each app had one 640-byte
+NSConcreteTextStorage. CoreText/attributed-string counts and CoreAnimation
+regions collapse when off-screen content is released. The follow-up's live
+heap is still 1.8 MiB above the original app in this diagnostic, consistent
+with the additional native table/hosting objects; total physical footprint is
+lower. Exact allocator backtrace attribution of every byte is not claimed.
+
+The first table prototype still left content in AppKit's reusable view cache:
+it retained 5,550 CoreText lines and used 142.8 MiB RSS in its pilot. Merely
+virtualizing the visible hierarchy was insufficient. `didRemove` now replaces
+the off-screen host's root with EmptyView and completes layout. The dedicated
+measurement host is likewise cleared after calculating heights. Native row
+height caches retain display models and scalar geometry, not laid-out text
+or backing layers. This releases text storage even while AppKit retains an
+empty reusable host. A final real-app capture reported 13 realized row views
+for 50 table rows at the end of the same workload. Whole-app NSHostingViewBase
+counts are 35 originally, 36 with the eager host, and 80 with reusable rows;
+the extra empty hosts are small, rather than retained full text layout trees. Views for the preceding page are no longer kept alive
+just to preserve an anchor; its stable identity and measured height suffice.
+
+The real native regression still checks clip origin on external update,
+visible anchors on earlier/later page installation and following at the live
+bottom. It additionally asserts that a transcript with over 20 rows realizes
+fewer than eight row views. No paging/anchor assertion was weakened.
+
+Five interleaved fresh-home release pairs repeated the identical original
+workload and metric definitions above, without competing builds/tests/profilers.
+Every run recorded 48 applies, 120 scroll blocks and seq 258; all apps were
+visible with scrollable documents. Median [min–max] across the five per-run
+medians (or per-run p95s):
+
+| Metric | Original app | Reusable rows |
+| --- | ---: | ---: |
+| Main-actor store apply, µs | 23.792 [17.875–24.750] | 16.312 [15.021–17.480] |
+| Native scroll/display work, ms | 3.288 [1.454–4.708] | 1.410 [1.358–1.430] |
+| Native scroll/display work p95, ms | 28.019 [11.449–29.128] | 38.693 [37.553–39.547] |
+| Display callback interval, ms | 16.677 [16.673–16.681] | 16.675 [16.674–16.676] |
+| Display callback interval p95, ms | 50.006 [33.338–50.021] | 50.042 [50.001–51.245] |
+| App RSS, MiB | 124.906 [123.641–125.609] | 122.172 [118.688–122.328] |
+| Unwanted clip-origin change, points | 1371.500 [777.500–1854.500] | 0.000 [0.000–0.000] |
+
+Median RSS is 2.734 MiB below the original app, recovering the
+reported memory regression. The median scroll-work gain and exact origin retention
+remain. Cold-row p95 regresses from 28.019 ms to 38.693 ms: releasing a row
+requires rebuilding its selectable SwiftUI text layout when it enters view.
+Display callback p95 stays near 50 ms for both arms; this is not the first
+implementation's approximately 17.6 ms tail. The last baseline round was faster than the other baseline rounds;
+it is included in the spread, not discarded. No claim is made that every
+individual scroll is faster or that all of the eager layout's tail benefit
+survives virtualization. Complete raw rounds are in `reuse-*`, with
+`reuse-summary.json`, `reuse-provenance.json` and `perf-reuse.log`.
+
+
+Two additional native-text approaches were measured and rejected. NSTextView
+lowered the pilot scroll tail but used 163.0 MiB RSS. A selectable NSTextField
+version was tested over five interleaved pairs; its candidate RSS was around
+128 MiB, again above baseline. Their sources are not shipped; raw results
+remain in `native-text-pilot-*`, `native-label-pilot-*` and `label-*`. Memory
+is the owner's priority, so the shipped version keeps the lower-RSS SwiftUI
+rows and explicitly reports the cold-row cost. Further reducing this cost
+would require sharing/preparing immutable shaped text without retaining whole
+view trees; its savings and implementation cost have not been established.
+
+Raw attribution is in `heap-before`, `heap-after`, `heap-table-after` (the
+intermediate failed memory approach), `heap-reuse-after` and the final
+`heap-memory-final-after` view-count capture. Each contains
+result.json, heap.txt, vmmap.txt, app/stop logs. The external harness adds only
+a post-result hold for inspection; normal timing rounds do not set that flag.
+A fresh command-line Time Profiler capture of the final reusable-row release
+app also succeeded (`profile-memory-after/ui.trace`), separately from the
+accepted timing rounds.
+
+## Conversation switcher: additional projection scope
+
+The SDK's current public Head has usage, recap and control state but no parent
+identity, child inventory, agent kind or admission/elapsed timing. The paged
+transcript cannot be the switcher's source: a child outside its requested range
+would disappear, and parsing private spawn authority in renderers would violate
+the requested boundary. The spawn's existing admitted_at and runner metadata,
+header parent and execution observations can supply a public projection without
+new durable fields.
+
+The following additional non-test files were requested before implementing B:
+
+- `crates/protocol/src/history.rs`: the typed public head metadata for the
+  conversation tree and its progress statistics.
+- `crates/engine/src/history.rs`: project safe identity/kind/timing from existing
+  facts at the daemon boundary, keeping authority and context images private.
+- `crates/engine/src/driver.rs`: supply existing parent/spawn metadata to that
+  public projection when the session is created or reopened.
+
+This follows the owner brief's file-allocation rule: “If you need another
+non-test file, stop and say exactly which and why in your report.” AGENTS.md
+supplies the architectural boundaries.
+The owner was asked asynchronously; dependent production changes await that
+scope decision. The intended shared SDK tree owns head-only observation and
+retains finished children; each client supplies native keyboard/focus and
+paged transcript navigation. It does not infer status or relationships from
+rendered text. Messaging and stopping use the existing inbox/cancel paths.
+No switcher implementation or switcher test is claimed yet.
 
 ## Checks
 
@@ -188,6 +316,9 @@ external `tgt-app-ux` specified in the brief.
 - Swift suite passed: 35 repository tests, including native scrolling and
   real-daemon output/navigation; one external diagnostic test was skipped.
 - Generated view vectors and new v44 wire corpus pass their reader tests.
+- The memory follow-up's complete Swift suite passed again, including the
+  native row-retention check; `mise run check:windows` passed. No Rust product
+  source changed in this follow-up, so its preceding nextest results stand.
 - `git diff --check` passed. No full CI workflow was dispatched.
 
 The first full Swift invocation omitted its required helper/vector environment
@@ -223,5 +354,5 @@ Only owned probe PIDs were stopped. Each isolated daemon was stopped with its
 exact A_HOME and helper's `daemon stop`. Evidence and the external target remain
 for review; phase-2 cargo clean/target deletion has not run. No history rewrite
 or speculative hardening was added. The child-storage research lane is unaffected.
-Owner review remains necessary for the measured memory tradeoff and unresolved
-white-space attribution. No unmeasured performance saving is projected.
+Owner scope approval remains necessary for the conversation switcher. Cold-row
+scroll tails and unresolved white-space attribution remain limitations. No unmeasured performance saving is projected.

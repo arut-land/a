@@ -18,13 +18,19 @@ public struct TranscriptView<Row: View>: View {
     }
 }
 
-private struct TranscriptEntry: Identifiable, Equatable {
+private struct TranscriptEntry: Equatable {
     struct ID: Hashable {
         let key: UInt64
         let offset: UInt64
     }
     let item: DisplayItem
     let id: ID
+}
+
+private enum TranscriptRow: Equatable {
+    case earlier(Bool)
+    case item(TranscriptEntry)
+    case later(Bool)
 }
 
 private struct TranscriptScroll<Row: View>: NSViewRepresentable {
@@ -50,53 +56,64 @@ private struct TranscriptScroll<Row: View>: NSViewRepresentable {
         let coordinator = context.coordinator
         let entries = coordinator.install(items, history: history, follows: follows)
         coordinator.store = store
-        coordinator.content = { [weak coordinator] width in
-            AnyView(VStack(alignment: .leading, spacing: 10) {
-                if let history, history.start > 0 || history.textStart > 0 {
-                    Button("Earlier messages") { store.loadEarlier() }.disabled(history.pending)
-                }
-                ForEach(entries) { entry in
+        coordinator.content = { entry, width in
+            AnyView(Group {
+                switch entry {
+                case .earlier(let pending):
+                    Button("Earlier messages") { store.loadEarlier() }.disabled(pending)
+                case .item(let entry):
                     row(entry.item)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background {
-                            if let coordinator { TranscriptMarker(id: entry.id, coordinator: coordinator) }
-                        }
-                        .id(entry.id)
-                }
-                if !follows {
+                case .later(let pending):
                     HStack {
-                        Button("Later messages") { store.loadLater() }.disabled(history?.pending == true)
+                        Button("Later messages") { store.loadLater() }.disabled(pending)
                         Button("Latest messages") { store.followLatest() }
                     }
                 }
-            }.padding(16).frame(width: width, alignment: .topLeading))
+            }.frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 16).padding(.vertical, 5)
+                .frame(width: width, alignment: .topLeading))
         }
-        coordinator.update()
+        var rows: [TranscriptRow] = []
+        if let history, history.start > 0 || history.textStart > 0 {
+            rows.append(.earlier(history.pending))
+        }
+        rows += entries.map(TranscriptRow.item)
+        if !follows { rows.append(.later(history?.pending == true)) }
+        coordinator.update(rows)
     }
 }
 
-private final class TranscriptCoordinator: NSObject {
+private final class TranscriptCoordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     private var page: [TranscriptEntry] = []
     private var previous: [TranscriptEntry] = []
+    private var rows: [TranscriptRow] = []
+    private var heights: [TranscriptEntry.ID: (DisplayItem, CGFloat)] = [:]
     private var generation: UInt32?
     private var start: UInt64?
     private var textStart: UInt64?
     private var follows = true
     private var pinned = true
     private var updating = false
-    private var layoutPending = false
     private var lastOrigin: NSPoint = .zero
     private var width: CGFloat = 0
     private weak var scroll: NSScrollView?
-    private let host = TranscriptHost(rootView: AnyView(EmptyView()))
-    fileprivate var markers: [TranscriptEntry.ID: NSView] = [:]
+    private let table = NSTableView()
+    private let measurement = NSHostingView(rootView: AnyView(EmptyView()))
     var store: SessionStore?
-    var content: ((CGFloat) -> AnyView)?
+    var content: ((TranscriptRow, CGFloat) -> AnyView)?
 
     func connect(_ scroll: NSScrollView) {
         self.scroll = scroll
-        scroll.documentView = host
-        host.invalidated = { [weak self] in self?.scheduleLayout() }
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("transcript"))
+        table.addTableColumn(column)
+        table.headerView = nil
+        table.backgroundColor = .clear
+        table.selectionHighlightStyle = .none
+        table.intercellSpacing = .zero
+        table.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
+        table.dataSource = self
+        table.delegate = self
+        scroll.documentView = table
         NotificationCenter.default.addObserver(self, selector: #selector(scrolled),
             name: NSView.boundsDidChangeNotification, object: scroll.contentView)
     }
@@ -128,13 +145,46 @@ private final class TranscriptCoordinator: NSObject {
         }
     }
 
-    func update() {
-        guard let scroll, let content, scroll.contentSize.width > 0 else { return }
+    func update(_ next: [TranscriptRow]) {
+        guard let scroll, scroll.contentSize.width > 0 else { rows = next; return }
         let anchor = visibleAnchor()
         updating = true
+        let resized = width != scroll.contentSize.width
         width = scroll.contentSize.width
-        host.rootView = content(width)
-        layout(anchor: anchor)
+        let keep = Set(next.compactMap { if case .item(let entry) = $0 { entry.id } else { nil } })
+        heights = resized ? [:] : heights.filter { keep.contains($0.key) }
+        let changed = IndexSet(next.indices.filter { $0 >= rows.count || rows[$0] != next[$0] })
+        let replaced = rows.count != next.count || zip(rows, next).contains { old, new in
+            if case .item(let a) = old, case .item(let b) = new { return a.id != b.id }
+            return false
+        }
+        rows = next
+        table.tableColumns[0].width = width
+        table.setFrameSize(NSSize(width: width, height: table.frame.height))
+        let log = OSLog(subsystem: "dev.a.app", category: .pointsOfInterest)
+        os_signpost(.begin, log: log, name: "Transcript layout")
+        if replaced || resized { table.reloadData() }
+        else if !changed.isEmpty {
+            table.noteHeightOfRows(withIndexesChanged: changed)
+            table.reloadData(forRowIndexes: changed, columnIndexes: IndexSet(integer: 0))
+        }
+        table.layoutSubtreeIfNeeded()
+        // A single measuring host replaces full-page retained SwiftUI layout trees.
+        measurement.rootView = AnyView(EmptyView())
+        measurement.layoutSubtreeIfNeeded()
+        let maximum = max(0, table.frame.height - scroll.contentSize.height)
+        let y: CGFloat
+        if pinned && follows { y = maximum }
+        else if let (id, offset) = anchor,
+                let index = rows.firstIndex(where: { if case .item(let entry) = $0 { entry.id == id } else { false } }) {
+            y = table.rect(ofRow: index).minY + offset
+        } else { y = scroll.contentView.bounds.minY }
+        let target = NSPoint(x: 0, y: min(maximum, max(0, y)))
+        if scroll.contentView.bounds.origin != target { scroll.contentView.scroll(to: target) }
+        scroll.reflectScrolledClipView(scroll.contentView)
+        lastOrigin = scroll.contentView.bounds.origin
+        pinned = scroll.contentView.bounds.maxY >= table.frame.height - 1
+        os_signpost(.end, log: log, name: "Transcript layout")
         updating = false
         if pinned && !follows {
             Task { [weak self] in
@@ -149,87 +199,64 @@ private final class TranscriptCoordinator: NSObject {
     private func visibleAnchor() -> (TranscriptEntry.ID, CGFloat)? {
         guard let scroll else { return nil }
         let y = scroll.contentView.bounds.minY
-        return markers.compactMap { id, view -> (TranscriptEntry.ID, CGFloat, CGFloat)? in
-            let frame = view.convert(view.bounds, to: host)
-            guard frame.maxY > y else { return nil }
-            return (id, y - frame.minY, frame.minY)
-        }.min { $0.2 < $1.2 }.map { ($0.0, $0.1) }
+        let range = table.rows(in: scroll.documentVisibleRect)
+        guard range.location != NSNotFound else { return nil }
+        return (range.location..<min(rows.count, range.location + range.length)).compactMap { index in
+            if case .item(let entry) = rows[index] { (entry.id, y - table.rect(ofRow: index).minY) }
+            else { nil }
+        }.first
     }
 
-    private func layout(anchor: (TranscriptEntry.ID, CGFloat)?) {
-        guard let scroll else { return }
-        let log = OSLog(subsystem: "dev.a.app", category: .pointsOfInterest)
-        os_signpost(.begin, log: log, name: "Transcript layout")
-        defer { os_signpost(.end, log: log, name: "Transcript layout") }
-        host.layoutSubtreeIfNeeded()
-        let height = max(host.fittingSize.height, scroll.contentSize.height)
-        if host.frame.size != NSSize(width: width, height: height) {
-            host.setFrameSize(NSSize(width: width, height: height))
+    func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
+
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+        let entry = rows[row]
+        if case .item(let item) = entry, let (old, height) = heights[item.id], old == item.item { return height }
+        measurement.rootView = content?(entry, width) ?? AnyView(EmptyView())
+        measurement.setFrameSize(NSSize(width: width, height: 1))
+        let height = max(1, ceil(measurement.fittingSize.height))
+        if case .item(let item) = entry { heights[item.id] = (item.item, height) }
+        return height
+    }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        let id = NSUserInterfaceItemIdentifier("transcript-row")
+        let host = table.makeView(withIdentifier: id, owner: nil) as? NSHostingView<AnyView>
+            ?? NSHostingView(rootView: AnyView(EmptyView()))
+        host.identifier = id
+        host.rootView = content?(rows[row], width) ?? AnyView(EmptyView())
+        return host
+    }
+
+    func tableView(_ tableView: NSTableView, didRemove rowView: NSTableRowView, forRow row: Int) {
+        for case let host as NSHostingView<AnyView> in rowView.subviews {
+            host.rootView = AnyView(EmptyView())
             host.layoutSubtreeIfNeeded()
         }
-        let maximum = max(0, height - scroll.contentSize.height)
-        let y: CGFloat
-        if pinned && follows {
-            y = maximum
-        } else if let (id, offset) = anchor, let marker = markers[id] {
-            y = marker.convert(marker.bounds, to: host).minY + offset
-        } else {
-            y = scroll.contentView.bounds.minY
-        }
-        let target = NSPoint(x: 0, y: min(maximum, max(0, y)))
-        if scroll.contentView.bounds.origin != target {
-            scroll.contentView.scroll(to: target)
-        }
-        scroll.reflectScrolledClipView(scroll.contentView)
-        lastOrigin = scroll.contentView.bounds.origin
-        pinned = scroll.contentView.bounds.maxY >= height - 1
     }
 
     func wheel(_ delta: CGFloat) {
         guard let scroll, !updating else { return }
         let bounds = scroll.contentView.bounds
         if delta > 0 && bounds.minY <= 0 { store?.loadEarlier() }
-        else if delta < 0 && bounds.maxY >= host.frame.height - 1 && !follows { store?.loadLater() }
+        else if delta < 0 && bounds.maxY >= table.frame.height - 1 && !follows { store?.loadLater() }
     }
 
     func viewportChanged() {
         guard let scroll, !updating, width != scroll.contentSize.width else { return }
-        update()
-    }
-
-    private func scheduleLayout() {
-        guard !layoutPending else { return }
-        layoutPending = true
-        Task { [weak self] in
-            guard let self else { return }
-            self.layoutPending = false
-            guard !self.updating else { return }
-            if let scroll = self.scroll, self.width != scroll.contentSize.width {
-                self.update()
-                return
-            }
-            self.updating = true
-            self.layout(anchor: self.visibleAnchor())
-            self.updating = false
-        }
+        update(rows)
     }
 
     @objc private func scrolled() {
         guard let scroll, !updating else { return }
         let bounds = scroll.contentView.bounds
         if bounds.origin != lastOrigin {
-            pinned = bounds.maxY >= host.frame.height - 1
+            pinned = bounds.maxY >= table.frame.height - 1
             lastOrigin = bounds.origin
         }
-        if width != scroll.contentSize.width {
-            update()
-            return
-        }
-        if bounds.minY <= 0 && host.frame.height > bounds.height {
-            store?.loadEarlier()
-        } else if pinned && !follows {
-            store?.loadLater()
-        }
+        if width != scroll.contentSize.width { update(rows); return }
+        if bounds.minY <= 0 && table.frame.height > bounds.height { store?.loadEarlier() }
+        else if pinned && !follows { store?.loadLater() }
     }
 }
 
@@ -244,47 +271,5 @@ private final class TranscriptScroller: NSScrollView {
     override func scrollWheel(with event: NSEvent) {
         super.scrollWheel(with: event)
         owner?.wheel(event.scrollingDeltaY)
-    }
-}
-
-private final class TranscriptHost: NSHostingView<AnyView> {
-    var invalidated: (() -> Void)?
-
-    override func invalidateIntrinsicContentSize() {
-        super.invalidateIntrinsicContentSize()
-        invalidated?()
-    }
-}
-
-private struct TranscriptMarker: NSViewRepresentable {
-    let id: TranscriptEntry.ID
-    weak var coordinator: TranscriptCoordinator?
-
-    final class Registration {
-        let id: TranscriptEntry.ID
-        weak var owner: TranscriptCoordinator?
-
-        init(id: TranscriptEntry.ID, owner: TranscriptCoordinator?) {
-            self.id = id
-            self.owner = owner
-        }
-    }
-
-    func makeCoordinator() -> Registration { Registration(id: id, owner: coordinator) }
-
-    func makeNSView(context: Context) -> NSView {
-        let view = NSView()
-        coordinator?.markers[id] = view
-        return view
-    }
-
-    func updateNSView(_ view: NSView, context: Context) {
-        coordinator?.markers[id] = view
-    }
-
-    static func dismantleNSView(_ view: NSView, coordinator: Registration) {
-        if coordinator.owner?.markers[coordinator.id] === view {
-            coordinator.owner?.markers.removeValue(forKey: coordinator.id)
-        }
     }
 }

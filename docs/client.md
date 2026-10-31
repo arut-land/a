@@ -73,13 +73,16 @@ are retrieval parameters, never visible labels. A child's stored tool-return
 summary can supply that output reference without restoring the tool card.
 
 The native `SessionStore` still owns only the SDK's demanded range. Its
-`TranscriptView` retains the preceding display page while installing an
+`TranscriptView` retains the preceding display page model while installing an
 adjacent page, including separate identities for fragments of a large text
 item (`HistoryWindow.text_key` and byte offset). Native `NSScrollView` geometry
 tracks whether the viewport is at the bottom. Layout preserves a visible row
 and its pixel offset when reading earlier output, and follows the bottom only
 when pinned there. Revisions do not issue scroll commands. These display pages
 are released with the transcript view; they do not extend SDK history demand.
+An NSTableView realizes visible row views, caching measured heights instead of
+keeping full-page layout trees. Off-screen reusable hosts clear their SwiftUI
+content when removed, releasing text layout and backing layers.
 
 ## Layers
 
