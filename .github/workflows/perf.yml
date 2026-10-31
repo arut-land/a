@@ -7,6 +7,10 @@ on:
     - cron: '17 4 * * 1'
   workflow_dispatch:
     inputs:
+      release_overlap:
+        description: "Native call-entry overlap probe (reopen or turn; empty disables)"
+        default: ''
+        type: string
       census_vmmap:
         description: "Add native Microsoft VMMap snapshots to a Windows census"
         default: false
@@ -94,7 +98,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: perf-${{ github.ref }}-${{ inputs.autostart && 'autostart' || 'measure' }}-${{ inputs.runner || 'all' }}-${{ inputs.source_ref || github.sha }}-${{ inputs.paired_ref }}-${{ inputs.build_only }}-${{ inputs.sessions }}-${{ inputs.residency }}-${{ inputs.alloc_census }}-${{ inputs.census_vmmap }}-${{ inputs.variant || '{}' }}
+  group: perf-${{ github.ref }}-${{ inputs.autostart && 'autostart' || 'measure' }}-${{ inputs.runner || 'all' }}-${{ inputs.source_ref || github.sha }}-${{ inputs.paired_ref }}-${{ inputs.build_only }}-${{ inputs.sessions }}-${{ inputs.residency }}-${{ inputs.alloc_census }}-${{ inputs.census_vmmap }}-${{ inputs.release_overlap }}-${{ inputs.variant || '{}' }}
   cancel-in-progress: false
 
 env:
@@ -105,7 +109,7 @@ env:
 
 jobs:
   residency:
-    if: inputs.residency || inputs.alloc_census || inputs.census_vmmap
+    if: inputs.residency || inputs.alloc_census || inputs.census_vmmap || inputs.release_overlap
     name: residency (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
@@ -126,6 +130,7 @@ jobs:
       PERF_ALLOC_CENSUS: ${{ inputs.alloc_census || inputs.census_vmmap || false }}
       PERF_RESIDENCY_CASES: ${{ inputs.residency_cases }}
       PERF_PAIRED_ROUNDS: ${{ inputs.paired_rounds || '5' }}
+      PERF_RELEASE_OVERLAP: ${{ inputs.release_overlap }}
     steps:
       - name: External build directory
         run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/tgt-native-release" >> "$GITHUB_ENV"
@@ -228,6 +233,7 @@ jobs:
           reference=()
           if [[ -n "$REFERENCE" ]]; then reference+=(--reference-source ../reference); fi
           if [[ "$PERF_ALLOC_CENSUS" == true ]]; then reference+=(--census); fi
+          if [[ -n "$PERF_RELEASE_OVERLAP" ]]; then reference+=(--overlap "$PERF_RELEASE_OVERLAP"); fi
           if [[ -n "$PERF_RESIDENCY_CASES" ]]; then reference+=(--cases "$PERF_RESIDENCY_CASES"); fi
           if [[ -n "${PERF_VMMAP:-}" ]]; then reference+=(--vmmap "$PERF_VMMAP"); fi
           python scripts/perf/residency.py --source ../measured --target "$CARGO_TARGET_DIR" --output "$RUNNER_TEMP/residency-output" --rounds "$PERF_PAIRED_ROUNDS" "${reference[@]}"
@@ -313,7 +319,7 @@ jobs:
           path: ${{ runner.temp }}/idle-charge-output/*.json
 
   measure:
-    if: github.event_name != 'schedule' && !inputs.autostart && !inputs.idle_charge && !inputs.residency && !inputs.alloc_census && !inputs.census_vmmap
+    if: github.event_name != 'schedule' && !inputs.autostart && !inputs.idle_charge && !inputs.residency && !inputs.alloc_census && !inputs.census_vmmap && !inputs.release_overlap
     name: perf (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
     # Churn workloads and twenty-round ablations need longer than the standard suite.

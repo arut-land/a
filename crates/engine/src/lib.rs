@@ -306,21 +306,16 @@ enum Residency {
 type Loaded = Result<Arc<Live>, (io::ErrorKind, String)>;
 
 #[derive(Default)]
-struct Retirement(Option<(rt::Rt, sys::PendingRelease)>);
+struct Retirement(Option<sys::PendingRelease>);
 
 impl Drop for Retirement {
     fn drop(&mut self) {
-        let Some((runtime, pending)) = self.0.take() else {
+        let Some(pending) = self.0.take() else {
             return;
         };
-        let admitted = runtime.spawn_blocking(
-            rt::BlockingClass::Cpu,
-            0,
-            Box::new(|| {
-                pending.run();
-            }),
-        );
-        runtime.spawn(Box::pin(async move { drop(admitted.await) }));
+        let _ = rt::spawn_maintenance(Box::new(|| {
+            pending.run();
+        }));
     }
 }
 
@@ -993,9 +988,7 @@ impl Daemon {
         self.changed(id);
         self.pulse.notify();
         Retirement(if sys::ReleaseLease::ENABLED {
-            lock(&self.slots)
-                .release()
-                .map(|pending| (Arc::clone(&self.shared.rt), pending))
+            lock(&self.slots).release()
         } else {
             None
         })

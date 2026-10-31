@@ -25,6 +25,58 @@ from stats import distribution
 ROOT = Path(__file__).resolve().parents[2]
 
 
+# Applied only to the measured fixture checkout; the exact diff accompanies samples.
+OVERLAP_HOOK = r'''
+    #[cfg(feature = "fixtures")]
+    fn overlap_release(release: impl FnOnce()) -> Option<bool> {
+        use std::io::{Read, Write};
+        let home = std::env::var_os("A_HOME")?;
+        let directory = std::path::PathBuf::from(home).join("release-overlap");
+        if !directory.is_dir() {
+            return None;
+        }
+        if std::fs::remove_file(directory.join("arm")).is_err() {
+            return Some(false);
+        }
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        std::fs::write(directory.join("port"), listener.local_addr().unwrap().port().to_string()).unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_nodelay(true).unwrap();
+        let mut command = [0];
+        stream.read_exact(&mut command).unwrap();
+        stream.write_all(b"B").unwrap();
+        let now = || u64::try_from(std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()).unwrap();
+        let begin_ns = now();
+        let started = std::time::Instant::now();
+        if command[0] == b'R' {
+            release();
+        }
+        let native_ns = started.elapsed().as_nanos();
+        let end_ns = now();
+        writeln!(stream, "{}", serde_json::json!({"begin_ns": begin_ns, "end_ns": end_ns,
+            "native_ns": native_ns, "released": command[0] == b'R'})).unwrap();
+        Some(command[0] == b'R')
+    }
+'''
+
+
+def instrument_overlap(source, output):
+    path = source / "crates/sys/src/memory.rs"
+    text = path.read_text()
+    begin = text.index('        #[cfg(target_os = "linux")]\n        {\n            // Keep the main arena')
+    end = text.index('        true\n', begin)
+    release = text[begin:end]
+    text = text[:begin] + ('        #[cfg(feature = "fixtures")]\n'
+                           '        if let Some(result) = overlap_release(|| {\n' + release +
+                           '        }) { return result; }\n') + text[begin:]
+    text = text.replace('    #[cfg(target_os = "linux")]\n    struct Batch {',
+                        OVERLAP_HOOK + '\n    #[cfg(target_os = "linux")]\n    struct Batch {', 1)
+    path.write_text(text)
+    (output / "overlap-instrumentation.patch").write_bytes(subprocess.check_output(
+        ["git", "diff", "--", "crates/sys/src/memory.rs"], cwd=source))
+
+
 def cargo_run(command, **kwargs):
     cargo = subprocess.check_output(["rustup", "which", "cargo"], cwd=kwargs.get("cwd"),
                                     env=kwargs.get("env"), text=True).strip()
@@ -378,6 +430,42 @@ fn main() {
                 }
                 serde_json::json!({"ms": ms, "items": items})
             }
+            "overlap" => {
+                use std::io::Read;
+                let id: SessionId = serde_json::from_value(value["id"].clone()).unwrap();
+                let turn = value["action"] == "turn";
+                let prepared = turn.then(|| Client::attach(&home, Target::Id(id)).0);
+                let input = "overlap: ".to_owned() + &"x".repeat(value["bytes"].as_u64().unwrap() as usize);
+                let mut stream = std::net::TcpStream::connect(("127.0.0.1", value["port"].as_u64().unwrap() as u16)).unwrap();
+                stream.set_nodelay(true).unwrap();
+                stream.write_all(if value["release"] == true { b"R" } else { b"C" }).unwrap();
+                let mut marker = [0];
+                stream.read_exact(&mut marker).unwrap();
+                assert_eq!(marker, *b"B");
+                let now = || u64::try_from(std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()).unwrap();
+                let begin_ns = now();
+                let started = Instant::now();
+                let client = if let Some(mut client) = prepared {
+                    let since = client.head.as_ref().unwrap().cut.seq;
+                    protocol::write_frame(&mut client.stream, &ClientMsg::Input {
+                        segments: input.clone().into(), mode: Default::default(),
+                        force: false, client_seq: None,
+                    }).unwrap();
+                    client.reply(&home, since, &input);
+                    client
+                } else {
+                    Client::attach(&home, Target::Id(id)).0
+                };
+                let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+                let end_ns = now();
+                let mut native = String::new();
+                BufReader::new(stream).read_line(&mut native).unwrap();
+                let native: serde_json::Value = serde_json::from_str(&native).unwrap();
+                client.detach();
+                serde_json::json!({"action": value["action"], "begin_ns": begin_ns,
+                    "end_ns": end_ns, "ms": elapsed_ms, "native": native})
+            }
             "turns" => {
                 let count = value["count"].as_u64().unwrap();
                 let bytes = value["bytes"].as_u64().unwrap() as usize;
@@ -687,7 +775,7 @@ def page_faults(pid):
             if key in ("minor_faults", "major_faults", "pfaults", "pageins", "num_page_faults")}
 
 
-def sample(binary, probe_binary, output, stored, count, turns, size, idle_seconds, census=False, vmmap=None):
+def sample(binary, probe_binary, output, stored, count, turns, size, idle_seconds, census=False, vmmap=None, overlap=None):
     with daemon(str(binary), output) as active:
         # lifecycle owns startup/teardown; restart applies this benchmark's
         # hibernation interval without changing the shared helper or product.
@@ -700,6 +788,8 @@ def sample(binary, probe_binary, output, stored, count, turns, size, idle_second
             active.census_output = output
             active.vmmap, active.census_index = vmmap, 0
             active.census.mkdir()
+        if overlap:
+            (active.home / "release-overlap").mkdir()
         checked([str(binary), "ls"], env=active.env, cwd=active.home, timeout=60)
         active.pid = int((active.home / "run/daemon.pid").read_text().splitlines()[0])
         if census:
@@ -755,10 +845,22 @@ def sample(binary, probe_binary, output, stored, count, turns, size, idle_second
                     assert next(row for row in rows if row["id"] == ids[0])["clients"] == 1
                     stages[f"wave{wave}_slow"] = dict(observe(probe, active, idle_seconds), catalog=rows)
                     assert probe.call("drain")["complete"]
+                if overlap and wave == 2:
+                    (active.home / "release-overlap/arm").touch()
                 ack = hibernate(probe, stored)
                 time.sleep(12)
                 stages[f"wave{wave}_hibernated"] = dict(observe(probe, active, idle_seconds), acknowledgement=ack)
             stages["wave2_hibernated"]["maps"] = memory_maps(active.pid)
+            if overlap:
+                port = active.home / "release-overlap/port"
+                deadline = time.monotonic() + 30
+                while not port.exists():
+                    if time.monotonic() > deadline:
+                        raise TimeoutError("native policy did not reach the armed release boundary")
+                    time.sleep(.01)
+                stages["overlap"] = probe.call("overlap", port=int(port.read_text()),
+                    release=overlap[0], action=overlap[1], id=ids[0], bytes=size)
+                return stages
             before = page_faults(active.pid)
             reopened = [probe.call("attach", id=id) for id in ids[:max(1, count)]]
             after = page_faults(active.pid)
@@ -919,6 +1021,7 @@ def main():
     parser.add_argument("--cases", help="explicit stored:active pairs for a focused diagnostic cohort")
     parser.add_argument("--vmmap", type=Path, help="native VMMap executable; census diagnostics only")
     parser.add_argument("--census", action="store_true", help="instrumented native allocator cohort; excluded from timing claims")
+    parser.add_argument("--overlap", choices=["reopen", "turn"], help="fixture call-entry overlap, paired native release versus no-op")
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--stored", default="1,8,32")
     parser.add_argument("--active", default="1,4,8")
@@ -950,6 +1053,10 @@ def main():
         parser.error("select a fresh output directory; existing samples must not be mixed")
     output.mkdir(parents=True, exist_ok=True)
     os.environ["A_HOME"] = str(output / "test-home")
+    if args.overlap:
+        if args.census or args.reference_source or args.reference_binary or args.binary:
+            parser.error("overlap uses one identically instrumented executable for release/no-op pairs")
+        instrument_overlap(source, output)
     if args.census:
         test_env = environment(target)
         if sys.platform == "linux" and platform.machine() == "aarch64":
@@ -986,7 +1093,7 @@ def main():
                     census_module_sha256=hashlib.sha256((source / "crates/sys/src/census.rs").read_bytes()).hexdigest() if args.census else None,
                     binaries={str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in (binary, reference, probe)},
                     labels=dict(A=str(reference), A2=str(binary)),
-                    parameters=dict(census=args.census, cases=cases, vmmap=str(args.vmmap) if args.vmmap else None, stored=stored, active=counts, turns=args.turns, bytes=args.bytes, idle_seconds=args.idle_seconds))
+                    parameters=dict(census=args.census, overlap=args.overlap, cases=cases, vmmap=str(args.vmmap) if args.vmmap else None, stored=stored, active=counts, turns=args.turns, bytes=args.bytes, idle_seconds=args.idle_seconds))
     (output / "residency-host.json").write_text(json.dumps(metadata, indent=2) + "\n")
     if args.build_only:
         return
@@ -997,7 +1104,8 @@ def main():
                 print(f"round={round} {label} stored={total} active={active}", flush=True)
                 record = dict(round=round, label=label, stored=total, active=active)
                 try:
-                    record["stages"] = sample(reference if label == "A" else binary, probe, output, total, active, args.turns, args.bytes, args.idle_seconds, args.census, args.vmmap)
+                    record["stages"] = sample(reference if label == "A" else binary, probe, output, total, active, args.turns, args.bytes, args.idle_seconds, args.census, args.vmmap,
+                                              (label == "A2", args.overlap) if args.overlap else None)
                 except Exception as error:
                     record["failure"] = repr(error)
                     with (output / "residency-failures.jsonl").open("a") as stream:

@@ -104,6 +104,18 @@ pub mod watch;
 /// A shared handle to the runtime a component was given.
 pub type Rt = Arc<dyn Runtime>;
 
+/// Starts best-effort maintenance on its own utility worker, which exits with the job.
+/// It consumes no foreground pool capacity and leaves no idle worker behind.
+pub fn spawn_maintenance(work: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+    thread::Builder::new()
+        .name("rt-maintenance".into())
+        .spawn(move || {
+            let _priority = sys::resources::Priority::utility();
+            work();
+        })
+        .map(drop)
+}
+
 /// How many times a thread waiting in [`block_on`] has woken.
 static WAKES: AtomicU64 = AtomicU64::new(0);
 
