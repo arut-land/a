@@ -1057,6 +1057,7 @@ def main():
     parser.add_argument("--vmmap", type=Path, help="native VMMap executable; census diagnostics only")
     parser.add_argument("--census", action="store_true", help="instrumented native allocator cohort; excluded from timing claims")
     parser.add_argument("--overlap", choices=["reopen", "turn"], help="fixture call-entry overlap, paired native release versus no-op")
+    parser.add_argument("--reference-check", choices=["attach-budget", "windows-suite"])
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--stored", default="1,8,32")
     parser.add_argument("--active", default="1,4,8")
@@ -1088,6 +1089,32 @@ def main():
         parser.error("select a fresh output directory; existing samples must not be mixed")
     output.mkdir(parents=True, exist_ok=True)
     os.environ["A_HOME"] = str(output / "test-home")
+    if args.reference_check:
+        test_env = environment(target)
+        if args.reference_check == "attach-budget":
+            binary = stage(executable(source, test_env, ["--features", "fixtures"], run=cargo_run), output / ("a-main" + SUFFIX))
+            test_env.update(A_BIN=str(binary), A_STRICT_BUDGETS="1")
+            command = ["cargo", "nextest", "run", "--workspace", "-E",
+                       "package(a) & test(=budgets::attaching_takes_under_2ms_at_p99)",
+                       "--run-ignored", "ignored-only", "--test-threads", "1", "--no-capture", "--no-tests=fail"]
+        else:
+            test_env["NEXTEST_PROFILE"] = "windows"
+            test_env["A_TEST_POWERSHELL"] = ";".join([shutil.which("pwsh.exe"),
+                str(Path(test_env["SYSTEMROOT"]) / "System32/WindowsPowerShell/v1.0/powershell.exe")])
+            cargo_run(["cargo", "build", "-p", "a"], cwd=source, env=test_env, check=True)
+            command = ["cargo", "nextest", "run", "--workspace", "--features", "a/lua", "--no-tests=fail", "--no-fail-fast"]
+        metadata = dict(revision=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip(),
+                        working_tree=subprocess.check_output(["git", "status", "--short"], cwd=source, text=True),
+                        command=command, check=args.reference_check, rounds=5)
+        (output / "main-proof-source.json").write_text(json.dumps(metadata, indent=2))
+        trials = []
+        for round in range(5):
+            result = cargo_run(command, cwd=source, env=test_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            (output / f"main-proof-{round}.txt").write_text(result.stdout)
+            print(result.stdout, flush=True)
+            trials.append(dict(round=round, returncode=result.returncode))
+            (output / "main-proof-trials.json").write_text(json.dumps(trials, indent=2))
+        return
     if args.overlap:
         if args.census or args.reference_source or args.reference_binary or args.binary:
             parser.error("overlap uses one identically instrumented executable for release/no-op pairs")
