@@ -2422,3 +2422,42 @@ fn agent_switching_and_stopping_work_in_both_terminal_buffers() {
         assert!(app.conversation_at.is_none());
     }
 }
+
+#[test]
+fn family_insertions_keep_keyboard_actions_on_the_selected_session() {
+    for viewport in [Viewport::Full, Viewport::Inline] {
+        let (mut app, main) = app(viewport, &[]);
+        let a = SessionId::new();
+        let b = SessionId::new();
+        let grandchild = SessionId::new();
+        let row = |session, parent, depth| client::ConversationRow {
+            session,
+            parent,
+            depth,
+            agent: "echo".into(),
+            title: "worker".into(),
+            status: client::ConversationStatus::Running,
+            admitted_unix_ms: None,
+            elapsed_ns: None,
+            usage: protocol::view::Usage::default(),
+        };
+        let mut rows = vec![
+            row(main, None, 0),
+            row(a, Some(main), 1),
+            row(b, Some(main), 1),
+        ];
+        app.conversations(rows.clone());
+        for _ in 0..3 {
+            app.input(Input::Key(Key::Down));
+        }
+        rows.insert(2, row(grandchild, Some(a), 2));
+        app.conversations(rows);
+        assert_eq!(app.conversation_at, Some(3), "{viewport:?}");
+        assert!(
+            matches!(app.input(Input::Key(Key::Char('x'))), Some(Effect::StopConversation(id)) if id == b)
+        );
+        assert!(
+            matches!(app.input(Input::Key(Key::Enter)), Some(Effect::Cmd(Cmd::Open(Target::Id(id)))) if id == b)
+        );
+    }
+}

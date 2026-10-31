@@ -482,6 +482,10 @@ impl App {
     }
 
     pub fn conversations(&mut self, rows: Vec<client::ConversationRow>) {
+        self.conversation_at = self
+            .conversation_at
+            .and_then(|at| self.conversations.get(at))
+            .and_then(|selected| rows.iter().position(|row| row.session == selected.session));
         self.conversations = rows;
         self.redraw = true;
         self.composed = None;

@@ -7,6 +7,52 @@ import Testing
 
 @Suite(.serialized)
 struct NativeTranscriptTests {
+    @Test
+    func streaming_growth_remeasures_only_the_reply_and_preserves_viewport_pinning() async throws {
+        let vector = try #require(Vector.all.first { $0.name == "retry replaces streamed text at every length" })
+        let reducer = Reducer()
+        let store = SessionStore(source: reducer)
+        for message in vector.messages {
+            if let update = try reducer.fold(message: message) { store.apply(update) }
+            if store.streaming != nil && store.items.contains(where: { $0.kind == .reply }) { break }
+        }
+        let stream = try #require(store.streaming)
+        let items = store.items
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 300),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
+        let host = NSHostingView(rootView: TranscriptView(store: store) { item in
+            Text(item.kind == .reply ? store.streaming?.text ?? "" : item.presentation.body?.text ?? "")
+                .font(.body.monospaced()).fixedSize(horizontal: false, vertical: true)
+        })
+        window.contentView = host
+        window.orderFront(nil)
+        try await Task.sleep(for: .milliseconds(100))
+        let scroll = try #require(findScrollView(host))
+        let table = try #require(scroll.documentView as? NSTableView)
+        let row = try #require(items.firstIndex { $0.key == stream.call })
+        let before = table.rect(ofRow: row).height
+        func appendLines() {
+            store.apply(ChangeBatch(history: nil, revision: store.rev + 1, retainedBytes: 0, seq: store.seq,
+                changes: [.delta(call: stream.call, text: String(repeating: "streamed line\n", count: 30))],
+                turn: store.turn, streaming: StreamId(call: stream.call, attempt: stream.attempt), title: store.title))
+        }
+        appendLines()
+        try await eventually("streamed reply grows without an item change") { table.rect(ofRow: row).height > before + 300 }
+        #expect(store.items == items)
+        #expect(abs(scroll.contentView.bounds.maxY - table.frame.height) <= 1)
+        scroll.contentView.scroll(to: NSPoint(x: 0, y: 50))
+        scroll.reflectScrolledClipView(scroll.contentView)
+        try await Task.sleep(for: .milliseconds(100))
+        let origin = scroll.contentView.bounds.origin
+        let height = table.rect(ofRow: row).height
+        appendLines()
+        try await eventually("scrolled-up reply continues growing") { table.rect(ofRow: row).height > height + 300 }
+        #expect(scroll.contentView.bounds.origin == origin)
+        #expect(store.items == items)
+    }
+
     @Test(.enabled(if: live != nil))
     func external_updates_preserve_the_native_viewport_when_scrolled_up() async throws {
         let client = try Client(helper: live!)
@@ -202,7 +248,10 @@ struct NativeTranscriptTests {
         defer { store.stop() }
         await parent.send("spawn picker child")
         try await eventually("picker family ready") { store.rows.count == 2 && store.rows.allSatisfy { !$0.running && $0.status != "connecting" } }
-        let child = try #require(store.rows.first { $0.parent == id })
+        await parent.send("spawn second picker child")
+        try await eventually("second picker child ready") { store.rows.count == 3 && store.rows.allSatisfy { !$0.running && $0.status != "connecting" } }
+        let first = store.rows[1]
+        let child = store.rows[2]
         let selection = ConversationSelection()
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 800, height: 200), styleMask: [.titled], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
@@ -221,7 +270,15 @@ struct NativeTranscriptTests {
                 isARepeat: false, keyCode: code)!)
         }
         key(125, "\u{F701}")
+        key(125, "\u{F701}")
+        let branch = SessionStore(session: Session(client: client))
+        branch.open(.id(id: first.id))
+        try await eventually("first child attached for nested spawn") { branch.link == .live }
+        await branch.send("spawn nested picker child")
+        try await eventually("grandchild inserted before the selected child") { store.rows.count == 4 }
         try await Task.sleep(for: .milliseconds(100))
+        let reordered = try #require(findScrollView(host)?.documentView as? NSTableView)
+        #expect(reordered.selectedRow == 3)
         key(36, "\r")
         try await eventually("Return activates the selected child") { selection.opened == child.id }
         host.rootView = ConversationSwitcher(store: store, current: child.id,
@@ -229,10 +286,11 @@ struct NativeTranscriptTests {
             open: { selection.opened = $0 })
         try await Task.sleep(for: .milliseconds(100))
         let table = try #require(findScrollView(host)?.documentView as? NSTableView)
-        let marker = try #require(table.view(atColumn: 0, row: 1, makeIfNecessary: true) as? NSTextField)
+        let marker = try #require(table.view(atColumn: 0, row: 3, makeIfNecessary: true) as? NSTextField)
         #expect(marker.stringValue.hasPrefix("●"))
         key(53, "\u{1b}")
         try await eventually("Escape returns to the composer") { !selection.managing }
+        await branch.detach()
         await parent.detach()
     }
 

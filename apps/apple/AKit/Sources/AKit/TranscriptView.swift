@@ -16,7 +16,7 @@ public struct TranscriptView<Row: View>: View {
 
     public var body: some View {
         TranscriptScroll(store: store, items: store.items, history: store.history,
-                         follows: store.followsHistory, row: row, text: text)
+                         follows: store.followsHistory, streaming: store.streaming, row: row, text: text)
     }
 }
 
@@ -27,6 +27,7 @@ private struct TranscriptEntry: Equatable {
     }
     let item: DisplayItem
     let text: NativeTranscriptText?
+    let streaming: StreamingText?
     let id: ID
 }
 
@@ -47,6 +48,7 @@ private struct TranscriptScroll<Row: View>: NSViewRepresentable {
     let items: [DisplayItem]
     let history: HistoryWindow?
     let follows: Bool
+    let streaming: StreamingText?
     let row: (DisplayItem) -> Row
     let text: (DisplayItem) -> NativeTranscriptText?
 
@@ -64,7 +66,7 @@ private struct TranscriptScroll<Row: View>: NSViewRepresentable {
 
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         let coordinator = context.coordinator
-        let entries = coordinator.install(items, text: text, history: history, follows: follows)
+        let entries = coordinator.install(items, text: text, streaming: streaming, history: history, follows: follows)
         coordinator.store = store
         coordinator.content = { entry, width in
             AnyView(Group {
@@ -129,7 +131,7 @@ private final class TranscriptCoordinator: NSObject, NSTableViewDataSource, NSTa
             name: NSView.boundsDidChangeNotification, object: scroll.contentView)
     }
 
-    func install(_ items: [DisplayItem], text: (DisplayItem) -> NativeTranscriptText?, history: HistoryWindow?, follows: Bool) -> [TranscriptEntry] {
+    func install(_ items: [DisplayItem], text: (DisplayItem) -> NativeTranscriptText?, streaming: StreamingText?, history: HistoryWindow?, follows: Bool) -> [TranscriptEntry] {
         if generation != history?.generation {
             page = []
             previous = []
@@ -147,7 +149,7 @@ private final class TranscriptCoordinator: NSObject, NSTableViewDataSource, NSTa
             textStart = history?.textStart
         }
         page = items.map { item in
-            TranscriptEntry(item: item, text: text(item), id: .init(key: item.key,
+            TranscriptEntry(item: item, text: text(item), streaming: item.kind == .reply && streaming?.call == item.key ? streaming : nil, id: .init(key: item.key,
                 offset: history?.textKey == item.key ? history?.textStart ?? 0 : 0))
         }
         let current = Set(page.map(\.id))

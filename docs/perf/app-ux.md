@@ -9,8 +9,8 @@ adjacent history pages.
 
 The native memory and cold-row follow-ups are included in the final measurements
 below. The owner's white-space screenshot remains pending; that symptom has not
-been attributed or claimed fixed. Full CI has not been dispatched. Phase 2 waits
-for the owner's instruction after independent review.
+been attributed or claimed fixed. Phase 1 did not dispatch full CI. The phase-2 review fixes and final CI result
+are recorded at the end.
 
 ## Reproduction and root causes
 
@@ -292,3 +292,42 @@ generated bindings and build artifacts stayed outside the worktree. Only owned
 probe PIDs were stopped, and every isolated daemon uses its exact A_HOME with
 `a daemon stop`. Evidence and the external target remain for review; phase-2
 clean/deletion has not run. No history rewrite or child-storage redesign occurred.
+
+
+## Phase 2: independent review fixes
+
+Streaming reply deltas change `SessionStore.streaming` without changing committed
+transcript entries. The native measurement cache therefore retained the reply's
+initial height. Each entry now includes only its own active reply's streaming
+text/attempt in measurement equality. Deltas invalidate that row's cached height
+without changing its stable anchor ID or invalidating unrelated rows. A real
+NSWindow regression feeds the shared recorded reducer stream, adds 30 lines with
+no item change, and asserts the native row grows while following the bottom.
+A second 30-line delta while scrolled up grows the row without moving the clip
+origin. This regression timed out on the previous implementation and passes
+with the fix (`p2-stream-red.log`, `p2-swift.log`).
+
+The TUI retained a selected array index across family snapshots. A grandchild
+inserted before child B moved keyboard actions to that new row. Snapshot delivery
+now resolves the previously selected SessionId in the new list before replacing
+its rows. The invariant test checks both alternate-screen and inline modes and
+asserts x and Enter still target B after insertion (`p2-selection-red.log`,
+`p2-nextest.log`). It fails against the preceding implementation.
+
+The macOS switcher already saves the selected SessionId before reload and finds
+its new row afterward. Its native keyboard test now spawns two children, selects
+B, creates A's grandchild through A's actual inbox, and checks selection moves
+to B's new row before Return activates B. Web rows likewise use stable
+session-derived DOM IDs and actions read the focused row's session ID. The
+browser regression opens A in a second authenticated tab, inserts its grandchild
+before focused B, and checks focus, roving tabindex and Enter still target B.
+No production selection change was necessary in these two clients.
+
+Local verification: 134 TUI/web nextest tests passed (3 skipped); the complete
+Swift suite completed 41 tests (one external diagnostic skipped), including the
+new streaming and native insertion checks. Clippy, formatting, the native Release
+build and the Windows lint passed. Initial extended browser runs failed test setup while establishing a shared
+authenticated context; the corrected test creates an explicit browser context
+and both tabs share it. The focused browser journey passes (`p2-web-3.log`). The complete package(a) result and hosted CI
+result are recorded below when complete. Phase-1 performance numbers above refer
+to its measured candidate; they were not rerun for these two correctness fixes.
