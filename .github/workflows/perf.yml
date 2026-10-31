@@ -325,6 +325,18 @@ jobs:
       - uses: actions/upload-artifact@v5
         if: always()
         with:
+          name: log-cuts-cpu-samples-${{ matrix.runner }}
+          path: |
+            ${{ runner.temp }}/log-cuts-cpu/builds.json
+            ${{ runner.temp }}/log-cuts-cpu/samples/**/result.json
+            ${{ runner.temp }}/log-cuts-cpu/samples/**/turns.jsonl
+            ${{ runner.temp }}/log-cuts-cpu/samples/summary.json
+            ${{ runner.temp }}/log-cuts-cpu/samples/machine.json
+            ${{ runner.temp }}/cpu-review.py
+          retention-days: 14
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
           name: log-cuts-cpu-${{ matrix.runner }}
           path: |
             ${{ runner.temp }}/log-cuts-cpu
