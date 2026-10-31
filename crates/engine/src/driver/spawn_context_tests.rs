@@ -7,6 +7,7 @@ use protocol::{Entry, Epoch, Mode, Seq};
 fn checking_a_new_spawn_never_decodes_settled_admissions() {
     let mut links: Vec<_> = (1..=256)
         .map(|seq| protocol::ledger::Link {
+            call: CallId::new(seq).unwrap(),
             seq: Seq::new(seq).unwrap(),
             child: SessionId::new(),
             input: "child".into(),
@@ -23,6 +24,7 @@ fn checking_a_new_spawn_never_decodes_settled_admissions() {
     assert!(admissions.last(&links, call).is_none());
     assert_eq!(SPAWN_READS.with(std::cell::Cell::take), 0);
     links.push(protocol::ledger::Link {
+        call,
         seq: Seq::new(257).unwrap(),
         child: SessionId::new(),
         input: "new".into(),

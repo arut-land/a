@@ -18,7 +18,7 @@ pub use question::{
 };
 
 /// The exact protocol this build speaks.
-pub const PROTO: u32 = 43;
+pub const PROTO: u32 = 44;
 
 /// Ordinary payloads leave 4 KiB per reserved control slot for cancellation.
 #[derive(Clone, Copy)]
@@ -471,10 +471,10 @@ kinds! {
         /// started is dropped.
         Interrupt "interrupt" { origin: Option<Author> = default } = Durable;
         // ── topology ───────────────────────────────────────────────────
-        /// The committed intent to start session `child` with `input`. Its seq
-        /// is the call that owns the child; the child's id is chosen before the
+        /// Call `call` committed to starting `child` with `input`. Its seq
+        /// identifies the link used by waits; the child's id is chosen before
         /// commit, so recovery finds the child instead of making another.
-        Link "link" { child: SessionId, input: String, intent: Json } = Durable;
+        Link "link" { call: CallId, child: SessionId, input: String, intent: Json } = Durable;
         /// The committed intent to send `payload` to `recipients`, the set
         /// the session's route resolved its address to, once: each is
         /// delivered an [`Envelope`] under the one id.
@@ -3194,6 +3194,7 @@ mod tests {
         let child = SessionId(Uuid::from_u128(1));
         let entries = [
             Body::Link {
+                call: CallId::new(1).unwrap(),
                 intent: Json::null(),
                 child,
                 input: "hi".into(),
@@ -3212,7 +3213,7 @@ mod tests {
         assert_eq!(
             json,
             [
-                format!(r#"{{"kind":"link","child":"{id}","input":"hi","intent":null}}"#),
+                format!(r#"{{"kind":"link","call":1,"child":"{id}","input":"hi","intent":null}}"#),
                 format!(r#"{{"kind":"watch","child":"{id}"}}"#),
                 r#"{"kind":"fired","watch":2,"outcome":{"status":"interrupted"}}"#.to_owned(),
             ]

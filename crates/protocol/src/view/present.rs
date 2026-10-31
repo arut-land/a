@@ -11,6 +11,9 @@ use crate::{
     ToolOutcome, Verdict, WaitOn,
 };
 
+/// The action that retrieves an output held outside the transcript.
+pub const OPEN_OUTPUT: &str = "Open output";
+
 /// What an item is, for the layout a renderer gives it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -91,10 +94,7 @@ impl Shown<'_> {
             Self::Text(text) => Cow::Borrowed(text),
             Self::Diff(text) | Self::Markdown(text) => Cow::Borrowed(text),
             Self::Json(json) => Cow::Owned(json.to_string()),
-            Self::Held(blob) => Cow::Owned(format!(
-                "{} bytes of {}, held as blob {}",
-                blob.size, blob.media_type, blob.id
-            )),
+            Self::Held(blob) => Cow::Owned(format!("Output · {} bytes", blob.size)),
         }
     }
 }
@@ -202,8 +202,22 @@ impl Item {
                 fired,
                 ..
             } => {
-                let title = format!("child {}", child.short());
-                let mut p = plain(Kind::Child, title.into(), Shown::Text(input.into()));
+                let title = format!("child {} · {}", child.short(), super::short(input));
+                let body = match fired {
+                    Some(Outcome::Done {
+                        output: Payload::Blob(blob),
+                    }) => Shown::Held(blob),
+                    Some(Outcome::Done {
+                        output: Payload::Inline(output),
+                    }) => {
+                        let text = output
+                            .parse::<String>()
+                            .unwrap_or_else(|_| output.to_string());
+                        Shown::Text(super::short(&text).into())
+                    }
+                    _ => Shown::None,
+                };
+                let mut p = plain(Kind::Child, title.into(), body);
                 (p.glyph, p.status) = match fired {
                     None => (Glyph::Busy, "running…".into()),
                     Some(Outcome::Done { .. }) => (Glyph::Ok, "done".into()),

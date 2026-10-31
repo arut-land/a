@@ -2,6 +2,592 @@
   {
     "frames": [
       "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
+      "{\"epoch\":0,\"input\":null,\"kind\":\"tool_call\",\"seq\":1,\"t\":\"entry\",\"tool\":\"task\"}",
+      "{\"epoch\":0,\"input\":null,\"kind\":\"tool_call\",\"seq\":2,\"t\":\"entry\",\"tool\":\"task\"}",
+      "{\"call\":1,\"child\":\"00000000-0000-0000-0000-000000000064\",\"epoch\":0,\"input\":\"summarize the work\",\"intent\":null,\"kind\":\"link\",\"seq\":3,\"t\":\"entry\"}",
+      "{\"call\":1,\"epoch\":0,\"kind\":\"wait\",\"link\":3,\"on\":\"child\",\"seq\":4,\"t\":\"entry\"}",
+      "{\"child\":\"00000000-0000-0000-0000-000000000064\",\"epoch\":0,\"kind\":\"watch\",\"seq\":5,\"t\":\"entry\"}",
+      "{\"epoch\":0,\"kind\":\"fired\",\"outcome\":{\"output\":\"completed child result\",\"status\":\"done\"},\"seq\":6,\"t\":\"entry\",\"watch\":5}",
+      "{\"call\":1,\"epoch\":0,\"kind\":\"tool_result\",\"outcome\":{\"output\":\"redundant tool result\",\"status\":\"done\"},\"seq\":7,\"t\":\"entry\"}",
+      "{\"call\":2,\"child\":\"00000000-0000-0000-0000-000000000065\",\"epoch\":0,\"input\":\"summarize the work\",\"intent\":null,\"kind\":\"link\",\"seq\":8,\"t\":\"entry\"}",
+      "{\"call\":2,\"epoch\":0,\"kind\":\"wait\",\"link\":8,\"on\":\"child\",\"seq\":9,\"t\":\"entry\"}",
+      "{\"child\":\"00000000-0000-0000-0000-000000000065\",\"epoch\":0,\"kind\":\"watch\",\"seq\":10,\"t\":\"entry\"}",
+      "{\"epoch\":0,\"kind\":\"fired\",\"outcome\":{\"output\":\"completed child result\",\"status\":\"done\"},\"seq\":11,\"t\":\"entry\",\"watch\":10}",
+      "{\"call\":2,\"epoch\":0,\"kind\":\"tool_result\",\"outcome\":{\"output\":\"redundant tool result\",\"status\":\"done\"},\"seq\":12,\"t\":\"entry\"}",
+      "{\"seq\":12,\"t\":\"synced\"}"
+    ],
+    "hash": "3dab3de8c4cc14a4",
+    "messages": [
+      {
+        "session": "00000000-0000-0000-0000-00000000000a",
+        "t": "attached",
+        "workspace": "/w"
+      },
+      {
+        "epoch": 0,
+        "input": null,
+        "kind": "tool_call",
+        "seq": 1,
+        "t": "entry",
+        "tool": "task"
+      },
+      {
+        "epoch": 0,
+        "input": null,
+        "kind": "tool_call",
+        "seq": 2,
+        "t": "entry",
+        "tool": "task"
+      },
+      {
+        "call": 1,
+        "child": "00000000-0000-0000-0000-000000000064",
+        "epoch": 0,
+        "input": "summarize the work",
+        "intent": null,
+        "kind": "link",
+        "seq": 3,
+        "t": "entry"
+      },
+      {
+        "call": 1,
+        "epoch": 0,
+        "kind": "wait",
+        "link": 3,
+        "on": "child",
+        "seq": 4,
+        "t": "entry"
+      },
+      {
+        "child": "00000000-0000-0000-0000-000000000064",
+        "epoch": 0,
+        "kind": "watch",
+        "seq": 5,
+        "t": "entry"
+      },
+      {
+        "epoch": 0,
+        "kind": "fired",
+        "outcome": {
+          "output": "completed child result",
+          "status": "done"
+        },
+        "seq": 6,
+        "t": "entry",
+        "watch": 5
+      },
+      {
+        "call": 1,
+        "epoch": 0,
+        "kind": "tool_result",
+        "outcome": {
+          "output": "redundant tool result",
+          "status": "done"
+        },
+        "seq": 7,
+        "t": "entry"
+      },
+      {
+        "call": 2,
+        "child": "00000000-0000-0000-0000-000000000065",
+        "epoch": 0,
+        "input": "summarize the work",
+        "intent": null,
+        "kind": "link",
+        "seq": 8,
+        "t": "entry"
+      },
+      {
+        "call": 2,
+        "epoch": 0,
+        "kind": "wait",
+        "link": 8,
+        "on": "child",
+        "seq": 9,
+        "t": "entry"
+      },
+      {
+        "child": "00000000-0000-0000-0000-000000000065",
+        "epoch": 0,
+        "kind": "watch",
+        "seq": 10,
+        "t": "entry"
+      },
+      {
+        "epoch": 0,
+        "kind": "fired",
+        "outcome": {
+          "output": "completed child result",
+          "status": "done"
+        },
+        "seq": 11,
+        "t": "entry",
+        "watch": 10
+      },
+      {
+        "call": 2,
+        "epoch": 0,
+        "kind": "tool_result",
+        "outcome": {
+          "output": "redundant tool result",
+          "status": "done"
+        },
+        "seq": 12,
+        "t": "entry"
+      },
+      {
+        "seq": 12,
+        "t": "synced"
+      }
+    ],
+    "name": "awaited spawns replace their tool rows",
+    "state": {
+      "items": [
+        {
+          "call": 1,
+          "child": "00000000-0000-0000-0000-000000000064",
+          "fired": {
+            "output": "completed child result",
+            "status": "done"
+          },
+          "input": "summarize the work",
+          "type": "child",
+          "watch": 5
+        },
+        {
+          "call": 2,
+          "child": "00000000-0000-0000-0000-000000000065",
+          "fired": {
+            "output": "completed child result",
+            "status": "done"
+          },
+          "input": "summarize the work",
+          "type": "child",
+          "watch": 10
+        }
+      ],
+      "seq": 12,
+      "session": "00000000-0000-0000-0000-00000000000a",
+      "state": {
+        "calls": [],
+        "queued": [],
+        "taken": [],
+        "turn": 0
+      },
+      "workspace": "/w"
+    },
+    "updates": [
+      {
+        "change": {
+          "change": "attached",
+          "reset": true,
+          "session": "00000000-0000-0000-0000-00000000000a",
+          "workspace": "/w"
+        },
+        "rev": 1,
+        "seq": 0
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 0,
+          "item": {
+            "call": 1,
+            "input": null,
+            "outcome": null,
+            "phase": {
+              "gating": {
+                "at": 0
+              }
+            },
+            "tool": "task",
+            "type": "tool"
+          }
+        },
+        "rev": 2,
+        "seq": 1
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 1,
+          "item": {
+            "call": 2,
+            "input": null,
+            "outcome": null,
+            "phase": {
+              "gating": {
+                "at": 0
+              }
+            },
+            "tool": "task",
+            "type": "tool"
+          }
+        },
+        "rev": 3,
+        "seq": 2
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 0,
+          "part": {
+            "part": "presentation"
+          }
+        },
+        "rev": 4,
+        "seq": 3
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 0,
+          "part": {
+            "part": "watch"
+          }
+        },
+        "rev": 5,
+        "seq": 5
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 0,
+          "part": {
+            "part": "outcome"
+          }
+        },
+        "rev": 6,
+        "seq": 6
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 1,
+          "part": {
+            "part": "presentation"
+          }
+        },
+        "rev": 7,
+        "seq": 8
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 1,
+          "part": {
+            "part": "watch"
+          }
+        },
+        "rev": 8,
+        "seq": 10
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 1,
+          "part": {
+            "part": "outcome"
+          }
+        },
+        "rev": 9,
+        "seq": 11
+      },
+      {
+        "change": {
+          "change": "synced"
+        },
+        "rev": 10,
+        "seq": 12
+      }
+    ]
+  },
+  {
+    "frames": [
+      "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
+      "{\"epoch\":0,\"input\":null,\"kind\":\"tool_call\",\"seq\":1,\"t\":\"entry\",\"tool\":\"task\"}",
+      "{\"epoch\":0,\"input\":null,\"kind\":\"tool_call\",\"seq\":2,\"t\":\"entry\",\"tool\":\"task\"}",
+      "{\"call\":1,\"child\":\"00000000-0000-0000-0000-000000000064\",\"epoch\":0,\"input\":\"summarize the work\",\"intent\":null,\"kind\":\"link\",\"seq\":3,\"t\":\"entry\"}",
+      "{\"child\":\"00000000-0000-0000-0000-000000000064\",\"epoch\":0,\"kind\":\"watch\",\"seq\":4,\"t\":\"entry\"}",
+      "{\"call\":1,\"epoch\":0,\"kind\":\"tool_result\",\"outcome\":{\"output\":null,\"status\":\"done\"},\"seq\":5,\"t\":\"entry\"}",
+      "{\"epoch\":0,\"kind\":\"fired\",\"outcome\":{\"output\":\"completed child result\",\"status\":\"done\"},\"seq\":6,\"t\":\"entry\",\"watch\":4}",
+      "{\"call\":2,\"child\":\"00000000-0000-0000-0000-000000000065\",\"epoch\":0,\"input\":\"summarize the work\",\"intent\":null,\"kind\":\"link\",\"seq\":7,\"t\":\"entry\"}",
+      "{\"child\":\"00000000-0000-0000-0000-000000000065\",\"epoch\":0,\"kind\":\"watch\",\"seq\":8,\"t\":\"entry\"}",
+      "{\"call\":2,\"epoch\":0,\"kind\":\"tool_result\",\"outcome\":{\"output\":null,\"status\":\"done\"},\"seq\":9,\"t\":\"entry\"}",
+      "{\"epoch\":0,\"kind\":\"fired\",\"outcome\":{\"output\":\"completed child result\",\"status\":\"done\"},\"seq\":10,\"t\":\"entry\",\"watch\":8}",
+      "{\"seq\":10,\"t\":\"synced\"}"
+    ],
+    "hash": "8df768ad542678d2",
+    "messages": [
+      {
+        "session": "00000000-0000-0000-0000-00000000000a",
+        "t": "attached",
+        "workspace": "/w"
+      },
+      {
+        "epoch": 0,
+        "input": null,
+        "kind": "tool_call",
+        "seq": 1,
+        "t": "entry",
+        "tool": "task"
+      },
+      {
+        "epoch": 0,
+        "input": null,
+        "kind": "tool_call",
+        "seq": 2,
+        "t": "entry",
+        "tool": "task"
+      },
+      {
+        "call": 1,
+        "child": "00000000-0000-0000-0000-000000000064",
+        "epoch": 0,
+        "input": "summarize the work",
+        "intent": null,
+        "kind": "link",
+        "seq": 3,
+        "t": "entry"
+      },
+      {
+        "child": "00000000-0000-0000-0000-000000000064",
+        "epoch": 0,
+        "kind": "watch",
+        "seq": 4,
+        "t": "entry"
+      },
+      {
+        "call": 1,
+        "epoch": 0,
+        "kind": "tool_result",
+        "outcome": {
+          "output": null,
+          "status": "done"
+        },
+        "seq": 5,
+        "t": "entry"
+      },
+      {
+        "epoch": 0,
+        "kind": "fired",
+        "outcome": {
+          "output": "completed child result",
+          "status": "done"
+        },
+        "seq": 6,
+        "t": "entry",
+        "watch": 4
+      },
+      {
+        "call": 2,
+        "child": "00000000-0000-0000-0000-000000000065",
+        "epoch": 0,
+        "input": "summarize the work",
+        "intent": null,
+        "kind": "link",
+        "seq": 7,
+        "t": "entry"
+      },
+      {
+        "child": "00000000-0000-0000-0000-000000000065",
+        "epoch": 0,
+        "kind": "watch",
+        "seq": 8,
+        "t": "entry"
+      },
+      {
+        "call": 2,
+        "epoch": 0,
+        "kind": "tool_result",
+        "outcome": {
+          "output": null,
+          "status": "done"
+        },
+        "seq": 9,
+        "t": "entry"
+      },
+      {
+        "epoch": 0,
+        "kind": "fired",
+        "outcome": {
+          "output": "completed child result",
+          "status": "done"
+        },
+        "seq": 10,
+        "t": "entry",
+        "watch": 8
+      },
+      {
+        "seq": 10,
+        "t": "synced"
+      }
+    ],
+    "name": "background spawns replace their tool rows",
+    "state": {
+      "items": [
+        {
+          "call": 1,
+          "child": "00000000-0000-0000-0000-000000000064",
+          "fired": {
+            "output": "completed child result",
+            "status": "done"
+          },
+          "input": "summarize the work",
+          "type": "child",
+          "watch": 4
+        },
+        {
+          "call": 2,
+          "child": "00000000-0000-0000-0000-000000000065",
+          "fired": {
+            "output": "completed child result",
+            "status": "done"
+          },
+          "input": "summarize the work",
+          "type": "child",
+          "watch": 8
+        }
+      ],
+      "seq": 10,
+      "session": "00000000-0000-0000-0000-00000000000a",
+      "state": {
+        "calls": [],
+        "queued": [],
+        "taken": [],
+        "turn": 0
+      },
+      "workspace": "/w"
+    },
+    "updates": [
+      {
+        "change": {
+          "change": "attached",
+          "reset": true,
+          "session": "00000000-0000-0000-0000-00000000000a",
+          "workspace": "/w"
+        },
+        "rev": 1,
+        "seq": 0
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 0,
+          "item": {
+            "call": 1,
+            "input": null,
+            "outcome": null,
+            "phase": {
+              "gating": {
+                "at": 0
+              }
+            },
+            "tool": "task",
+            "type": "tool"
+          }
+        },
+        "rev": 2,
+        "seq": 1
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 1,
+          "item": {
+            "call": 2,
+            "input": null,
+            "outcome": null,
+            "phase": {
+              "gating": {
+                "at": 0
+              }
+            },
+            "tool": "task",
+            "type": "tool"
+          }
+        },
+        "rev": 3,
+        "seq": 2
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 0,
+          "part": {
+            "part": "presentation"
+          }
+        },
+        "rev": 4,
+        "seq": 3
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 0,
+          "part": {
+            "part": "watch"
+          }
+        },
+        "rev": 5,
+        "seq": 4
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 0,
+          "part": {
+            "part": "outcome"
+          }
+        },
+        "rev": 6,
+        "seq": 6
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 1,
+          "part": {
+            "part": "presentation"
+          }
+        },
+        "rev": 7,
+        "seq": 7
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 1,
+          "part": {
+            "part": "watch"
+          }
+        },
+        "rev": 8,
+        "seq": 8
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 1,
+          "part": {
+            "part": "outcome"
+          }
+        },
+        "rev": 9,
+        "seq": 10
+      },
+      {
+        "change": {
+          "change": "synced"
+        },
+        "rev": 10,
+        "seq": 10
+      }
+    ]
+  },
+  {
+    "frames": [
+      "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
       "{\"epoch\":0,\"kind\":\"model_call\",\"model\":\"m\",\"seq\":1,\"t\":\"entry\"}",
       "{\"seq\":1,\"t\":\"synced\"}",
       "{\"call\":1,\"t\":\"delta\",\"text\":\"a\\nold\"}",
@@ -9812,7 +10398,7 @@
   {
     "frames": [
       "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
-      "{\"child\":\"00000000-0000-0000-0000-00000000000c\",\"epoch\":0,\"input\":\"sleep 1\",\"intent\":null,\"kind\":\"link\",\"seq\":1,\"t\":\"entry\"}",
+      "{\"call\":1,\"child\":\"00000000-0000-0000-0000-00000000000c\",\"epoch\":0,\"input\":\"sleep 1\",\"intent\":null,\"kind\":\"link\",\"seq\":1,\"t\":\"entry\"}",
       "{\"child\":\"00000000-0000-0000-0000-00000000000c\",\"epoch\":0,\"kind\":\"watch\",\"seq\":2,\"t\":\"entry\"}",
       "{\"epoch\":0,\"kind\":\"fired\",\"outcome\":{\"output\":{\"slept\":1},\"status\":\"done\"},\"seq\":3,\"t\":\"entry\",\"watch\":2}",
       "{\"seq\":3,\"t\":\"synced\"}"
@@ -9825,6 +10411,7 @@
         "workspace": "/w"
       },
       {
+        "call": 1,
         "child": "00000000-0000-0000-0000-00000000000c",
         "epoch": 0,
         "input": "sleep 1",
@@ -10913,7 +11500,7 @@
     "frames": [
       "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
       "{\"seq\":0,\"t\":\"synced\"}",
-      "{\"child\":\"00000000-0000-0000-16df-9d6ac76bd322\",\"epoch\":0,\"input\":\"go\",\"intent\":null,\"kind\":\"link\",\"seq\":1,\"t\":\"entry\"}",
+      "{\"call\":1,\"child\":\"00000000-0000-0000-16df-9d6ac76bd322\",\"epoch\":0,\"input\":\"go\",\"intent\":null,\"kind\":\"link\",\"seq\":1,\"t\":\"entry\"}",
       "{\"child\":\"00000000-0000-0000-16df-9d6ac76bd322\",\"epoch\":0,\"kind\":\"watch\",\"seq\":2,\"t\":\"entry\"}",
       "{\"epoch\":0,\"kind\":\"fired\",\"outcome\":{\"status\":\"interrupted\"},\"seq\":3,\"t\":\"entry\",\"watch\":2}",
       "{\"message\":\"e\",\"t\":\"error\"}",
@@ -10943,7 +11530,7 @@
       "{\"call\":14,\"t\":\"delta\",\"text\":\"48\"}",
       "{\"call\":14,\"t\":\"delta\",\"text\":\"2\"}",
       "{\"call\":14,\"epoch\":0,\"kind\":\"model_result\",\"outcome\":{\"output\":{\"message\":{\"content\":[{\"text\":\"reply 482\",\"type\":\"text\"}]},\"usage\":{\"input\":3,\"output\":5}},\"status\":\"done\"},\"seq\":15,\"t\":\"entry\"}",
-      "{\"child\":\"00000000-0000-0000-8c31-dc059121ada3\",\"epoch\":0,\"input\":\"go\",\"intent\":null,\"kind\":\"link\",\"seq\":16,\"t\":\"entry\"}",
+      "{\"call\":1,\"child\":\"00000000-0000-0000-8c31-dc059121ada3\",\"epoch\":0,\"input\":\"go\",\"intent\":null,\"kind\":\"link\",\"seq\":16,\"t\":\"entry\"}",
       "{\"child\":\"00000000-0000-0000-8c31-dc059121ada3\",\"epoch\":0,\"kind\":\"watch\",\"seq\":17,\"t\":\"entry\"}",
       "{\"epoch\":0,\"kind\":\"fired\",\"outcome\":{\"output\":{\"slept\":1},\"status\":\"done\"},\"seq\":18,\"t\":\"entry\",\"watch\":17}",
       "{\"by\":\"policy\",\"d\":\"on_stop\",\"epoch\":0,\"kind\":\"decision\",\"seq\":19,\"t\":\"entry\",\"text\":\"go on\"}",
@@ -10956,7 +11543,7 @@
       "{\"call\":20,\"epoch\":0,\"kind\":\"model_result\",\"outcome\":{\"output\":{\"message\":{\"content\":[{\"text\":\"reply 467\",\"type\":\"text\"}]},\"usage\":{\"input\":3,\"output\":5}},\"status\":\"done\"},\"seq\":21,\"t\":\"entry\"}",
       "{\"epoch\":0,\"kind\":\"input\",\"mode\":\"steer\",\"segments\":[{\"text\":\"u47\"}],\"seq\":22,\"t\":\"entry\",\"taken\":true}",
       "{\"epoch\":0,\"kind\":\"from_a_newer_build\",\"seq\":23,\"t\":\"entry\"}",
-      "{\"child\":\"00000000-0000-0000-0ceb-9e68e19650bf\",\"epoch\":0,\"input\":\"go\",\"intent\":null,\"kind\":\"link\",\"seq\":24,\"t\":\"entry\"}",
+      "{\"call\":1,\"child\":\"00000000-0000-0000-0ceb-9e68e19650bf\",\"epoch\":0,\"input\":\"go\",\"intent\":null,\"kind\":\"link\",\"seq\":24,\"t\":\"entry\"}",
       "{\"child\":\"00000000-0000-0000-0ceb-9e68e19650bf\",\"epoch\":0,\"kind\":\"watch\",\"seq\":25,\"t\":\"entry\"}",
       "{\"epoch\":0,\"kind\":\"fired\",\"outcome\":{\"error\":\"f\",\"status\":\"failed\"},\"seq\":26,\"t\":\"entry\",\"watch\":25}",
       "{\"epoch\":0,\"input\":{\"command\":\"echo 3\"},\"kind\":\"tool_call\",\"seq\":27,\"t\":\"entry\",\"tool\":\"bash\"}",
@@ -10976,6 +11563,7 @@
         "t": "synced"
       },
       {
+        "call": 1,
         "child": "00000000-0000-0000-16df-9d6ac76bd322",
         "epoch": 0,
         "input": "go",
@@ -11201,6 +11789,7 @@
         "t": "entry"
       },
       {
+        "call": 1,
         "child": "00000000-0000-0000-8c31-dc059121ada3",
         "epoch": 0,
         "input": "go",
@@ -11313,6 +11902,7 @@
         "t": "entry"
       },
       {
+        "call": 1,
         "child": "00000000-0000-0000-0ceb-9e68e19650bf",
         "epoch": 0,
         "input": "go",
@@ -12130,14 +12720,14 @@
       "{\"by\":\"policy\",\"call\":1,\"d\":\"permission\",\"epoch\":0,\"kind\":\"decision\",\"permission\":{\"ask\":{\"mode\":{\"mode\":\"ask\"}}},\"seq\":2,\"t\":\"entry\"}",
       "{\"call\":1,\"epoch\":0,\"kind\":\"answer\",\"seq\":3,\"t\":\"entry\",\"value\":false}",
       "{\"call\":1,\"card\":{\"body\":\"x\\n\",\"note\":\"exit 0\",\"title\":\"$ echo\"},\"epoch\":0,\"kind\":\"tool_result\",\"outcome\":{\"output\":{\"exit\":0,\"output\":\"x\\n\"},\"status\":\"done\"},\"seq\":4,\"t\":\"entry\"}",
-      "{\"child\":\"00000000-0000-0000-77d3-d4856d3c62a6\",\"epoch\":0,\"input\":\"go\",\"intent\":null,\"kind\":\"link\",\"seq\":5,\"t\":\"entry\"}",
+      "{\"call\":1,\"child\":\"00000000-0000-0000-77d3-d4856d3c62a6\",\"epoch\":0,\"input\":\"go\",\"intent\":null,\"kind\":\"link\",\"seq\":5,\"t\":\"entry\"}",
       "{\"child\":\"00000000-0000-0000-77d3-d4856d3c62a6\",\"epoch\":0,\"kind\":\"watch\",\"seq\":6,\"t\":\"entry\"}",
       "{\"epoch\":0,\"kind\":\"fired\",\"outcome\":{\"output\":{\"slept\":1},\"status\":\"done\"},\"seq\":7,\"t\":\"entry\",\"watch\":6}",
       "{\"message\":\"e\",\"t\":\"error\"}",
       "{\"message\":\"e\",\"t\":\"error\"}",
       "{\"epoch\":0,\"kind\":\"assistant\",\"seq\":8,\"t\":\"entry\",\"text\":\"a11\"}"
     ],
-    "hash": "6c181965a7f8a0b9",
+    "hash": "335b0670b4b6c7a3",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -12202,6 +12792,7 @@
         "t": "entry"
       },
       {
+        "call": 1,
         "child": "00000000-0000-0000-77d3-d4856d3c62a6",
         "epoch": 0,
         "input": "go",
@@ -12251,34 +12842,6 @@
       "items": [
         {
           "call": 1,
-          "card": {
-            "body": "x\n",
-            "note": "exit 0",
-            "title": "$ echo"
-          },
-          "input": {
-            "command": "echo 1"
-          },
-          "outcome": {
-            "output": {
-              "exit": 0,
-              "output": "x\n"
-            },
-            "status": "done"
-          },
-          "phase": {
-            "settled": "done"
-          },
-          "reason": {
-            "mode": {
-              "mode": "ask"
-            }
-          },
-          "tool": "bash",
-          "type": "tool"
-        },
-        {
-          "call": 5,
           "child": "00000000-0000-0000-77d3-d4856d3c62a6",
           "fired": {
             "output": {
@@ -12382,15 +12945,10 @@
       },
       {
         "change": {
-          "change": "added",
-          "index": 1,
-          "item": {
-            "call": 5,
-            "child": "00000000-0000-0000-77d3-d4856d3c62a6",
-            "fired": null,
-            "input": "go",
-            "type": "child",
-            "watch": null
+          "change": "updated",
+          "index": 0,
+          "part": {
+            "part": "presentation"
           }
         },
         "rev": 7,
@@ -12399,7 +12957,7 @@
       {
         "change": {
           "change": "updated",
-          "index": 1,
+          "index": 0,
           "part": {
             "part": "watch"
           }
@@ -12410,7 +12968,7 @@
       {
         "change": {
           "change": "updated",
-          "index": 1,
+          "index": 0,
           "part": {
             "part": "outcome"
           }
@@ -12437,7 +12995,7 @@
       {
         "change": {
           "change": "added",
-          "index": 2,
+          "index": 1,
           "item": {
             "seq": 8,
             "text": "a11",

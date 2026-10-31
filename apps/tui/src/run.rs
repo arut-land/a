@@ -25,7 +25,9 @@ pub fn run(daemon: &Daemon, target: Target, viewport: Viewport) -> io::Result<()
             size_of::<Event>()
                 + match event {
                     Event::Client(event) => event.retained_bytes(),
-                    Event::Input(super::keys::Input::Paste(text), _) => text.len(),
+                    Event::Input(super::keys::Input::Paste(text), _) | Event::Output(_, text) => {
+                        text.len()
+                    }
                     _ => 0,
                 }
         },
@@ -208,6 +210,7 @@ impl Client {
                 .take(client::PUMP_BATCH)
             {
                 match event {
+                    Event::Output(id, text) => self.app.output(id, text),
                     Event::Control => {
                         let (changed, exit) = self.control_step()?;
                         whole |= changed;
@@ -286,6 +289,34 @@ impl Client {
     /// `Err(Redraw)` asks for the next frame whole.
     fn effect(&mut self, effect: Effect) -> Result<Option<Exit>, Redraw> {
         let asked = match effect {
+            Effect::Output(id) => {
+                let Some(session) = self.app.client.view().session else {
+                    return Ok(None);
+                };
+                let daemon = self.driver.daemon().clone();
+                let runtime = self.runtime.clone();
+                let post = self.post.clone();
+                self.runtime.spawn(Box::pin(async move {
+                    let loaded = async {
+                        let mut fetched = daemon.fetch_async(&runtime, session, id, ..).await?;
+                        let mut bytes = Vec::new();
+                        let mut buffer = [0; 8192];
+                        loop {
+                            let count = fetched.read_async(&mut buffer).await?;
+                            if count == 0 {
+                                break;
+                            }
+                            bytes.extend_from_slice(&buffer[..count]);
+                        }
+                        Ok::<_, client::Error>(String::from_utf8_lossy(&bytes).into_owned())
+                    }
+                    .await;
+                    let text =
+                        loaded.unwrap_or_else(|_| "This output is no longer available.".into());
+                    let _ = post.send(Event::Output(id, text));
+                }));
+                return Ok(None);
+            }
             Effect::OpenUrl(url) => {
                 match sys::open_browser(&url) {
                     Ok(mut child) => {

@@ -293,3 +293,36 @@ func demanded_history_replaces_the_native_window_without_losing_the_session() as
     #expect(store.history?.cut == cut)
     await store.detach()
 }
+
+@Test(.enabled(if: live != nil))
+func spawned_work_has_one_navigable_row_and_output_is_fetched_on_demand() async throws {
+    let client = try Client(helper: live!)
+    let store = SessionStore(session: Session(client: client))
+    let workspace = FileManager.default.temporaryDirectory.appending(path: "akit-children-\(UUID())")
+    try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: workspace) }
+    store.open(.new(workspace: workspace.path))
+    try await eventually("children session attached") { store.link == .live && store.history?.pending == false }
+    let output = String(repeating: "child output line\n", count: 600)
+    await store.send("spawn " + output)
+    try await eventually("child result") {
+        !store.turn.running && store.history?.pending == false && store.items.contains { $0.kind == .child && $0.presentation.status == "done" }
+    }
+    let children = store.items.filter { $0.kind == .child }
+    #expect(children.count == 1)
+    #expect(!store.items.contains { $0.kind == .tool })
+    let child = try #require(children.first)
+    #expect(child.navigation != nil)
+    #expect(child.presentation.body?.text == "Output · 10828 bytes")
+    let content = try #require(child.presentation.content)
+    #expect(content.label == "Open output")
+    #expect(try await store.output(content) == "The child session finished:\n" + output)
+    let transcript = SessionStore(session: Session(client: client))
+    transcript.open(.id(id: try #require(child.navigation)))
+    try await eventually("child transcript reachable") {
+        transcript.link == .live && transcript.history?.pending == false && transcript.items.contains { $0.kind == .assistant }
+    }
+    #expect(transcript.items.contains { $0.kind == .assistant && $0.presentation.body?.text == output })
+    await transcript.detach()
+    await store.detach()
+}

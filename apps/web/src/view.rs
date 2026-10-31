@@ -199,10 +199,10 @@ pub fn item_row<'a>(item: &'a Item, view: &'a SessionView) -> impl Renderable {
                 // a title shows in the bar.
                 Kind::Side => {}
                 Kind::Tool => {
-                    ToolCard p=(&p);
+                    ToolCard p=(&p) session=(view.session);
                 }
                 Kind::Command if !client::approval_parts(&p).is_empty() => {
-                    ToolCard p=(&p);
+                    ToolCard p=(&p) session=(view.session);
                 }
                 Kind::Command => {
                     div style=(style::NOTE) {
@@ -223,6 +223,7 @@ pub fn item_row<'a>(item: &'a Item, view: &'a SessionView) -> impl Renderable {
                         }
                         " · " (p.body.text())
                         " · " span style=(status_style(p.glyph)) { (p.status) }
+                        OutputLink body=(&p.body) session=(view.session);
                     }
                 }
             }
@@ -280,7 +281,7 @@ fn reply_row<'a>(
 
 /// A tool call: what it runs, where it stands, and what it shows for it.
 #[component]
-fn tool_card<'a>(p: &'a Presented<'a>) -> impl Renderable {
+fn tool_card<'a>(p: &'a Presented<'a>, session: Option<SessionId>) -> impl Renderable {
     maud! {
         div style=(style::TOOL) {
             div style=(style::TOOL_HEAD) {
@@ -375,6 +376,16 @@ fn tool_card<'a>(p: &'a Presented<'a>) -> impl Renderable {
                     pre style=(style::OUTPUT) { (body.text()) }
                 }
             }
+            OutputLink body=(&p.body) session=(session);
+        }
+    }
+}
+
+#[component]
+fn output_link<'a>(body: &'a Shown<'a>, session: Option<SessionId>) -> impl Renderable {
+    maud! {
+        @if let (Shown::Held(output), Some(session)) = (body, session) {
+            a style=(style::LINK) href={ "/output/" (format_args!("{session}")) "/" (format_args!("{}", output.id)) } target="_blank" { (protocol::view::OPEN_OUTPUT) }
         }
     }
 }
@@ -488,6 +499,35 @@ fn question_choices(
 mod tests {
     use super::*;
     use protocol::{DaemonMsg, Decode};
+
+    #[test]
+    fn child_output_links_retrieve_content_without_exposing_storage_labels() {
+        let session = SessionId::new();
+        let child = SessionId::new();
+        let output = protocol::BlobRef {
+            id: protocol::BlobId([7; 32]),
+            size: 12000,
+            media_type: "text/plain".into(),
+            origin: protocol::BlobOrigin::ToolOutput(CallId::new(1).unwrap()),
+        };
+        let item = Item::Child {
+            call: CallId::new(1).unwrap(),
+            child,
+            input: "child work".into(),
+            watch: None,
+            fired: Some(protocol::Outcome::Done {
+                output: protocol::Payload::Blob(Box::new(output.clone())),
+            }),
+        };
+        let view =
+            SessionView::from_log(session, "/w".into(), std::iter::empty::<protocol::Entry>());
+        let rendered = html(item_row(&item, &view));
+        assert!(rendered.contains(&format!("href=\"/s/{child}\"")));
+        assert!(rendered.contains(&format!("href=\"/output/{session}/{}\"", output.id)));
+        assert!(rendered.contains("Open output"));
+        assert!(rendered.contains("12000 bytes"));
+        assert!(!rendered.contains("blob"));
+    }
 
     #[test]
     fn question_urls_are_explicit_links_and_answers_use_a_post_body() {

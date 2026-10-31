@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::future::{Future, poll_fn};
+use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::Poll;
@@ -124,6 +125,36 @@ impl App {
         tx.send_first(what).is_ok()
     }
 
+    async fn output(&self, path: &str) -> http::Response<Vec<u8>> {
+        let reference = path
+            .strip_prefix("/output/")
+            .and_then(|path| path.split_once('/'))
+            .and_then(|(session, output)| {
+                Some((
+                    parse_session(session)?,
+                    output.parse::<protocol::BlobId>().ok()?,
+                ))
+            });
+        let Some((session, output)) = reference else {
+            return text(StatusCode::NOT_FOUND, "no such output");
+        };
+        match self
+            .blocking(move |daemons| {
+                let mut bytes = Vec::new();
+                daemons
+                    .first()
+                    .daemon
+                    .fetch(session, output, ..)?
+                    .read_to_end(&mut bytes)?;
+                Ok::<_, client::Error>(bytes)
+            })
+            .await
+        {
+            Ok(bytes) => whole(StatusCode::OK, "text/plain; charset=utf-8", bytes),
+            Err(_) => text(StatusCode::NOT_FOUND, "This output is no longer available."),
+        }
+    }
+
     /// Answers a request the gate let through.
     pub async fn handle(self: &Arc<Self>, request: Request<Vec<u8>>) -> Reply {
         let (parts, body) = request.into_parts();
@@ -140,6 +171,7 @@ impl App {
             (parse_session(id), events)
         });
         let response = match (&parts.method, path, session) {
+            (&Method::GET, path, _) if path.starts_with("/output/") => self.output(path).await,
             (&Method::GET, "/", _) => {
                 let listed = self
                     .blocking(|daemons| daemons.first().daemon.sessions())

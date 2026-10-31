@@ -50,6 +50,37 @@ old metadata; withdrawing a purpose releases its page. `SessionView::side(purpos
 reads requested metadata, and `Change::Metadata` updates headers without replacing
 presentation rows. The UI selects purposes; core layers do not name plugins.
 
+## Child operations and stored output
+
+A committed `Link.call` names the call that created the child. The shared
+reducer replaces that call's tool row with a typed child item, preserving the
+row key. Further children of the same call have their own link keys. Watches
+update each child's status; completion never adds a second tool-result row.
+The history index retains the contributing facts so a requested old cut can
+still show the tool before admission and the child after admission. Input recall
+retains the original editable command independently of its child presentation.
+
+Child presentation includes a short work title and result summary.
+`DisplayItem.navigation` names the child's session for native navigation; web
+links and terminal row actions open that same session. It is not a context or
+execution-authority image.
+
+`Shown::Held` carries a retrievable output reference. Its text is a size label;
+renderers show the shared `OPEN_OUTPUT` action and fetch the bytes on demand.
+The FFI exposes this as `Presentation.content`, and `Session.output` starts a
+cancellable `BlobFetch` on the attached session's authority. Storage identities
+are retrieval parameters, never visible labels. A child's stored tool-return
+summary can supply that output reference without restoring the tool card.
+
+The native `SessionStore` still owns only the SDK's demanded range. Its
+`TranscriptView` retains the preceding display page while installing an
+adjacent page, including separate identities for fragments of a large text
+item (`HistoryWindow.text_key` and byte offset). Native `NSScrollView` geometry
+tracks whether the viewport is at the bottom. Layout preserves a visible row
+and its pixel offset when reading earlier output, and follows the bottom only
+when pinned there. Revisions do not issue scroll commands. These display pages
+are released with the transcript view; they do not extend SDK history demand.
+
 ## Layers
 
 ```

@@ -349,6 +349,19 @@ impl App {
     fn overlay_lines(&self, width: usize) -> Option<Vec<Line>> {
         let mut out = Vec::new();
         match self.overlay.as_ref()? {
+            Overlay::Output { text, .. } => {
+                out.push(Line::plain(
+                    "output · ↑/↓ scroll · esc close",
+                    Style::new().bold(),
+                ));
+                let width = match self.viewport {
+                    Viewport::Full => width.min(80),
+                    Viewport::Inline => width,
+                };
+                for line in sanitize(text).lines() {
+                    out.extend(wrap(&[Span::new(line, Style::new())], width, &[], &[]));
+                }
+            }
             Overlay::Picker { selected } => {
                 out.push(Line::plain("sessions", Style::new().bold()));
                 if self.client.sessions().is_empty() {
@@ -486,7 +499,10 @@ impl App {
         (self.width, self.body) = (width, body);
         match (self.viewport, overlay) {
             (Viewport::Inline, Some(lines)) => {
-                let skip = lines.len().saturating_sub(usize::from(body));
+                let skip = match self.overlay {
+                    Some(Overlay::Output { offset, .. }) => offset,
+                    _ => lines.len().saturating_sub(usize::from(body)),
+                };
                 for (y, line) in (0..body).zip(lines.iter().skip(skip)) {
                     canvas.line(0, y, line);
                 }
@@ -538,6 +554,22 @@ impl App {
         }
     }
 
+    pub(super) fn scroll_output(&mut self, delta: isize) {
+        let (width, shown) = match self.viewport {
+            Viewport::Full => (
+                self.width.saturating_sub(4),
+                usize::from(self.body.saturating_sub(2)),
+            ),
+            Viewport::Inline => (self.width, usize::from(self.body)),
+        };
+        let maximum = self
+            .overlay_lines(width)
+            .map_or(0, |lines| lines.len().saturating_sub(shown));
+        if let Some(Overlay::Output { offset, .. }) = &mut self.overlay {
+            *offset = offset.saturating_add_signed(delta).min(maximum);
+        }
+    }
+
     /// Draws `lines` in a bordered box centered over the top `body` rows.
     fn boxed(&self, canvas: &mut Canvas, body: u16, lines: &[Line]) {
         let (width, _) = canvas.size();
@@ -554,6 +586,7 @@ impl App {
         // A picker's selection stays in view.
         let skip = match self.overlay {
             Some(Overlay::Picker { selected }) => (selected + 3).saturating_sub(shown),
+            Some(Overlay::Output { offset, .. }) => offset,
             _ => 0,
         }
         .min(lines.len().saturating_sub(shown));
@@ -599,5 +632,46 @@ fn tilde(path: &HostPath) -> String {
             None => path.to_owned(),
         },
         None => path.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+
+    #[test]
+    fn opened_output_preserves_lines_and_clamps_scroll_to_its_actual_rows() {
+        for viewport in [Viewport::Full, Viewport::Inline] {
+            let mut app = App::new(viewport, &protocol::Target::New);
+            app.width = 180;
+            app.body = 3;
+            app.overlay = Some(Overlay::Output {
+                id: protocol::BlobId([7; 32]),
+                text: format!("{}\ntail", "x".repeat(170)),
+                offset: 0,
+            });
+            let lines = app.overlay_lines(176).unwrap();
+            let maximum_width = if viewport == Viewport::Full { 80 } else { 176 };
+            assert!(lines.iter().all(|line| line.width() <= maximum_width));
+            assert!(
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .all(|span| !span.text.contains('\n'))
+            );
+            assert_eq!(
+                super::super::super::view::texts(&lines[1..]).join(""),
+                format!("{}tail", "x".repeat(170))
+            );
+            app.scroll_output(isize::MAX);
+            let Some(Overlay::Output { offset: bottom, .. }) = app.overlay else {
+                panic!("output overlay")
+            };
+            app.scroll_output(-1);
+            let Some(Overlay::Output { offset, .. }) = app.overlay else {
+                panic!("output overlay")
+            };
+            assert_eq!(offset, bottom.saturating_sub(1));
+        }
     }
 }

@@ -62,6 +62,7 @@ pub fn viewport() -> Option<Viewport> {
 
 /// What wakes the event loop.
 enum Event {
+    Output(protocol::BlobId, String),
     Input(keys::Input, u64),
     /// Coalesced lifecycle controls live outside the typing backlog.
     Control,

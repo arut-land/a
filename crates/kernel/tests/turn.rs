@@ -1028,6 +1028,7 @@ fn spawned() -> Expected {
         vec![entry(
             3,
             Body::Link {
+                call: CallId::new(2).unwrap(),
                 intent: Json::null(),
                 child: child(),
                 input: "go".into(),

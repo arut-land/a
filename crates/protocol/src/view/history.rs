@@ -264,26 +264,7 @@ impl Index {
             Direction::Before => Box::new((0..anchor).rev()),
         };
         for index in indices {
-            let mut facts = BTreeSet::new();
-            self.sources(index, request.cut.seq, &mut facts);
-            let entries = facts
-                .into_iter()
-                .map(&mut read)
-                .collect::<io::Result<Vec<_>>>()?;
-            let view =
-                SessionView::from_log(request.cut.session, self.view.workspace.clone(), entries);
-            let key = self.records[index]
-                .keys
-                .iter()
-                .rev()
-                .find(|(at, _)| *at <= request.cut.seq)
-                .expect("item exists at cut")
-                .1;
-            let mut item = view
-                .items
-                .into_iter()
-                .find(|item| item.key() == key)
-                .ok_or_else(|| io::Error::other("history index did not reconstruct its item"))?;
+            let mut item = self.reconstruct(index, request, &mut read)?;
             let selected = match &request.filter {
                 Filter::Transcript => true,
                 Filter::Inputs => matches!(
@@ -343,6 +324,50 @@ impl Index {
             page.items.reverse();
         }
         Ok(page)
+    }
+
+    fn reconstruct(
+        &self,
+        index: usize,
+        request: &Request,
+        read: &mut impl FnMut(Seq) -> io::Result<Entry>,
+    ) -> io::Result<Item> {
+        let mut facts = BTreeSet::new();
+        self.sources(index, request.cut.seq, &mut facts);
+        let entries = facts
+            .into_iter()
+            .map(read)
+            .collect::<io::Result<Vec<_>>>()?;
+        let key = self.records[index]
+            .keys
+            .iter()
+            .rev()
+            .find(|(at, _)| *at <= request.cut.seq)
+            .expect("item exists at cut")
+            .1;
+        // Recall edits the command, independently of its child-operation presentation.
+        let recall = request.filter == Filter::Inputs
+            && entries.iter().any(|entry| {
+                entry.seq == key
+                    && matches!(
+                        entry.body,
+                        Body::ToolCall {
+                            by: crate::Audience::User,
+                            ..
+                        }
+                    )
+            });
+        SessionView::from_log(
+            request.cut.session,
+            self.view.workspace.clone(),
+            entries
+                .iter()
+                .filter(|entry| !recall || !matches!(entry.body, Body::Link { .. })),
+        )
+        .items
+        .into_iter()
+        .find(|item| item.key() == key)
+        .ok_or_else(|| io::Error::other("history index did not reconstruct its item"))
     }
 
     fn sources(&self, index: usize, through: u64, facts: &mut BTreeSet<Seq>) {
@@ -490,7 +515,15 @@ fn thin(item: &mut Item) {
         }
         Item::Child { input, fired, .. } => {
             *input = String::new();
-            *fired = None;
+            *fired = fired.take().map(|outcome| match outcome {
+                crate::Outcome::Done { .. } => crate::Outcome::Done {
+                    output: crate::Json::null().into(),
+                },
+                crate::Outcome::Failed { .. } => crate::Outcome::Failed {
+                    error: String::new(),
+                },
+                crate::Outcome::Interrupted { .. } => crate::Outcome::Interrupted { output: None },
+            });
         }
         Item::Hook { decision, .. } => *decision = String::new(),
         Item::Environment { .. } => {}
@@ -501,6 +534,80 @@ fn thin(item: &mut Item) {
 mod tests {
     use super::*;
     use crate::Decode;
+
+    #[test]
+    fn a_child_command_remains_recallable_without_reintroducing_its_tool_card() {
+        let session = SessionId::new();
+        let call = crate::CallId::new(1).unwrap();
+        let child = SessionId::new();
+        let entries: Vec<_> = [
+            Body::ToolCall {
+                invoke: None,
+                tool: "delegate".into(),
+                input: crate::Json::encode(&serde_json::json!({"args":"do the work"})).unwrap(),
+                id: None,
+                card: None,
+                by: crate::Audience::User,
+            },
+            Body::Link {
+                call,
+                child,
+                input: "do the work".into(),
+                intent: crate::Json::null(),
+            },
+            Body::Watch { child },
+            Body::Fired {
+                watch: Seq::new(3).unwrap(),
+                outcome: crate::Outcome::Done {
+                    output: crate::Json::encode("finished").unwrap().into(),
+                },
+            },
+            Body::ToolResult {
+                call,
+                outcome: crate::Outcome::Done {
+                    output: crate::Json::null().into(),
+                },
+                card: None,
+                held: Vec::new(),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(at, body)| Entry::new(Seq::new(at as u64 + 1).unwrap(), Epoch(1), body))
+        .collect();
+        let mut index = Index::new(session, "/w".into());
+        for entry in &entries {
+            index.apply(entry);
+        }
+        for filter in [Filter::Transcript, Filter::Inputs] {
+            let page = index
+                .page(
+                    &Request {
+                        cut: index.head(Epoch(1)).cut,
+                        anchor: 0,
+                        text_offset: None,
+                        direction: Direction::After,
+                        bytes: 65536,
+                        filter: filter.clone(),
+                    },
+                    |seq| Ok(entries[usize::try_from(seq.get()).unwrap() - 1].clone()),
+                )
+                .unwrap();
+            assert_eq!(page.items.len(), 1);
+            match (&filter, &page.items[0].item) {
+                (Filter::Transcript, Item::Child { .. }) => {}
+                (
+                    Filter::Inputs,
+                    Item::Tool {
+                        by: crate::Audience::User,
+                        input,
+                        ..
+                    },
+                ) => assert_eq!(Item::args(input), "do the work"),
+                _ => panic!("unexpected {filter:?} page: {page:?}"),
+            }
+        }
+    }
 
     #[test]
     fn public_heads_never_carry_internal_envelope_payloads() {

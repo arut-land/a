@@ -113,6 +113,8 @@ impl Style {
 /// What a click on a span does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
+    Child(protocol::SessionId),
+    Output(protocol::BlobId),
     /// Collapses or expands tool call `call`'s card.
     Toggle(protocol::Seq),
     Approve(protocol::CallId, bool),

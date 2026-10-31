@@ -345,6 +345,7 @@ fn replayed_process_ids_never_confer_process_ownership() {
 #[test]
 fn links_are_rearmed() {
     let link = || Body::Link {
+        call: CallId::new(2).unwrap(),
         intent: Json::null(),
         child: child(),
         input: "go".into(),
@@ -402,6 +403,7 @@ fn a_call_whose_child_settled_before_a_crash_resumes_with_its_result() {
         input("task go"),
         tool_call("task", task.clone()),
         Body::Link {
+            call: CallId::new(2).unwrap(),
             intent: Json::null(),
             child: child(),
             input: "go".into(),

@@ -409,19 +409,13 @@ impl BlobFetch {
             .map(SessionId)
             .map_err(|e| invalid(format!("session: {e}")))?;
         let blob = blob.parse().map_err(|e| invalid(format!("blob: {e}")))?;
-        let (sender, pieces) = rt::channel::bounded_async(16);
-        Ok(Self {
-            asked: Mutex::new(Some(Fetching {
-                daemon: client.daemon().clone(),
-                session,
-                blob,
-                offset,
-                len,
-                pieces: sender,
-            })),
-            pieces,
-            cancel: Arc::default(),
-        })
+        Ok(Self::request(
+            client.daemon().clone(),
+            session,
+            blob,
+            offset,
+            len,
+        ))
     }
 
     /// Asks for it, starting the daemon if needed. Starts once.
@@ -484,6 +478,30 @@ impl BlobFetch {
     /// ended first.
     pub fn cancel(&self) {
         self.cancel.cancel();
+    }
+}
+
+impl BlobFetch {
+    fn request(
+        daemon: Daemon,
+        session: SessionId,
+        blob: protocol::BlobId,
+        offset: u64,
+        len: Option<u64>,
+    ) -> Self {
+        let (sender, pieces) = rt::channel::bounded_async(16);
+        Self {
+            asked: Mutex::new(Some(Fetching {
+                daemon,
+                session,
+                blob,
+                offset,
+                len,
+                pieces: sender,
+            })),
+            pieces,
+            cancel: Arc::default(),
+        }
     }
 }
 
@@ -579,6 +597,25 @@ impl Session {
 
     pub fn details(&self, key: u64) -> Option<String> {
         lock(&self.feed).details(key)
+    }
+
+    /// Retrieves output on the current session's authority, independently of its visible page.
+    pub fn output(&self, id: &str) -> Result<BlobFetch, ClientError> {
+        let blob = id.parse().map_err(|_| ClientError::InvalidArgument {
+            message: "invalid output reference".into(),
+        })?;
+        let session = lock(&self.feed)
+            .client
+            .view()
+            .session
+            .ok_or(ClientError::NotOpen)?;
+        Ok(BlobFetch::request(
+            self.driver.daemon().clone(),
+            session,
+            blob,
+            0,
+            None,
+        ))
     }
 
     pub fn snapshot(&self) -> SessionSnapshot {

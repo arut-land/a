@@ -27,6 +27,7 @@ pub enum Effect {
     History(client::HistoryDemand),
     Recall(client::HistoryDemand),
     OpenUrl(String),
+    Output(protocol::BlobId),
     /// Replace an unresponsive daemon.
     Restart,
     Redraw,
@@ -41,6 +42,11 @@ enum Recall {
 }
 
 enum Overlay {
+    Output {
+        id: protocol::BlobId,
+        text: String,
+        offset: usize,
+    },
     Picker {
         selected: usize,
     },
@@ -886,6 +892,8 @@ impl App {
     fn overlay_key(&mut self, key: Key) -> Option<Effect> {
         let last = self.client.sessions().len().saturating_sub(1);
         match (&mut self.overlay, key) {
+            (Some(Overlay::Output { .. }), Key::Up | Key::PageUp) => self.scroll_output(-10),
+            (Some(Overlay::Output { .. }), Key::Down | Key::PageDown) => self.scroll_output(10),
             (Some(Overlay::Picker { selected }), Key::Up | Key::Ctrl('p')) => {
                 *selected = selected.saturating_sub(1);
             }
@@ -995,6 +1003,7 @@ impl App {
 
     fn wheel(&mut self, dir: i32) {
         match &mut self.overlay {
+            Some(Overlay::Output { .. }) => self.scroll_output(dir as isize * 3),
             Some(Overlay::Picker { selected }) => {
                 let last = self.client.sessions().len().saturating_sub(1);
                 *selected = selected.saturating_add_signed(dir as isize).min(last);
@@ -1006,6 +1015,15 @@ impl App {
 
     fn act(&mut self, action: Action) -> Option<Effect> {
         match action {
+            Action::Child(id) => return Some(Effect::Cmd(Cmd::Open(Target::Id(id)))),
+            Action::Output(id) => {
+                self.overlay = Some(Overlay::Output {
+                    id,
+                    text: "Loading output…".into(),
+                    offset: 0,
+                });
+                return Some(Effect::Output(id));
+            }
             Action::Toggle(call) => {
                 if !self.collapsed.remove(&call) {
                     self.collapsed.insert(call);
@@ -1041,6 +1059,19 @@ impl App {
             Action::Quit => return Some(Effect::Quit),
         }
         None
+    }
+
+    pub(super) fn output(&mut self, id: protocol::BlobId, text: String) {
+        if let Some(Overlay::Output {
+            id: wanted,
+            text: shown,
+            ..
+        }) = &mut self.overlay
+            && *wanted == id
+        {
+            *shown = text;
+            self.redraw = true;
+        }
     }
 
     /// Item `key`'s rows are out of date.
