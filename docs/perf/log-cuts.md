@@ -341,7 +341,7 @@ main format 1 where candidate format 2 was expected, after a 0.70-second fresh
 build. Neither the common target name nor the reported artifact alone was a
 source-identity check. No hosted timing from that staging method is
 accepted. Their raw records and logs remain as invalid diagnostics. The revised
-hosted build clears the one target's release artifacts between source variants,
+hosted build clears the assigned build target between source variants,
 stages the reported artifact, bypasses command-wrapper ambiguity, and requires distinct hashes plus each source revision's expected on-disk log
 format before timing. Local format probes independently confirm main format 1
 and candidate format 2; the final local release rebuild is byte-for-byte
