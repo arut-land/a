@@ -955,9 +955,11 @@ def main():
         if sys.platform == "linux" and platform.machine() == "aarch64":
             # The runner's mold aborts on range-extension thunks in the large
             # engine test image. Release images keep the normal linker recipe.
+            # LLVM's RELR output lacks the glibc ABI marker on this runner.
             flags = tomllib.loads((source / ".cargo/config.toml").read_text())["target"]['cfg(target_os = "linux")']["rustflags"]
             test_env["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join(
-                flag.replace("-fuse-ld=mold", "-fuse-ld=lld") for flag in flags)
+                flag.replace("-fuse-ld=mold", "-fuse-ld=lld") for flag in flags
+                if flag != "-Clink-arg=-Wl,--pack-dyn-relocs=relr")
         cargo_run(["cargo", "nextest", "run", "-p", "sys", "-p", "engine", "--features", "sys/fixtures"],
                   cwd=source, env=test_env, check=True)
         cargo_run(["cargo", "clippy", "-p", "sys", "-p", "engine", "--all-targets",
