@@ -13,6 +13,7 @@ import socket
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 import tomllib
 import unittest
@@ -1181,7 +1182,22 @@ SETTLE_FAILURE_TRACE = r'''
             rt::block_on(rt::or(self.pulse.until(&ready),
                 rt::or(self.jobs.until(&ready), super::EVENTS.1.until(&ready))));
             eprintln!("depth-timeout eventual-idle after={:?}", observed.elapsed());
-            for header in self.shared.store.headers().unwrap() {
+            let headers = self.shared.store.headers().unwrap();
+            let mut refused = 0;
+            let mut interrupted = false;
+            for header in &headers {
+                for body in bodies(&*self.shared.store, header.id) {
+                    interrupted |= matches!(&body, Body::Interrupt { .. });
+                    if let Body::Link { intent, .. } = body {
+                        let frozen = crate::driver::spawn::SpawnIntent::from_json(&intent).unwrap();
+                        if frozen.refusal == Some(ext::SpawnRefusal::DepthExhausted) {
+                            refused += 1;
+                        }
+                    }
+                }
+            }
+            eprintln!("depth-timeout final-invariant headers={} exhausted={} interrupted={}", headers.len(), refused, interrupted);
+            for header in headers {
                 eprintln!("depth-timeout final-log {} {:#?}", header.id, bodies(&*self.shared.store, header.id));
             }
         }
@@ -1244,6 +1260,87 @@ def engine_ci_suites(source, target, output, cold):
         raise SystemExit(100)
 
 
+def depth_contention(source, reference, target, output):
+    import psutil
+    env = environment(target)
+    env["NEXTEST_PROFILE"] = "windows"
+    env["A_TEST_POWERSHELL"] = ";".join([shutil.which("pwsh.exe"),
+        str(Path(env["SYSTEMROOT"]) / "System32/WindowsPowerShell/v1.0/powershell.exe")])
+    for checkout in [reference, source]:
+        path = checkout / "crates/engine/src/tests.rs"
+        text = path.read_text()
+        marker = '        assert!(held, "never {what}");'
+        assert text.count(marker) == 1
+        path.write_text(text.replace(marker, SETTLE_FAILURE_TRACE + marker))
+    engine_suites(source, reference, target, output, 5, True, None, "engine", False, None, 0, False)
+    identities = json.loads((output / "engine-sources.json").read_text())
+    (output / "depth-contention-roles.json").write_text(json.dumps(
+        dict(main="old branch test", branch="explicit-boundary candidate", workers=32), indent=2))
+    listing = cargo_run(["cargo", "nextest", "list", "-p", "engine", "--message-format", "json"],
+        nextest_version="0.9.148", cwd=source, env=env, stdout=subprocess.PIPE, check=True)
+    metadata = json.loads(listing.stdout)
+    suites = [suite for suite in metadata["rust-suites"].values()
+              if suite["binary-name"] == "engine" and suite["kind"] == "lib"]
+    assert len(suites) == 1
+    binary = output / "depth-pressure.exe"
+    shutil.copy2(suites[0]["binary-path"], binary)
+    build = metadata["rust-build-meta"]
+    search = [build["platforms"]["host"]["libdir"]["path"], str(Path(suites[0]["binary-path"]).parent),
+              str(target / "debug/deps"), *(str(target / path) for path in build["linked-paths"])]
+    load_env = dict(env, PATH=os.pathsep.join([*search, env["PATH"]]))
+    (target / "depth-run").mkdir(parents=True, exist_ok=True)
+    for round in range(5):
+        for label in (["main", "branch"] if round % 2 == 0 else ["branch", "main"]):
+            checkout = reference if label == "main" else source
+            with tempfile.TemporaryDirectory(prefix="native-depth-contention-") as temporary:
+                root = Path(temporary)
+                sut = root / "sut"
+                sut.mkdir()
+                test_env = dict(env, A_HOME=str(sut / "home"), TMP=str(sut), TEMP=str(sut), TMPDIR=str(sut))
+                pressure = []
+                with contextlib.ExitStack() as streams:
+                    try:
+                        for index in range(32):
+                            home = root / f"pressure-{index}"
+                            home.mkdir()
+                            stream = streams.enter_context((output / f"pressure-{label}-{round:02}-{index:02}.txt").open("wb"))
+                            child = subprocess.Popen([str(binary), "--exact",
+                                "driver::tests::side::title_regeneration_keeps_owner_context_out_of_thread_history", "--nocapture"],
+                                cwd=source, env=dict(load_env, A_HOME=str(home / "home"), TMP=str(home), TEMP=str(home), TMPDIR=str(home)),
+                                stdout=stream, stderr=subprocess.STDOUT)
+                            pressure.append(child)
+                        started = time.perf_counter_ns()
+                        result = cargo_run(["cargo", "nextest", "run", "--archive-file", identities[label]["archive"],
+                            "--workspace-remap", str(checkout), "--extract-to", str(target / "depth-run"),
+                            "--extract-overwrite", "--no-fail-fast", "--retries", "0", "--no-tests=fail",
+                            "--success-output", "final", "-E", "test(=tests::inherited_task_cannot_reset_an_exhausted_depth_budget)"],
+                            nextest_version="0.9.148", cwd=checkout, env=test_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                        elapsed_ns = time.perf_counter_ns() - started
+                        (output / f"depth-contention-{label}-{round:02}.txt").write_bytes(result.stdout)
+                        active = []
+                        for child in pressure:
+                            if child.poll() is None:
+                                try:
+                                    cpu = psutil.Process(child.pid).cpu_times()
+                                except psutil.NoSuchProcess:
+                                    continue
+                                active.append(dict(pid=child.pid, cpu_seconds=cpu.user + cpu.system))
+                        shutil.make_archive(str(output / f"depth-state-{label}-{round:02}"), "zip", sut)
+                        row = dict(round=round, label=label, returncode=result.returncode, elapsed_ns=elapsed_ns,
+                            active_pressure=active, source=identities[label]["revision"], archive_sha256=identities[label]["sha256"])
+                        with (output / "depth-contention.jsonl").open("a") as out:
+                            out.write(json.dumps(row) + "\n")
+                        print(json.dumps(row), flush=True)
+                        print(result.stdout.decode("utf8", errors="replace")[-3000:], flush=True)
+                    finally:
+                        for child in pressure:
+                            if child.poll() is None:
+                                child.kill()
+                            child.wait()
+                if result.returncode not in (0, 100) or b"test run:" not in result.stdout:
+                    raise SystemExit(result.returncode or 1)
+
+
 def main():
     sys.stdout.reconfigure(encoding="utf-8")
     # The workload only talks to fixture daemons and loopback diagnostics.
@@ -1291,6 +1388,7 @@ def main():
     parser.add_argument("--overlap", choices=["reopen", "turn"], help="fixture call-entry overlap, paired native release versus no-op")
     parser.add_argument("--engine-suites", action="store_true")
     parser.add_argument("--engine-ci-suites", action="store_true")
+    parser.add_argument("--depth-contention", action="store_true")
     parser.add_argument("--prepare-engine", action="store_true")
     parser.add_argument("--suite-trial", type=int)
     parser.add_argument("--suite-scope", choices=["engine", "workspace"], default="engine")
@@ -1329,6 +1427,9 @@ def main():
         parser.error("select a fresh output directory; existing samples must not be mixed")
     output.mkdir(parents=True, exist_ok=True)
     os.environ["A_HOME"] = str(output / "test-home")
+    if args.depth_contention:
+        depth_contention(source, args.reference_source.resolve(), target, output)
+        return
     if args.engine_ci_suites:
         engine_ci_suites(source, target, output, args.suite_trial is not None)
         return

@@ -268,6 +268,10 @@ jobs:
           REFERENCE: ${{ inputs.paired_ref }}
         run: |
           $reference = @()
+          if ($env:PERF_RELEASE_OVERLAP -eq 'engine-depth-contention') {
+            python scripts/perf/residency.py --source ../measured --reference-source ../reference --target $env:CARGO_TARGET_DIR --output "$env:RUNNER_TEMP/residency-output" --rounds 5 --depth-contention
+            exit $LASTEXITCODE
+          }
           if ($env:PERF_RELEASE_OVERLAP -eq 'engine-one-core') {
             python scripts/perf/residency.py --source ../measured --target $env:CARGO_TARGET_DIR --output "$env:RUNNER_TEMP/residency-output" --engine-suites --rounds 5 --depth-one-core
             exit $LASTEXITCODE
@@ -565,6 +569,9 @@ jobs:
             ${{ runner.temp }}/residency-output/census-module.rs
             ${{ runner.temp }}/residency-output/engine-*.txt
             ${{ runner.temp }}/residency-output/cold-load-*.txt
+            ${{ runner.temp }}/residency-output/pressure-*.txt
+            ${{ runner.temp }}/residency-output/depth-contention-*.txt
+            ${{ runner.temp }}/residency-output/depth-state-*.zip
           retention-days: 30
       - name: Clean owned target
         if: always()
