@@ -305,6 +305,20 @@ enum Residency {
 
 type Loaded = Result<Arc<Live>, (io::ErrorKind, String)>;
 
+#[derive(Default)]
+struct Retirement(Option<sys::PendingRelease>);
+
+impl Drop for Retirement {
+    fn drop(&mut self) {
+        let Some(pending) = self.0.take() else {
+            return;
+        };
+        let _ = rt::spawn_maintenance(Box::new(|| {
+            pending.run();
+        }));
+    }
+}
+
 impl Slot {
     fn new(header: Header, residency: Residency, daemon: Weak<Daemon>) -> Arc<Self> {
         Arc::new(Self {
@@ -967,12 +981,17 @@ impl Daemon {
     }
 
     /// Session `id`'s actor ended: it is hibernated, as it last listed.
-    fn ended(&self, id: SessionId) {
+    fn ended(&self, id: SessionId) -> Retirement {
         if let Some(slot) = self.slot(id) {
             slot.ending();
         }
         self.changed(id);
         self.pulse.notify();
+        Retirement(if sys::ReleaseLease::ENABLED {
+            lock(&self.slots).release()
+        } else {
+            None
+        })
     }
 
     /// Every session as it lists, newest first, from memory: no log is

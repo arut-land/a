@@ -1,5 +1,30 @@
 //! Process allocator policy for the small daemon and its clients.
 
+/// Owns optional maintenance work. No target currently meets the measured latency bound.
+#[derive(Debug, Default)]
+pub struct ReleaseLease(Option<PendingRelease>);
+
+/// No measured native policy can currently issue release authority.
+#[derive(Debug)]
+pub struct PendingRelease(std::convert::Infallible);
+
+impl ReleaseLease {
+    /// Whether this target has a measured policy, so owners can omit scheduling entirely.
+    pub const ENABLED: bool = false;
+
+    /// Takes the current generation, if this target can issue one.
+    pub fn pending(&mut self) -> Option<PendingRelease> {
+        self.0.take()
+    }
+}
+
+impl PendingRelease {
+    /// Runs an authorized release; disabled policies cannot construct this value.
+    pub fn run(self) -> bool {
+        match self.0 {}
+    }
+}
+
 /// Bounds per-thread arena growth before the process starts workers.
 /// Other allocators already manage their own arena policy.
 pub fn small_footprint() {

@@ -1534,9 +1534,13 @@ impl Actor {
         };
         ended.set();
         session.changed.notify();
-        if let Some(daemon) = session.shared.daemon.upgrade() {
-            daemon.ended(session.id);
-        }
+        let retirement = session
+            .shared
+            .daemon
+            .upgrade()
+            .map(|daemon| daemon.ended(session.id));
+        // Tuple fields drop in order: release the completion reference before scheduling.
+        let _retired = (session, retirement);
     }
 
     #[allow(clippy::too_many_lines)]
