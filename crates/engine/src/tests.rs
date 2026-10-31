@@ -1172,6 +1172,9 @@ fn watchers_are_sent_the_session_list_as_it_changes() {
     drop(attachment);
     until(&|list| list.len() == 1 && list[0].clients == 0);
     settle(&daemon);
+    // Join the publisher before asserting against an unchanged list.
+    stop.set();
+    rt::block_on(done.wait());
     daemon.publish_list();
     seen.extend(std::iter::from_fn(|| watcher.try_next()).map(decode));
     assert!(
@@ -1180,8 +1183,6 @@ fn watchers_are_sent_the_session_list_as_it_changes() {
     );
     daemon.publish_list();
     assert!(watcher.try_next().is_none(), "only changes are sent");
-    stop.set();
-    rt::block_on(done.wait());
     home.endpoint().remove();
     std::fs::remove_dir_all(&root).unwrap();
 }
