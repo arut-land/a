@@ -539,6 +539,7 @@ fn a_parent_hears_from_its_child_exactly_once() {
         got[3..],
         [
             Body::Link {
+                call: CallId::new(3).unwrap(),
                 child,
                 intent: match &got[3] {
                     Body::Link { intent, .. } => intent.clone(),
@@ -665,6 +666,7 @@ fn watches_rearm_after_a_crash_and_fire_once() {
                 by: Audience::Model,
             },
             Body::Link {
+                call: CallId::new(2).unwrap(),
                 child,
                 intent: spawn_intent(2, "sleep 0"),
                 input: "sleep 0".into(),

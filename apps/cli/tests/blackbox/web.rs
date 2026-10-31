@@ -461,6 +461,7 @@ fn a_tab_streams_replies_and_answers_asks_until_it_closes() {
 #[test]
 fn a_live_composer_never_throws_or_discards_a_newer_draft() {
     let env = Env::new("web-browser");
+    env.ext("policy", "ask = [\"bash\"]");
     let web = Web::start(&env);
     let result = Command::new("node")
         .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/../web/test-live.mjs"))
@@ -499,7 +500,12 @@ fn a_long_transcript_sends_each_item_once() {
         let end = patch.selector.is_none() && patch.html.starts_with("<div id=\"end\"");
         let changed = patch.selector.is_none() && patch.html.starts_with("<div id=\"h-");
         let cursor = patch.selector.is_none() && patch.html.starts_with("<span id=\"history-end\"");
-        assert!(added || changed || end || cursor, "{patch:?}");
+        let conversations =
+            patch.selector.is_none() && patch.html.starts_with("<nav id=\"conversations\"");
+        assert!(
+            added || changed || end || cursor || conversations,
+            "{patch:?}"
+        );
     }
     let html = shown(&events.patches);
     for n in 0..40 {

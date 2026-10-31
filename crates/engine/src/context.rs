@@ -1120,6 +1120,7 @@ mod tests {
         .unwrap();
         loaded
             .append(Body::Link {
+                call: CallId::new(1).unwrap(),
                 child: SessionId::new(),
                 input: "child".into(),
                 intent: SpawnImage {

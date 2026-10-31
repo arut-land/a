@@ -861,6 +861,7 @@ impl Live {
                 loaded.seq,
                 crate::history::Owner {
                     session: header.id,
+                    parent: header.parent.map(|parent| parent.session),
                     workspace: protocol::HostPath::lossy(&header.workspace),
                     generation: protocol::Epoch(loaded.writer.epoch()),
                 },
@@ -2609,6 +2610,7 @@ impl Actor {
             loaded.seq,
             crate::history::Owner {
                 session: self.live.id,
+                parent: self.live.parent.map(|parent| parent.session),
                 workspace: protocol::HostPath::lossy(&self.live.workspace),
                 generation: protocol::Epoch(loaded.writer.epoch()),
             },

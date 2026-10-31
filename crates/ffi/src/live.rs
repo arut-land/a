@@ -26,6 +26,9 @@ use crate::{
     TurnInfo,
 };
 
+// List updates are complete snapshots; intermediate lists cannot help recovery.
+const SNAPSHOT_BUFFER: usize = 1;
+
 fn runtime() -> &'static Arc<Threads> {
     static RUNTIME: OnceLock<Arc<Threads>> = OnceLock::new();
     RUNTIME.get_or_init(|| Arc::new(Threads::default()))
@@ -196,6 +199,90 @@ impl Client {
     }
 }
 
+/// A head-only SDK observer for one conversation family.
+pub struct ConversationWatch {
+    daemon: Daemon,
+    origin: SessionId,
+    producer: Arc<StreamProducer<Vec<crate::ConversationInfo>>>,
+    rows: Arc<Mutex<Vec<client::ConversationRow>>>,
+    watch: Mutex<Option<client::ConversationWatch>>,
+}
+
+fn conversation_rows(rows: &[client::ConversationRow]) -> Vec<crate::ConversationInfo> {
+    let now = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX);
+    rows.iter()
+        .map(|row| crate::ConversationInfo {
+            id: row.session.to_string(),
+            parent: row.parent.map(|id| id.to_string()),
+            depth: u32::try_from(row.depth).unwrap_or(u32::MAX),
+            agent: row.agent.clone(),
+            title: row.title.clone(),
+            status: row.status.name().into(),
+            detail: row.detail(now),
+            running: row.status == client::ConversationStatus::Running,
+        })
+        .collect()
+}
+
+#[export]
+impl ConversationWatch {
+    pub fn new(client: &Client, origin: &str) -> Result<Self, ClientError> {
+        let origin = parse_id(origin)?;
+        Ok(Self {
+            daemon: client.daemon().clone(),
+            origin,
+            producer: Arc::new(StreamProducer::new(SNAPSHOT_BUFFER)),
+            rows: Arc::default(),
+            watch: Mutex::default(),
+        })
+    }
+
+    #[ffi_stream(item = Vec<crate::ConversationInfo>)]
+    pub fn updates(&self) -> Arc<EventSubscription<Vec<crate::ConversationInfo>>> {
+        self.producer.subscribe()
+    }
+
+    pub fn start(&self) {
+        let mut watch = lock(&self.watch);
+        if watch.is_some() {
+            return;
+        }
+        let rows = Arc::clone(&self.rows);
+        let producer = Arc::clone(&self.producer);
+        *watch = Some(client::ConversationWatch::start(
+            runtime().clone(),
+            self.daemon.clone(),
+            self.origin,
+            move |next| {
+                let update = conversation_rows(&next);
+                *lock(&rows) = next;
+                producer.push(update);
+            },
+        ));
+    }
+
+    pub fn snapshot(&self) -> Vec<crate::ConversationInfo> {
+        conversation_rows(&lock(&self.rows))
+    }
+
+    pub fn interrupt(&self, session: &str) -> Result<(), ClientError> {
+        let session = parse_id(session)?;
+        lock(&self.watch)
+            .as_ref()
+            .ok_or_else(|| ClientError::Unavailable {
+                message: "conversation observer has not started".into(),
+            })?
+            .interrupt(session)
+            .map_err(ClientError::from)
+    }
+}
+
 /// The daemon's session list as it changes, pushed by the daemon over one
 /// connection: subscribe to `updates`, then `start`.
 pub struct SessionWatch {
@@ -210,7 +297,7 @@ impl SessionWatch {
     pub fn new(client: &Client) -> Self {
         Self {
             daemons: client.daemons.clone(),
-            producer: Arc::new(StreamProducer::new(64)),
+            producer: Arc::new(StreamProducer::new(SNAPSHOT_BUFFER)),
             watch: Mutex::new(None),
         }
     }
@@ -409,19 +496,13 @@ impl BlobFetch {
             .map(SessionId)
             .map_err(|e| invalid(format!("session: {e}")))?;
         let blob = blob.parse().map_err(|e| invalid(format!("blob: {e}")))?;
-        let (sender, pieces) = rt::channel::bounded_async(16);
-        Ok(Self {
-            asked: Mutex::new(Some(Fetching {
-                daemon: client.daemon().clone(),
-                session,
-                blob,
-                offset,
-                len,
-                pieces: sender,
-            })),
-            pieces,
-            cancel: Arc::default(),
-        })
+        Ok(Self::request(
+            client.daemon().clone(),
+            session,
+            blob,
+            offset,
+            len,
+        ))
     }
 
     /// Asks for it, starting the daemon if needed. Starts once.
@@ -484,6 +565,30 @@ impl BlobFetch {
     /// ended first.
     pub fn cancel(&self) {
         self.cancel.cancel();
+    }
+}
+
+impl BlobFetch {
+    fn request(
+        daemon: Daemon,
+        session: SessionId,
+        blob: protocol::BlobId,
+        offset: u64,
+        len: Option<u64>,
+    ) -> Self {
+        let (sender, pieces) = rt::channel::bounded_async(16);
+        Self {
+            asked: Mutex::new(Some(Fetching {
+                daemon,
+                session,
+                blob,
+                offset,
+                len,
+                pieces: sender,
+            })),
+            pieces,
+            cancel: Arc::default(),
+        }
     }
 }
 
@@ -579,6 +684,25 @@ impl Session {
 
     pub fn details(&self, key: u64) -> Option<String> {
         lock(&self.feed).details(key)
+    }
+
+    /// Retrieves output on the current session's authority, independently of its visible page.
+    pub fn output(&self, id: &str) -> Result<BlobFetch, ClientError> {
+        let blob = id.parse().map_err(|_| ClientError::InvalidArgument {
+            message: "invalid output reference".into(),
+        })?;
+        let session = lock(&self.feed)
+            .client
+            .view()
+            .session
+            .ok_or(ClientError::NotOpen)?;
+        Ok(BlobFetch::request(
+            self.driver.daemon().clone(),
+            session,
+            blob,
+            0,
+            None,
+        ))
     }
 
     pub fn snapshot(&self) -> SessionSnapshot {

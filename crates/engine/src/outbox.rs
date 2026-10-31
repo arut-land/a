@@ -114,6 +114,7 @@ impl FrameLog {
             seq,
             crate::history::Owner {
                 session: protocol::SessionId::new(),
+                parent: None,
                 workspace: "/test".into(),
                 generation: protocol::Epoch(1),
             },

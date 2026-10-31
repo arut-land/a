@@ -3,56 +3,25 @@ import SwiftUI
 
 struct ChatView: View {
     @Bindable var store: SessionStore
+    var conversations: ConversationStore?
+    @FocusState private var composing: Bool
+    @State private var managing = false
     /// What a typed line asks of the app, rather than of the session.
     var perform: (AppAction) -> Void = { _ in }
     @State private var input = ""
     @State private var showsHelp = false
-    @State private var userScrolling = false
+    var openChild: (String) -> Void = { _ in }
 
     var body: some View {
         VStack(spacing: 0) {
+            if let parent = conversations?.rows.first(where: { $0.id == store.sessionId })?.parent {
+                Button("Back to parent") { openChild(parent) }.buttonStyle(.link).padding(.top, 4)
+            }
             if let recap = store.recap {
                 RecapBar(recap: recap)
             }
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 10) {
-                        if let history = store.history, (history.start > 0 || history.textStart > 0) {
-                            Button("Earlier messages") { store.loadEarlier() }
-                                .disabled(history.pending)
-                        }
-                        ForEach(store.items) { item in
-                            ItemView(item: item, store: store).id(item.key)
-                        }
-                        if !store.followsHistory {
-                            HStack {
-                                Button("Later messages") { store.loadLater() }
-                                    .disabled(store.history?.pending == true)
-                                Button("Latest messages") { store.followLatest() }
-                            }
-                        }
-                        Color.clear.frame(height: 1).id("end")
-                    }
-                    .padding()
-                }
-                .scrollBounceBehavior(.always, axes: .vertical)
-                .onScrollPhaseChange { _, phase, context in
-                    userScrolling = phase.isScrolling && phase != .animating
-                    if userScrolling { page(HistoryEdge.of(context.geometry)) }
-                }
-                .onScrollGeometryChange(for: HistoryEdge.self) { HistoryEdge.of($0) } action: { _, edge in
-                    if userScrolling { page(edge) }
-                }
-                .onChange(of: store.history.map { PageAnchor(start: $0.start, text: $0.textStart) }) {
-                    guard !store.followsHistory else { return }
-                    switch store.historyDirection {
-                    case .older:
-                        if let item = store.items.last { proxy.scrollTo(item.key, anchor: .bottom) }
-                    case .newer:
-                        if let item = store.items.first { proxy.scrollTo(item.key, anchor: .top) }
-                    }
-                }
-                .background(FollowEnd(store: store, proxy: proxy))
+            TranscriptView(store: store, text: nativeText) { item in
+                ItemView(item: item, store: store, openChild: openChild)
             }
             if let problem = store.problem {
                 Label(problem, systemImage: "exclamationmark.triangle")
@@ -62,7 +31,13 @@ struct ChatView: View {
             }
             Divider()
             HStack {
-                TextField("Message, or $ command", text: $input)
+                TextField(composerPlaceholder, text: $input)
+                    .focused($composing)
+                    .onKeyPress(.downArrow) {
+                        guard input.isEmpty, conversations?.rows.isEmpty == false else { return .ignored }
+                        composing = false; managing = true
+                        return .handled
+                    }
                     .textFieldStyle(.plain)
                     .onSubmit(send)
                 if store.turn.canInterrupt {
@@ -74,6 +49,10 @@ struct ChatView: View {
                     .disabled(input.trimmingCharacters(in: .whitespaces).isEmpty || !store.turn.canSend)
             }
             .padding(10)
+            if let conversations {
+                ConversationSwitcher(store: conversations, current: store.sessionId, managing: $managing, open: openChild)
+                    .onChange(of: managing) { _, active in if !active { composing = true } }
+            }
         }
         .navigationTitle(store.title ?? store.sessionId.map { String($0.suffix(8)) } ?? "New session")
         .navigationSubtitle(store.workspace)
@@ -97,12 +76,21 @@ struct ChatView: View {
         }
     }
 
-    private func page(_ edge: HistoryEdge) {
-        switch edge {
-        case .older: store.loadEarlier()
-        case .newer: if !store.followsHistory { store.loadLater() }
-        case .middle: break
+    private func nativeText(_ item: DisplayItem) -> NativeTranscriptText? {
+        switch item.kind {
+        case .user: .user(item.presentation.body?.text ?? "")
+        case .assistant:
+            if let body = item.presentation.body, body.kind == .markdown { .markdown(body) }
+            else { .text(item.presentation.body?.text.trimmingCharacters(in: .newlines) ?? "") }
+        default: nil
         }
+    }
+
+    private var composerPlaceholder: String {
+        if let row = conversations?.rows.first(where: { $0.id == store.sessionId }), row.parent != nil {
+            return "Message @\(row.title)…"
+        }
+        return "Message, or $ command"
     }
 
     private func send() {
@@ -120,32 +108,6 @@ struct ChatView: View {
                 }
             } catch {}
         }
-    }
-}
-
-private struct PageAnchor: Equatable {
-    let start: UInt64
-    let text: UInt64
-}
-
-private enum HistoryEdge: Equatable {
-    case older, newer, middle
-
-    static func of(_ geometry: ScrollGeometry) -> Self {
-        let y = geometry.contentOffset.y + geometry.contentInsets.top
-        if y <= 0 { return .older }
-        if y + geometry.containerSize.height >= geometry.contentSize.height { return .newer }
-        return .middle
-    }
-}
-
-/// Streamed tokens update this view without rebuilding the transcript.
-struct FollowEnd: View {
-    let store: SessionStore
-    let proxy: ScrollViewProxy
-
-    var body: some View {
-        Color.clear.onChange(of: store.rev) { if store.followsHistory { proxy.scrollTo("end", anchor: .bottom) } }
     }
 }
 
@@ -188,6 +150,7 @@ struct RecapBar: View {
 struct ItemView: View {
     let item: DisplayItem
     let store: SessionStore
+    var openChild: (String) -> Void = { _ in }
 
     var body: some View {
         let shown = item.presentation
@@ -223,9 +186,17 @@ struct ItemView: View {
         case .hook:
             Note(icon: "hook", text: shown.title)
         case .child:
-            HStack {
-                Note(icon: "arrow.triangle.branch", text: "\(shown.title): \(shown.body?.text ?? "")")
-                StatusText(shown: shown)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    if let destination = item.navigation {
+                        Button { openChild(destination) } label: {
+                            Label(shown.title, systemImage: "arrow.triangle.branch")
+                        }.buttonStyle(.link)
+                    }
+                    StatusText(shown: shown)
+                }
+                BodyView(body: shown.body)
+                OutputButton(shown: shown, store: store)
             }
         case .environment:
             Note(icon: "folder", text: shown.title)
@@ -370,6 +341,7 @@ struct ToolView: View {
             }
             if let question = shown.question { QuestionForm(question: question, store: store).id(question.id) }
             BodyView(body: shown.body)
+            OutputButton(shown: shown, store: store)
         }
         .padding(10)
         .background(.quaternary.opacity(0.5), in: .rect(cornerRadius: 8))
@@ -506,5 +478,39 @@ private struct QuestionForm: View {
             QuestionInput(key: field.key, value: values[field.key] ?? "", included: (field.required || included.contains(field.key)) && (field.kind != .choice || values[field.key] != nil))
         }
         Task { await store.answer(question: question, action: action, values: draft) }
+    }
+}
+
+struct OutputButton: View {
+    let shown: Presentation
+    let store: SessionStore
+    @State private var opened = false
+    @State private var text: String?
+    @State private var problem: String?
+
+    var body: some View {
+        if let content = shown.content {
+            Button(content.label) { opened = true }
+                .sheet(isPresented: $opened, onDismiss: { text = nil; problem = nil }) {
+                    VStack(alignment: .leading) {
+                        if let text {
+                            ScrollView { Text(text).font(.body.monospaced()).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }
+                        } else if let problem {
+                            Text(problem).foregroundStyle(.red)
+                        } else {
+                            ProgressView("Loading output…")
+                        }
+                        Button("Done") { opened = false }
+                    }
+                    .padding().frame(minWidth: 540, minHeight: 320)
+                    .task(id: content.id) {
+                        text = nil
+                        problem = nil
+                        do { text = try await store.output(content) }
+                        catch is CancellationError {}
+                        catch { problem = error.localizedDescription }
+                    }
+                }
+        }
     }
 }

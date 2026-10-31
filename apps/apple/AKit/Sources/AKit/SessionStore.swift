@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import os
 
 /// A view source whose recovery worker follows task cancellation.
 public protocol RecoveringViewSource: ViewSource {
@@ -28,8 +29,6 @@ private nonisolated func buildRecovery(_ recovery: Recovery) async -> Resync? {
     }
 }
 
-public enum HistoryDirection { case older, newer }
-
 public enum CacheState: Equatable {
     case active, cached, detached
 }
@@ -46,7 +45,6 @@ public final class SessionStore {
     public private(set) var items: [DisplayItem] = []
     public private(set) var history: HistoryWindow?
     public private(set) var followsHistory = true
-    public private(set) var historyDirection = HistoryDirection.older
     @ObservationIgnored private var requestingHistory = false
 
     /// Live text of the reply in flight.
@@ -166,6 +164,26 @@ public final class SessionStore {
         run { try $0.approve(call: call, approved: approved) }
     }
 
+    /// The content is retrieved only when the user opens its output control.
+    public func output(_ link: OutputLink) async throws -> String {
+        guard let session else { throw ClientError.notOpen }
+        let fetch = try session.output(id: link.id)
+        return try await withTaskCancellationHandler {
+            fetch.start()
+            var data = Data()
+            while let piece = try await fetch.next() {
+                switch piece {
+                case .bytes(let bytes): data.append(contentsOf: bytes)
+                case .done: return String(decoding: data, as: UTF8.self)
+                case .notHeld: throw ClientError.unavailable(message: "This output is no longer available.")
+                case .cancelled: throw CancellationError()
+                case .failed(let error): throw ClientError.unavailable(message: error)
+                }
+            }
+            throw ClientError.unavailable(message: "The output could not be loaded.")
+        } onCancel: { fetch.cancel() }
+    }
+
     public func interrupt() async {
         run { try $0.interrupt() }
     }
@@ -182,7 +200,6 @@ public final class SessionStore {
         guard !requestingHistory, history?.pending != true, let history, (history.start > 0 || history.textStart > 0), let session else { return }
         requestingHistory = true
         followsHistory = false
-        historyDirection = .older
         do { try session.historyBefore(anchor: history.start) }
         catch { requestingHistory = false; problem = error.localizedDescription }
     }
@@ -190,7 +207,6 @@ public final class SessionStore {
     public func loadLater() {
         guard !requestingHistory, history?.pending != true, let history, let session else { return }
         requestingHistory = true
-        historyDirection = .newer
         do {
             if (history.end < history.total || history.textEnd < history.textTotal) {
                 followsHistory = false
@@ -240,6 +256,9 @@ public final class SessionStore {
 
     /// Applies `update` once, recovering gaps and invalidations asynchronously.
     public func apply(_ update: ChangeBatch) {
+        let log = OSLog(subsystem: "dev.a.app", category: .pointsOfInterest)
+        os_signpost(.begin, log: log, name: "Session update")
+        defer { os_signpost(.end, log: log, name: "Session update") }
         if update.revision <= rev { return }
         latestRevision = max(latestRevision, update.revision)
         let invalidated = update.changes.contains { change in

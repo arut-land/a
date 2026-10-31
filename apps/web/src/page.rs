@@ -33,6 +33,7 @@ pub struct Page {
     live: Option<(protocol::CallId, u16)>,
     /// Events not yet sent.
     out: Vec<u8>,
+    pending_conversations: Option<Vec<client::ConversationRow>>,
 }
 
 impl Page {
@@ -62,8 +63,25 @@ impl Page {
             streamed: None,
             live: None,
             out: Vec::new(),
+            pending_conversations: None,
         };
         (page, open)
+    }
+
+    pub fn conversations(&mut self, rows: &[client::ConversationRow]) {
+        self.pending_conversations = Some(rows.to_vec());
+        self.show_conversations();
+    }
+
+    fn show_conversations(&mut self) {
+        if self.shown.is_none() {
+            return;
+        }
+        let Some(rows) = self.pending_conversations.take() else {
+            return;
+        };
+        let markup = html(view::conversation_list(&rows, self.session));
+        self.patch(&Patch::Replace(&markup));
     }
 
     /// The events not yet sent.
@@ -308,6 +326,7 @@ impl Page {
             self.show_end();
             self.show_title();
         }
+        self.show_conversations();
     }
 
     /// Shows the session's title again if it changed.

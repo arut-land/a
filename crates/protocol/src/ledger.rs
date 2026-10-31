@@ -296,6 +296,7 @@ impl Sending {
 /// A child session linked, and the input it starts with.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Link {
+    pub call: CallId,
     pub intent: Json,
     pub seq: Seq,
     pub child: SessionId,
@@ -452,10 +453,12 @@ impl Ledger {
                 self.result = Some(ToolOutcome::Interrupted { output: None });
             }
             Body::Link {
+                call,
                 child,
                 input,
                 intent,
             } => self.links.push(Link {
+                call: *call,
                 intent: intent.clone(),
                 seq,
                 child: *child,

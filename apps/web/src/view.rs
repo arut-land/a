@@ -3,6 +3,7 @@
 //! (`#i{key}`) so that a change replaces just that item; the transcript's
 //! end (`#end`) follows the items, and new items go in before it. What an
 //! item says is [`Item::present`]'s; here is only where it goes.
+use hypertext::Raw;
 use hypertext::prelude::*;
 use protocol::view::md::{self, Block, Inline};
 use protocol::view::{Glyph, Item, Kind, Presented, SessionView, Shown, recap_line};
@@ -99,13 +100,106 @@ pub fn chat_page(session: SessionId, tab: &str) -> String {
                 form style=(style::COMPOSER)
                     data-effect="if ($admitted !== false) { if ($draft === $admitted) $draft = ''; $admitted = false; }"
                     data-on:submit="$draft.trim() && @post('/api/send')" {
-                    input style=(style::INPUT) name="text" placeholder="Message" autocomplete="off"
+                    input #composer style=(style::INPUT) name="text" placeholder="Message" autocomplete="off"
                         autofocus data-bind:draft;
                     button type="submit" style=(style::BUTTON) { "Send" }
                 }
+                nav #conversations aria-label="Conversations" {}
             }
+            // XSS SAFETY: the script is a static literal without interpolated content.
+            script type="module" { (Raw::dangerously_create(CONVERSATION_KEYS)) }
         }
     })
+}
+
+const CONVERSATION_KEYS: &str = r"
+const composer = document.getElementById('composer');
+const links = () => [...document.querySelectorAll('[data-conversation]')];
+function select(link) {
+  links().forEach(a => a.tabIndex = a === link ? 0 : -1);
+  link?.focus();
+}
+document.addEventListener('keydown', event => {
+  if (event.target === composer && !composer.value && event.key === 'ArrowDown') {
+    event.preventDefault(); select(links()[0]); return;
+  }
+  const row = event.target.closest('[data-conversation]');
+  if (!row) return;
+  const list = links(), at = list.indexOf(row);
+  if (event.key === 'Escape' || (event.key === 'ArrowUp' && at === 0)) {
+    event.preventDefault(); composer.focus();
+  } else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+    event.preventDefault(); select(list[Math.min(list.length - 1, Math.max(0, at + (event.key === 'ArrowDown' ? 1 : -1)))]);
+  } else if (event.key === 'x' && row.dataset.stop === 'true') {
+    event.preventDefault(); stop(row.dataset.conversation);
+  }
+});
+async function stop(session) {
+  const tab = new URL(location.href).searchParams.get('tab') || document.querySelector('[data-signals]').getAttribute('data-signals').match(/tab: '([^']+)'/)[1];
+  await fetch('/api/conversation/stop', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({tab, session})});
+}
+document.addEventListener('click', event => {
+  const button = event.target.closest('[data-stop-conversation]');
+  if (button) stop(button.dataset.stopConversation);
+});
+function hint(row) {
+  const hint = document.getElementById('conversation-hint');
+  if (!row || !hint) return;
+  const text = row.dataset.stop === 'true' ? '↑/↓ to select · Enter to view · x to stop · Esc to compose' : '↑/↓ to select · Enter to view · Esc to compose';
+  if (hint.textContent !== text) hint.textContent = text;
+}
+document.addEventListener('focusin', event => hint(event.target.closest('[data-conversation]')));
+new MutationObserver(() => {
+  const list = document.getElementById('conversations');
+  if (list?.dataset.placeholder) composer.placeholder = list.dataset.placeholder;
+  const row = document.activeElement?.closest('[data-conversation]');
+  if (row) { links().forEach(a => a.tabIndex = a === row ? 0 : -1); hint(row); }
+}).observe(document.getElementById('conversations').parentNode, {childList: true, subtree: true, attributes: true, attributeFilter: ['data-placeholder']});
+";
+
+pub fn conversation_list(
+    rows: &[client::ConversationRow],
+    current: SessionId,
+) -> impl Renderable + '_ {
+    let now = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX);
+    let active = rows.iter().find(|row| row.session == current);
+    let placeholder = active.filter(|row| row.parent.is_some()).map_or_else(
+        || "Message".to_owned(),
+        |row| format!("Message @{}…", row.title),
+    );
+    maud! {
+        nav #conversations aria-label="Conversations" data-placeholder=(placeholder) style="max-height: 160px; overflow-y: auto; width: min(46rem, 100%); margin: auto;" {
+            @if let Some(parent) = active.and_then(|row| row.parent) {
+                a href={ "/s/" (format_args!("{parent}")) } { "← Back to parent" }
+            }
+            div role="listbox" aria-label="Agent conversations" {
+                @for row in rows {
+                    div style="display: flex; align-items: center; gap: 0.5rem;" {
+                        a id=(format!("conversation_{}", row.session)) role="option" aria-selected=(if row.session == current { "true" } else { "false" })
+                            tabindex=(if row.session == current { "0" } else { "-1" })
+                            data-conversation=(format_args!("{}", row.session))
+                            data-stop=(if row.parent.is_some() && row.status == client::ConversationStatus::Running { "true" } else { "false" })
+                            style="flex: 1; color: var(--text); text-decoration: none; padding: 0.25rem;"
+                            href={ "/s/" (format_args!("{}", row.session)) } {
+                            (if row.session == current { "● " } else { "○ " })
+                            @if row.depth == 0 { "main" } @else { (row.agent.as_str()) "  " (row.title.as_str()) }
+                            " · " (row.detail(now))
+                        }
+                        @if row.parent.is_some() && row.status == client::ConversationStatus::Running {
+                            button type="button" data-stop-conversation=(format_args!("{}", row.session)) { "Stop" }
+                        }
+                    }
+                }
+            }
+            p #conversation-hint style=(style::NOTE) { "↓ from an empty message to manage conversations" }
+        }
+    }
 }
 
 /// The session's title, once its model named it.
@@ -199,10 +293,10 @@ pub fn item_row<'a>(item: &'a Item, view: &'a SessionView) -> impl Renderable {
                 // a title shows in the bar.
                 Kind::Side => {}
                 Kind::Tool => {
-                    ToolCard p=(&p);
+                    ToolCard p=(&p) session=(view.session);
                 }
                 Kind::Command if !client::approval_parts(&p).is_empty() => {
-                    ToolCard p=(&p);
+                    ToolCard p=(&p) session=(view.session);
                 }
                 Kind::Command => {
                     div style=(style::NOTE) {
@@ -223,6 +317,7 @@ pub fn item_row<'a>(item: &'a Item, view: &'a SessionView) -> impl Renderable {
                         }
                         " · " (p.body.text())
                         " · " span style=(status_style(p.glyph)) { (p.status) }
+                        OutputLink body=(&p.body) session=(view.session);
                     }
                 }
             }
@@ -280,7 +375,7 @@ fn reply_row<'a>(
 
 /// A tool call: what it runs, where it stands, and what it shows for it.
 #[component]
-fn tool_card<'a>(p: &'a Presented<'a>) -> impl Renderable {
+fn tool_card<'a>(p: &'a Presented<'a>, session: Option<SessionId>) -> impl Renderable {
     maud! {
         div style=(style::TOOL) {
             div style=(style::TOOL_HEAD) {
@@ -375,6 +470,16 @@ fn tool_card<'a>(p: &'a Presented<'a>) -> impl Renderable {
                     pre style=(style::OUTPUT) { (body.text()) }
                 }
             }
+            OutputLink body=(&p.body) session=(session);
+        }
+    }
+}
+
+#[component]
+fn output_link<'a>(body: &'a Shown<'a>, session: Option<SessionId>) -> impl Renderable {
+    maud! {
+        @if let (Shown::Held(output), Some(session)) = (body, session) {
+            a style=(style::LINK) href={ "/output/" (format_args!("{session}")) "/" (format_args!("{}", output.id)) } target="_blank" { (protocol::view::OPEN_OUTPUT) }
         }
     }
 }
@@ -488,6 +593,35 @@ fn question_choices(
 mod tests {
     use super::*;
     use protocol::{DaemonMsg, Decode};
+
+    #[test]
+    fn child_output_links_retrieve_content_without_exposing_storage_labels() {
+        let session = SessionId::new();
+        let child = SessionId::new();
+        let output = protocol::BlobRef {
+            id: protocol::BlobId([7; 32]),
+            size: 12000,
+            media_type: "text/plain".into(),
+            origin: protocol::BlobOrigin::ToolOutput(CallId::new(1).unwrap()),
+        };
+        let item = Item::Child {
+            call: CallId::new(1).unwrap(),
+            child,
+            input: "child work".into(),
+            watch: None,
+            fired: Some(protocol::Outcome::Done {
+                output: protocol::Payload::Blob(Box::new(output.clone())),
+            }),
+        };
+        let view =
+            SessionView::from_log(session, "/w".into(), std::iter::empty::<protocol::Entry>());
+        let rendered = html(item_row(&item, &view));
+        assert!(rendered.contains(&format!("href=\"/s/{child}\"")));
+        assert!(rendered.contains(&format!("href=\"/output/{session}/{}\"", output.id)));
+        assert!(rendered.contains("Open output"));
+        assert!(rendered.contains("12000 bytes"));
+        assert!(!rendered.contains("blob"));
+    }
 
     #[test]
     fn question_urls_are_explicit_links_and_answers_use_a_post_body() {

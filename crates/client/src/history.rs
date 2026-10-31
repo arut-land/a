@@ -417,6 +417,62 @@ mod tests {
     use protocol::view::Index;
     use protocol::{Body, Entry, Epoch, HostPath, Seq, SessionId};
 
+    #[test]
+    fn demanded_spawn_pages_deliver_child_items_without_tool_duplicates() {
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("../../protocol/tests/vectors/view.json")).unwrap();
+        for vector in vectors.as_array().unwrap().iter().filter(|vector| {
+            vector["name"]
+                .as_str()
+                .unwrap()
+                .ends_with("spawns replace their tool rows")
+        }) {
+            let entries: Vec<_> = vector["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| message["t"] == "entry")
+                .map(|message| Entry::from_json(&serde_json::to_vec(message).unwrap()).unwrap())
+                .collect();
+            let mut index = Index::new(SessionId::new(), HostPath::default());
+            for entry in &entries {
+                index.apply(entry);
+            }
+            let mut history = History::default();
+            let (id, range) = request(&mut history, &index.head(Epoch(1)));
+            let page = index
+                .page(&range, |seq| {
+                    Ok(entries
+                        .iter()
+                        .find(|entry| entry.seq == seq)
+                        .unwrap()
+                        .clone())
+                })
+                .unwrap();
+            let (loaded, retry) = history
+                .part(id, 0, &serde_json::to_string(&page).unwrap(), true)
+                .unwrap();
+            let loaded = loaded.unwrap();
+            assert!(retry.is_empty());
+            assert_eq!(loaded.items.len(), 2);
+            assert_eq!(
+                loaded
+                    .items
+                    .iter()
+                    .map(protocol::view::Item::key)
+                    .collect::<BTreeSet<_>>()
+                    .len(),
+                2
+            );
+            assert!(
+                loaded
+                    .items
+                    .iter()
+                    .all(|item| matches!(item, protocol::view::Item::Child { .. }))
+            );
+        }
+    }
+
     fn log() -> (Index, Vec<Entry>) {
         let entries: Vec<_> = (1..=3)
             .map(|seq| {

@@ -101,7 +101,14 @@ pub fn presented_rows(item: &Item, p: &Presented<'_>, width: usize, look: Look) 
         Kind::Child => {
             let head = vec![
                 Span::new("⑂ ", BUSY),
-                Span::new(format!("{} ", p.title), Style::new().bold()),
+                Span::button(
+                    format!("{} ", p.title),
+                    Style::new().bold(),
+                    Action::Child(match item {
+                        Item::Child { child, .. } => *child,
+                        _ => unreachable!(),
+                    }),
+                ),
                 status(p),
             ];
             let mut out = vec![blank, Line::from(head)];
@@ -111,6 +118,13 @@ pub fn presented_rows(item: &Item, p: &Presented<'_>, width: usize, look: Look) 
             )];
             let pad = [Span::new("  ", MUTED)];
             out.extend(wrap(&body, width, &pad, &pad).into_iter().take(3));
+            if let Shown::Held(output) = &p.body {
+                out.push(Line::from([Span::button(
+                    protocol::view::OPEN_OUTPUT,
+                    CODE,
+                    Action::Output(output.id),
+                )]));
+            }
             out
         }
     }
@@ -786,6 +800,13 @@ impl CardCursor {
         let mut header = p.clone();
         header.body = Shown::None;
         let mut head = card(item.key(), &header, None, width, look);
+        if let Shown::Held(output) = &p.body {
+            head.push(Line::from([Span::button(
+                protocol::view::OPEN_OUTPUT,
+                CODE,
+                Action::Output(output.id),
+            )]));
+        }
         let hidden = if look.collapsed {
             count
         } else if look.verbose {
@@ -1001,6 +1022,13 @@ fn card(
         ]),
     ];
     let from = out.len();
+    if let Shown::Held(output) = &p.body {
+        out.push(Line::from([Span::button(
+            protocol::view::OPEN_OUTPUT,
+            CODE,
+            Action::Output(output.id),
+        )]));
+    }
     if look.collapsed {
         if !body.is_empty() {
             out.push(Line::plain(format!("     {} lines", body.len()), MUTED));
@@ -1551,6 +1579,57 @@ mod cursor_tests {
 #[cfg(test)]
 mod card_cursor_tests {
     use super::*;
+
+    #[test]
+    fn child_rows_offer_navigation_and_output_retrieval_without_storage_text() {
+        let child = protocol::SessionId::new();
+        let output = protocol::BlobRef {
+            id: protocol::BlobId([7; 32]),
+            size: 12000,
+            media_type: "text/plain".into(),
+            origin: protocol::BlobOrigin::ToolOutput(CallId::new(1).unwrap()),
+        };
+        let item = Item::Child {
+            call: CallId::new(1).unwrap(),
+            child,
+            input: "child work".into(),
+            watch: None,
+            fired: Some(protocol::Outcome::Done {
+                output: protocol::Payload::Blob(Box::new(output.clone())),
+            }),
+        };
+        let rows = rows(&item, 100, Look::default());
+        assert!(
+            rows.iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.action == Some(Action::Child(child)))
+        );
+        assert!(
+            rows.iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.action == Some(Action::Output(output.id)))
+        );
+        assert!(!texts(&rows).join("\n").contains("blob"));
+        let tool = Item::Tool {
+            invoke: None,
+            call: CallId::new(1).unwrap(),
+            tool: "output".into(),
+            input: Json::null(),
+            phase: protocol::ledger::Phase::Settled(protocol::ledger::OutcomeKind::Done),
+            outcome: Some(protocol::Outcome::Done {
+                output: protocol::Payload::Blob(Box::new(output)),
+            }),
+            reason: None,
+            card: None,
+            by: protocol::Audience::Model,
+        };
+        let shown = tool.present();
+        let cursor = CardCursor::new(&tool, &shown, 100, Look::default(), 30);
+        assert_eq!(
+            cursor.window(&tool, &shown, 0..cursor.len()),
+            presented_rows(&tool, &shown, 100, Look::default())
+        );
+    }
 
     #[test]
     fn card_windows_equal_expanded_collapsed_and_tail_rows() {

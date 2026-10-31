@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::future::{Future, poll_fn};
+use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::Poll;
@@ -30,6 +31,8 @@ type Tabs = Mutex<HashMap<String, (u64, Arc<Post<TabIn>>)>>;
 /// What a live tab's client takes in.
 enum TabIn {
     Client(Event),
+    Conversations(Vec<client::ConversationRow>),
+    StopConversation(SessionId),
     /// A line typed in the composer.
     Line(String, rt::oneshot::Sender<bool>),
     Cmd(Cmd),
@@ -124,6 +127,51 @@ impl App {
         tx.send_first(what).is_ok()
     }
 
+    async fn output(&self, path: &str) -> http::Response<Vec<u8>> {
+        let reference = path
+            .strip_prefix("/output/")
+            .and_then(|path| path.split_once('/'))
+            .and_then(|(session, output)| {
+                Some((
+                    parse_session(session)?,
+                    output.parse::<protocol::BlobId>().ok()?,
+                ))
+            });
+        let Some((session, output)) = reference else {
+            return text(StatusCode::NOT_FOUND, "no such output");
+        };
+        match self
+            .blocking(move |daemons| {
+                let mut bytes = Vec::new();
+                daemons
+                    .first()
+                    .daemon
+                    .fetch(session, output, ..)?
+                    .read_to_end(&mut bytes)?;
+                Ok::<_, client::Error>(bytes)
+            })
+            .await
+        {
+            Ok(bytes) => whole(StatusCode::OK, "text/plain; charset=utf-8", bytes),
+            Err(_) => text(StatusCode::NOT_FOUND, "This output is no longer available."),
+        }
+    }
+
+    fn stop_conversation(&self, body: &[u8]) -> http::Response<Vec<u8>> {
+        #[derive(Deserialize)]
+        struct Stop {
+            tab: String,
+            session: String,
+        }
+        match serde_json::from_slice::<Stop>(body)
+            .ok()
+            .and_then(|stop| Some((stop.tab, parse_session(&stop.session)?)))
+        {
+            Some((tab, session)) => done(self.tell(&tab, TabIn::StopConversation(session))),
+            None => done(false),
+        }
+    }
+
     /// Answers a request the gate let through.
     pub async fn handle(self: &Arc<Self>, request: Request<Vec<u8>>) -> Reply {
         let (parts, body) = request.into_parts();
@@ -140,6 +188,7 @@ impl App {
             (parse_session(id), events)
         });
         let response = match (&parts.method, path, session) {
+            (&Method::GET, path, _) if path.starts_with("/output/") => self.output(path).await,
             (&Method::GET, "/", _) => {
                 let listed = self
                     .blocking(|daemons| daemons.first().daemon.sessions())
@@ -193,6 +242,7 @@ impl App {
                     None => done(false),
                 }
             }
+            (&Method::POST, "/api/conversation/stop", _) => self.stop_conversation(&body),
             (&Method::POST, "/api/answer", _) => self.answer(&body),
             (&Method::POST, "/api/approve", _) => {
                 let call = param(query, "call")
@@ -262,6 +312,7 @@ pub struct Live {
     inbox: Inbox<TabIn>,
     driver: client::ClientHandle,
     page: Page,
+    conversations: client::ConversationWatch,
 }
 
 impl Live {
@@ -271,7 +322,8 @@ impl Live {
                 + match input {
                     TabIn::Client(event) => event.retained_bytes(),
                     TabIn::Line(text, _) => text.len(),
-                    TabIn::Cmd(_) => 4096,
+                    TabIn::Cmd(_) | TabIn::StopConversation(_) => 4096,
+                    TabIn::Conversations(rows) => rows.len() * 512,
                     TabIn::Question { values, .. } => {
                         values.iter().map(|(k, v)| k.len() + v.len()).sum()
                     }
@@ -280,6 +332,15 @@ impl Live {
         let tx = Arc::new(tx);
         let driver = Driver::with_inbox(tx.as_ref().clone(), TabIn::Client)
             .start(app.rt.clone(), app.daemons.first().daemon.clone());
+        let post = Arc::clone(&tx);
+        let conversations = client::ConversationWatch::start(
+            app.rt.clone(),
+            app.daemons.first().daemon.clone(),
+            session,
+            move |rows| {
+                let _ = post.send(TabIn::Conversations(rows));
+            },
+        );
         let stream = app.streams.fetch_add(1, Ordering::Relaxed);
         lock(&app.tabs).insert(id.to_owned(), (stream, tx));
         let (page, open) = Page::new(session);
@@ -290,6 +351,7 @@ impl Live {
             inbox,
             driver,
             page,
+            conversations,
         };
         live.driver.pump(&mut live.page, open);
         live
@@ -308,6 +370,20 @@ impl Live {
             }
             for input in Self::batch(&self.inbox).await? {
                 let (effects, admission) = match input {
+                    TabIn::Conversations(rows) => {
+                        self.page.conversations(&rows);
+                        (Vec::new(), None)
+                    }
+                    TabIn::StopConversation(session) => {
+                        let effects = self
+                            .conversations
+                            .interrupt(session)
+                            .err()
+                            .map(|notice| client::Effect::Show(client::Show::Notice(notice)))
+                            .into_iter()
+                            .collect();
+                        (effects, None)
+                    }
                     TabIn::Client(event) => (self.page.client.step(event), None),
                     TabIn::Line(text, reply) => (self.page.line(&text), Some(reply)),
                     TabIn::Cmd(cmd) => (self.page.command(cmd), None),

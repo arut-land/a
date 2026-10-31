@@ -24,9 +24,11 @@ use protocol::{HostPath, SessionSummary, Target};
 pub enum Effect {
     /// The session client's to carry out.
     Cmd(Cmd),
+    StopConversation(protocol::SessionId),
     History(client::HistoryDemand),
     Recall(client::HistoryDemand),
     OpenUrl(String),
+    Output(protocol::BlobId),
     /// Replace an unresponsive daemon.
     Restart,
     Redraw,
@@ -41,6 +43,11 @@ enum Recall {
 }
 
 enum Overlay {
+    Output {
+        id: protocol::BlobId,
+        text: String,
+        offset: usize,
+    },
     Picker {
         selected: usize,
     },
@@ -96,6 +103,8 @@ struct QuestionEdit {
 #[allow(clippy::struct_excessive_bools)]
 pub struct App {
     pub client: SessionClient,
+    conversations: Vec<client::ConversationRow>,
+    conversation_at: Option<usize>,
     viewport: Viewport,
     /// This shell's workspace: the picker starts on its latest session.
     workspace: HostPath,
@@ -216,6 +225,8 @@ impl App {
         }
         Self {
             client,
+            conversations: Vec::new(),
+            conversation_at: None,
             viewport,
             workspace: HostPath::default(),
             cache: BTreeMap::new(),
@@ -261,6 +272,12 @@ impl App {
         self.redraw
     }
 
+    pub fn conversations_running(&self) -> bool {
+        self.conversations
+            .iter()
+            .any(|row| row.status == client::ConversationStatus::Running)
+    }
+
     /// A turn is working and nothing waits for the person: the indicator
     /// turns, and the event loop wakes to turn it. At every other time the
     /// client has no timer.
@@ -272,7 +289,8 @@ impl App {
 
     /// The indicator's clock ticked.
     pub fn tick(&mut self) {
-        self.redraw |= self.working();
+        self.redraw |= self.working() || self.conversations_running();
+        self.composed = None;
     }
 
     pub fn view(&self) -> &SessionView {
@@ -459,6 +477,20 @@ impl App {
         self.redraw = true;
     }
 
+    pub fn contains_conversation(&self, id: protocol::SessionId) -> bool {
+        self.conversations.iter().any(|row| row.session == id)
+    }
+
+    pub fn conversations(&mut self, rows: Vec<client::ConversationRow>) {
+        self.conversation_at = self
+            .conversation_at
+            .and_then(|at| self.conversations.get(at))
+            .and_then(|selected| rows.iter().position(|row| row.session == selected.session));
+        self.conversations = rows;
+        self.redraw = true;
+        self.composed = None;
+    }
+
     pub fn input(&mut self, input: Input) -> Option<Effect> {
         self.redraw = true;
         match input {
@@ -485,6 +517,18 @@ impl App {
         self.flash = None;
         if self.overlay.is_some() {
             return self.overlay_key(key);
+        }
+        if self.conversation_at.is_some() {
+            return self.conversation_key(key);
+        }
+        if key == Key::Down
+            && self.editor.is_empty()
+            && self.current_question().is_none()
+            && !self.conversations.is_empty()
+        {
+            self.conversation_at = Some(0);
+            self.composed = None;
+            return None;
         }
         let asked = self.client.turn().asking;
         if key != Key::Ctrl('c')
@@ -568,6 +612,32 @@ impl App {
             Key::Esc => self.recap_hidden = true,
             key => return self.compose_key(key),
         }
+        None
+    }
+
+    fn conversation_key(&mut self, key: Key) -> Option<Effect> {
+        let at = self.conversation_at?;
+        match key {
+            Key::Down => {
+                self.conversation_at =
+                    Some((at + 1).min(self.conversations.len().saturating_sub(1)));
+            }
+            Key::Up if at > 0 => self.conversation_at = Some(at - 1),
+            Key::Esc | Key::Up => self.conversation_at = None,
+            Key::Enter => {
+                let id = self.conversations.get(at)?.session;
+                self.conversation_at = None;
+                return Some(Effect::Cmd(Cmd::Open(Target::Id(id))));
+            }
+            Key::Char('x') => {
+                let row = self.conversations.get(at)?;
+                if row.parent.is_some() && row.status == client::ConversationStatus::Running {
+                    return Some(Effect::StopConversation(row.session));
+                }
+            }
+            _ => {}
+        }
+        self.composed = None;
         None
     }
 
@@ -886,6 +956,8 @@ impl App {
     fn overlay_key(&mut self, key: Key) -> Option<Effect> {
         let last = self.client.sessions().len().saturating_sub(1);
         match (&mut self.overlay, key) {
+            (Some(Overlay::Output { .. }), Key::Up | Key::PageUp) => self.scroll_output(-10),
+            (Some(Overlay::Output { .. }), Key::Down | Key::PageDown) => self.scroll_output(10),
             (Some(Overlay::Picker { selected }), Key::Up | Key::Ctrl('p')) => {
                 *selected = selected.saturating_sub(1);
             }
@@ -995,6 +1067,7 @@ impl App {
 
     fn wheel(&mut self, dir: i32) {
         match &mut self.overlay {
+            Some(Overlay::Output { .. }) => self.scroll_output(dir as isize * 3),
             Some(Overlay::Picker { selected }) => {
                 let last = self.client.sessions().len().saturating_sub(1);
                 *selected = selected.saturating_add_signed(dir as isize).min(last);
@@ -1006,6 +1079,21 @@ impl App {
 
     fn act(&mut self, action: Action) -> Option<Effect> {
         match action {
+            Action::Conversation(at) => {
+                self.conversation_at = Some(at);
+                return Some(Effect::Cmd(Cmd::Open(Target::Id(
+                    self.conversations.get(at)?.session,
+                ))));
+            }
+            Action::Child(id) => return Some(Effect::Cmd(Cmd::Open(Target::Id(id)))),
+            Action::Output(id) => {
+                self.overlay = Some(Overlay::Output {
+                    id,
+                    text: "Loading output…".into(),
+                    offset: 0,
+                });
+                return Some(Effect::Output(id));
+            }
             Action::Toggle(call) => {
                 if !self.collapsed.remove(&call) {
                     self.collapsed.insert(call);
@@ -1041,6 +1129,19 @@ impl App {
             Action::Quit => return Some(Effect::Quit),
         }
         None
+    }
+
+    pub(super) fn output(&mut self, id: protocol::BlobId, text: String) {
+        if let Some(Overlay::Output {
+            id: wanted,
+            text: shown,
+            ..
+        }) = &mut self.overlay
+            && *wanted == id
+        {
+            *shown = text;
+            self.redraw = true;
+        }
     }
 
     /// Item `key`'s rows are out of date.

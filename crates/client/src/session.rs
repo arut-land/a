@@ -280,6 +280,7 @@ pub struct SessionClient {
     view: SessionView,
     history: crate::history::History,
     heads: protocol::history::Heads,
+    conversation: Option<crate::ConversationHead>,
     readers: std::collections::BTreeMap<u64, crate::history::History>,
     sides: std::collections::BTreeMap<String, crate::history::Side>,
     view_current: bool,
@@ -310,6 +311,7 @@ impl SessionClient {
             view: SessionView::default(),
             history: crate::history::History::default(),
             heads: protocol::history::Heads::default(),
+            conversation: None,
             readers: std::collections::BTreeMap::default(),
             sides: std::collections::BTreeMap::default(),
             view_current: false,
@@ -327,6 +329,10 @@ impl SessionClient {
 
     pub const fn link(&self) -> &Link {
         &self.link
+    }
+
+    pub fn conversation(&self) -> Option<&crate::ConversationHead> {
+        self.conversation.as_ref()
     }
 
     pub const fn view(&self) -> &SessionView {
@@ -478,7 +484,10 @@ impl SessionClient {
         }
         let state = &self.view.state;
         let activity = self.view.activity;
-        let running = activity != Some(Activity::Idle);
+        let running = !matches!(
+            activity,
+            Some(Activity::Idle | Activity::Done | Activity::Failed)
+        );
         let asking = state.inbox().next();
         let asks = u32::try_from(state.inbox().count()).unwrap_or(u32::MAX);
         TurnView {
@@ -521,6 +530,7 @@ impl SessionClient {
             self.unanswered.clear();
             self.queued.clear();
             self.view_current = false;
+            self.conversation = None;
             self.submission = None;
         }
         let mut attach = attach;
@@ -866,6 +876,12 @@ impl SessionClient {
     }
 
     fn accept_head(&mut self, head: &protocol::history::Head, out: &mut Vec<Effect>) {
+        self.conversation = Some(crate::ConversationHead {
+            session: head.cut.session,
+            seq: head.cut.seq,
+            identity: head.conversation.clone(),
+            usage: head.usage,
+        });
         for (purpose, side) in &mut self.sides {
             let reference = head.sides.get(purpose).map(|reference| {
                 (

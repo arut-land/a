@@ -1384,6 +1384,7 @@ impl Core {
         let link = self.append(
             fx,
             Body::Link {
+                call,
                 child,
                 input: input.clone(),
                 intent,

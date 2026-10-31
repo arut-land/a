@@ -1068,7 +1068,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
             "entry_link",
             entry(
                 15,
-                Body::Link { intent: protocol::Json::null(),
+                Body::Link { call: CallId::new(1).unwrap(), intent: protocol::Json::null(),
                     child: SessionId(Uuid::from_u128(0xc)),
                     input: "look".into(),
                 },

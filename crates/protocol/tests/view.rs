@@ -261,6 +261,7 @@ impl Session {
     fn child(&mut self, rng: &mut Rng) {
         let child = SessionId(Uuid::from_u128(u128::from(rng.next())));
         self.commit(Body::Link {
+            call: CallId::new(1).unwrap(),
             intent: Json::null(),
             child,
             input: "go".into(),
@@ -604,6 +605,94 @@ fn vectors_path() -> PathBuf {
 }
 
 /// Named scenarios: the daemon messages a client receives, as JSON.
+fn spawned_operations(background: bool) -> Vec<Value> {
+    let mut session = Session::default();
+    let calls: Vec<_> = (0..2)
+        .map(|_| {
+            session.commit(Body::ToolCall {
+                invoke: None,
+                tool: "task".into(),
+                input: Json::null(),
+                id: None,
+                card: None,
+                by: Audience::Model,
+            })
+        })
+        .collect();
+    for (at, call) in calls.into_iter().enumerate() {
+        let call = CallId::new(call).unwrap();
+        let child = SessionId(Uuid::from_u128(100 + at as u128));
+        let link = session.commit(Body::Link {
+            call,
+            child,
+            input: "summarize the work".into(),
+            intent: Json::null(),
+        });
+        if !background {
+            session.commit(Body::Wait {
+                call,
+                on: protocol::WaitOn::Child {
+                    link: Seq::new(link).unwrap(),
+                },
+            });
+        }
+        let watch = session.commit(Body::Watch { child });
+        if background {
+            session.commit(Body::ToolResult {
+                call,
+                outcome: Outcome::Done {
+                    output: Json::null().into(),
+                },
+                card: None,
+                held: Vec::new(),
+            });
+        }
+        session.commit(Body::Fired {
+            watch: Seq::new(watch).unwrap(),
+            outcome: Outcome::Done {
+                output: Json::encode("completed child result").unwrap().into(),
+            },
+        });
+        if !background {
+            session.commit(Body::ToolResult {
+                call,
+                outcome: Outcome::Done {
+                    output: Json::encode("redundant tool result").unwrap().into(),
+                },
+                card: None,
+                held: Vec::new(),
+            });
+        }
+    }
+    std::iter::once(DaemonMsg::Attached {
+        session: SESSION,
+        workspace: "/w".into(),
+    })
+    .chain(session.log)
+    .chain(std::iter::once(DaemonMsg::Synced { seq: session.seq }))
+    .map(|msg| serde_json::to_value(msg).unwrap())
+    .collect()
+}
+
+#[test]
+fn each_spawn_replaces_its_tool_without_duplicate_rows_or_keys() {
+    for background in [false, true] {
+        let mut view = SessionView::default();
+        for message in spawned_operations(background) {
+            view.fold(&DaemonMsg::from_json(&serde_json::to_vec(&message).unwrap()).unwrap());
+        }
+        assert_eq!(view.items.len(), 2);
+        for (at, item) in view.items.iter().enumerate() {
+            assert!(matches!(item, protocol::view::Item::Child { .. }));
+            assert_eq!(item.key().get(), at as u64 + 1);
+            let shown = item.present();
+            assert_eq!(shown.status, "done");
+            assert_eq!(shown.body.text(), "completed child result");
+            assert!(!shown.body.text().contains("redundant"));
+        }
+    }
+}
+
 fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
     let msg = |m: DaemonMsg| serde_json::to_value(m).unwrap();
     let entry = |seq, body| {
@@ -671,6 +760,9 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
     ]
     };
     let mut scenarios = vec![
+        ("awaited spawns replace their tool rows", spawned_operations(false)),
+        ("background spawns replace their tool rows", spawned_operations(true)),
+
         ("retry replaces streamed text at every length", vec![
             attached(),
             entry(1, Body::ModelCall { request: None, model: "m".into(), attempt: 0, choice: protocol::ToolChoice::Auto, r#for: None, purpose: None }),
@@ -958,6 +1050,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                 entry(
                     1,
                     Body::Link {
+                        call: CallId::new(1).unwrap(),
                         intent: Json::null(),
                         child: SessionId(Uuid::from_u128(0xc)),
                         input: "sleep 1".into(),
@@ -1877,7 +1970,7 @@ fn call_annotations_present_generic_cards_until_the_call_finishes() {
 /// A client never has a blob's bytes: it shows what the result is and the
 /// reference the daemon serves it by.
 #[test]
-fn a_result_held_as_a_blob_is_shown_as_its_reference() {
+fn stored_output_presents_size_without_storage_identifiers() {
     let (_, messages) = scenarios()
         .into_iter()
         .find(|(name, _)| name.starts_with("a result held as a blob"))
@@ -1891,13 +1984,9 @@ fn a_result_held_as_a_blob_is_shown_as_its_reference() {
         panic!("{shown:?}");
     };
     assert_eq!(blob.size, 11_000);
-    assert_eq!(
-        shown.body.text(),
-        format!(
-            "11000 bytes of text/plain, held as blob {}",
-            "5a".repeat(32)
-        )
-    );
+    assert_eq!(shown.body.text(), "Output · 11000 bytes");
+    assert!(!shown.body.text().contains(&blob.id.to_string()));
+    assert!(!shown.body.text().contains("text/plain"));
 }
 
 #[test]

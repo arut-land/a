@@ -25,7 +25,9 @@ use protocol::view::{
 use protocol::{CommandInfo, SessionSummary};
 
 pub use feed::{Recovery, Reducer};
-pub use live::{BlobFetch, Client, QueryStream, Session, SessionWatch, find_session};
+pub use live::{
+    BlobFetch, Client, ConversationWatch, QueryStream, Session, SessionWatch, find_session,
+};
 
 /// The purpose of the side request that titles a session, as the app
 /// reads its reply from the view.
@@ -309,6 +311,7 @@ pub struct HistoryWindow {
     pub end: u64,
     pub total: u64,
     pub pending: bool,
+    pub text_key: Option<u64>,
     pub text_start: u64,
     pub text_end: u64,
     pub text_total: u64,
@@ -323,6 +326,7 @@ impl From<&protocol::history::Position> for HistoryWindow {
             end: position.end as u64,
             total: position.count as u64,
             pending: false,
+            text_key: position.fragment.as_ref().map(|f| f.key.get()),
             text_start: position.fragment.as_ref().map_or(0, |f| f.start as u64),
             text_end: position.fragment.as_ref().map_or(0, |f| f.end as u64),
             text_total: position.fragment.as_ref().map_or(0, |f| f.total as u64),
@@ -509,6 +513,7 @@ pub enum DisplayKind {
 #[data]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Presentation {
+    pub content: Option<OutputLink>,
     pub glyph: StatusGlyph,
     /// One line: what it is, such as `$ ls`; empty for a message.
     pub title: String,
@@ -520,6 +525,14 @@ pub struct Presentation {
     pub body: Option<ShownBody>,
     /// A reply's token counts, once it has them.
     pub usage: Option<TokenUsage>,
+}
+
+/// A requested output; its identity is used for retrieval, never as display text.
+#[data]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutputLink {
+    pub id: String,
+    pub label: String,
 }
 
 /// A question and its field descriptors; drafts never enter the daemon log.
@@ -825,6 +838,13 @@ impl From<&Presented<'_>> for Presentation {
             }),
         };
         Self {
+            content: match &p.body {
+                Shown::Held(blob) => Some(OutputLink {
+                    id: blob.id.to_string(),
+                    label: protocol::view::OPEN_OUTPUT.into(),
+                }),
+                _ => None,
+            },
             glyph: match p.glyph {
                 Glyph::None => StatusGlyph::Plain,
                 Glyph::Ok => StatusGlyph::Ok,
@@ -954,6 +974,20 @@ pub struct StreamingText {
 
 /// The whole view at `rev`: what a client takes on a gap too large to
 /// replay.
+/// One row of the SDK's conversation family, without transcript payloads.
+#[data]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConversationInfo {
+    pub id: String,
+    pub parent: Option<String>,
+    pub depth: u32,
+    pub agent: String,
+    pub title: String,
+    pub status: String,
+    pub detail: String,
+    pub running: bool,
+}
+
 #[data]
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionSnapshot {

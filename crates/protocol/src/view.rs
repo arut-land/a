@@ -30,8 +30,8 @@ use crate::{
 };
 
 pub use present::{
-    Buttons, Glyph, Kind, Presented, Shown, answer_line, call_title, decision_line, mismatch_line,
-    recap_line,
+    Buttons, Glyph, Kind, OPEN_OUTPUT, Presented, Shown, answer_line, call_title, decision_line,
+    mismatch_line, recap_line,
 };
 
 /// Reconnection and rendering state, with no authority to resume execution.
@@ -452,6 +452,9 @@ impl Item {
                 Status::Interrupted => Phase::Settled(OutcomeKind::Interrupted),
             },
             Self::Tool { phase, .. } => phase.clone(),
+            Self::Child { fired, .. } => fired.as_ref().map_or(Phase::Running, |outcome| {
+                Phase::Settled(OutcomeKind::of(outcome))
+            }),
             _ => return None,
         })
     }
@@ -462,6 +465,7 @@ impl Item {
         match self {
             Self::Reply { status, .. } => !matches!(status, Status::Running),
             Self::Tool { outcome, .. } => outcome.is_some(),
+            Self::Child { fired, .. } => fired.is_some(),
             _ => true,
         }
     }
@@ -1014,13 +1018,28 @@ impl SessionView {
                 purpose: purpose.clone(),
                 owner: *r#for,
             },
-            Body::Link { child, input, .. } => Item::Child {
-                call: CallId(seq),
-                child: *child,
-                input: input.clone(),
-                watch: None,
-                fired: None,
-            },
+            Body::Link {
+                call, child, input, ..
+            } => {
+                let at = self
+                    .call(*call)
+                    .filter(|at| matches!(self.items[*at], Item::Tool { .. }));
+                let item = Item::Child {
+                    call: if at.is_some() { *call } else { CallId(seq) },
+                    child: *child,
+                    input: input.clone(),
+                    watch: None,
+                    fired: None,
+                };
+                if let Some(index) = at {
+                    self.items[index] = item;
+                    return Some(Change::Updated {
+                        index,
+                        part: Part::Presentation,
+                    });
+                }
+                item
+            }
             Body::Question { question } => Item::Tool {
                 invoke: None,
                 call: CallId(seq),
@@ -1067,27 +1086,7 @@ impl SessionView {
                 outcome,
                 card,
                 ..
-            } => {
-                let at = self.call(*call)?;
-                let Item::Tool {
-                    outcome: o,
-                    card: shown,
-                    phase,
-                    ..
-                } = &mut self.items[at]
-                else {
-                    return None;
-                };
-                *phase = Phase::Settled(OutcomeKind::of(outcome));
-                *o = Some(outcome.clone());
-                if card.is_some() {
-                    shown.clone_from(card);
-                }
-                Some(Change::Updated {
-                    index: at,
-                    part: Part::Outcome,
-                })
-            }
+            } => self.tool_result(*call, outcome, card.as_ref()),
             Body::ModelResult { call, outcome, .. } => self.replied(*call, outcome),
             Body::Answer { call, .. } => {
                 let at = self.call(*call)?;
@@ -1190,6 +1189,49 @@ impl SessionView {
             *shown = Some(Box::new(reason.clone()));
         }
         self.rephase(call)
+    }
+
+    fn tool_result(
+        &mut self,
+        call: CallId,
+        outcome: &ToolOutcome,
+        card: Option<&Card>,
+    ) -> Option<Change> {
+        let at = self.call(call)?;
+        if let (
+            Item::Child {
+                fired: Some(Outcome::Done { output: shown }),
+                ..
+            },
+            Outcome::Done {
+                output: output @ crate::Payload::Blob(_),
+            },
+        ) = (&mut self.items[at], outcome)
+        {
+            shown.clone_from(output);
+            return Some(Change::Updated {
+                index: at,
+                part: Part::Outcome,
+            });
+        }
+        let Item::Tool {
+            outcome: o,
+            card: shown,
+            phase,
+            ..
+        } = &mut self.items[at]
+        else {
+            return None;
+        };
+        *phase = Phase::Settled(OutcomeKind::of(outcome));
+        *o = Some(outcome.clone());
+        if let Some(card) = card {
+            *shown = Some(card.clone());
+        }
+        Some(Change::Updated {
+            index: at,
+            part: Part::Outcome,
+        })
     }
 
     /// Brings tool call `call`'s item to the phase the ledger has it at;
