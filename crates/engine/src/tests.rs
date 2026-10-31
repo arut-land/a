@@ -2014,29 +2014,70 @@ fn detached_messages_wait_for_a_boundary_and_the_parent_hears_once() {
 
 #[test]
 fn inherited_task_cannot_reset_an_exhausted_depth_budget() {
-    let (root, home) = home("depth-exhaustion");
-    let daemon = Daemon::load(&home, &echo()).unwrap();
-    let parent = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
-    parent
-        .session()
-        .submit(&("spawn ".repeat(10) + "hi"))
-        .unwrap();
-    settle(&daemon);
-    let headers = daemon.shared.store.headers().unwrap();
-    assert_eq!(headers.len(), 9);
-    let mut exhausted = 0;
-    for header in headers {
-        for body in bodies(&*daemon.shared.store, header.id) {
-            if let Body::Link { intent, .. } = body {
-                let value = crate::driver::spawn::SpawnIntent::from_json(&intent).unwrap();
-                if value.refusal == Some(ext::SpawnRefusal::DepthExhausted) {
-                    exhausted += 1;
-                    assert_eq!(value.request.depth.remaining(), 0);
-                }
-            }
+    struct LimitedDepth;
+    impl ext::Extension for LimitedDepth {
+        const NAME: &'static str = "limited_depth";
+        const VERSION: u32 = 1;
+        fn contribute(&self, r: &mut ext::Registrar) {
+            r.tool(Self);
         }
     }
-    assert_eq!(exhausted, 1);
+    impl ext::Tool for LimitedDepth {
+        type In = NoInput;
+        type Out = String;
+        const NAME: &'static str = "limited_depth";
+        const DESCRIPTION: &'static str = "Starts a bounded child chain.";
+        const REPLAY: ext::Replay = ext::Replay::Safe;
+        const CONCURRENCY: ext::Concurrency = ext::Concurrency::Shared;
+        async fn call(&self, _: &NoInput, cx: &ext::Cx) -> Result<Self::Out, String> {
+            let result = ext::Conversation::task::<Self>("depth", "spawn spawn hi")
+                .depth(2)
+                .ask(cx)
+                .await
+                .map_err(|e| format!("{e:?}"))?;
+            Ok(ext::child_result(&result, None))
+        }
+    }
+
+    let (root, home) = home("depth-exhaustion");
+    let config = Config {
+        extensions: |c| configured(c)?.with(&LimitedDepth),
+        ..echo()
+    };
+    let daemon = Daemon::load(&home, &config).unwrap();
+    let parent = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
+    parent.session().submit("call limited_depth {}").unwrap();
+    settle(&daemon);
+    let headers = daemon.shared.store.headers().unwrap();
+    assert_eq!(headers.len(), 3);
+    let mut session = parent.session().id;
+    // Two edges are enough to exercise both clamping and refusal at zero.
+    for (remaining, refusal) in [
+        (1, None),
+        (0, None),
+        (0, Some(ext::SpawnRefusal::DepthExhausted)),
+    ] {
+        let links: Vec<_> = bodies(&*daemon.shared.store, session)
+            .into_iter()
+            .filter_map(|body| match body {
+                Body::Link { child, intent, .. } => Some((child, intent)),
+                _ => None,
+            })
+            .collect();
+        let [(child, intent)] = links.as_slice() else {
+            panic!("each session must make exactly one spawn attempt");
+        };
+        let frozen = crate::driver::spawn::SpawnIntent::from_json(intent).unwrap();
+        assert_eq!(frozen.request.depth.remaining(), remaining);
+        assert_eq!(frozen.refusal, refusal);
+        if refusal.is_none() {
+            let header = headers.iter().find(|header| header.id == *child).unwrap();
+            assert_eq!(header.parent.unwrap().session, session);
+        } else {
+            assert!(headers.iter().all(|header| header.id != *child));
+        }
+        session = *child;
+    }
     drop(parent);
     drop(daemon);
     std::fs::remove_dir_all(root).unwrap();
