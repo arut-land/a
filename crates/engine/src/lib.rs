@@ -360,8 +360,6 @@ impl Slot {
     /// actor's end makes the transition ([`Daemon::ended`]); whoever waits
     /// for it only reads it.
     fn ending(&self) -> Option<Flag> {
-        // Declared before the residency guard: scheduling follows its unlock.
-        let mut retirement = Retirement::default();
         let mut residency = lock(&self.residency);
         if let Residency::Loading { finished, .. } = &*residency {
             return Some(finished.clone());
@@ -375,11 +373,7 @@ impl Slot {
         let last = hibernated(live.summary());
         *residency = Residency::Hibernated { last };
         if let Some(daemon) = self.daemon.upgrade() {
-            let mut slots = lock(&daemon.slots);
-            slots.ended(self.header.id);
-            retirement.0 = slots
-                .release()
-                .map(|pending| (Arc::clone(&daemon.shared.rt), pending));
+            lock(&daemon.slots).ended(self.header.id);
             daemon.pulse.notify();
         }
         None
@@ -992,12 +986,17 @@ impl Daemon {
     }
 
     /// Session `id`'s actor ended: it is hibernated, as it last listed.
-    fn ended(&self, id: SessionId) {
+    fn ended(&self, id: SessionId) -> Retirement {
         if let Some(slot) = self.slot(id) {
             slot.ending();
         }
         self.changed(id);
         self.pulse.notify();
+        Retirement(
+            lock(&self.slots)
+                .release()
+                .map(|pending| (Arc::clone(&self.shared.rt), pending)),
+        )
     }
 
     /// Every session as it lists, newest first, from memory: no log is

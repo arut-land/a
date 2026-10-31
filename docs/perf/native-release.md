@@ -50,3 +50,18 @@ worktree at the supplied `scratchpad/r/native-release` path. Prior mem-release
 results motivate the experiment but are not relabeled as results for this
 candidate. The residency harness brackets reopening with native process fault
 counters to investigate refault costs separately from release scheduling.
+
+## Decision rule
+
+Before completing the cohorts: require lower post-wave charge in every paired
+round, no increase in paired median reopen or turn latency, and zero observed
+quiet idle CPU in every uninstrumented candidate sample. Report all paired
+spreads even when their medians pass; five rounds cannot prove a universal
+zero-cost claim. A platform also needs a measured allocator-counter gate and
+verification of the final gated implementation before production enablement.
+
+A second diagnostic retains the main arena's entire top with
+`malloc_trim(usize::MAX)` and compares directly with the first candidate on
+Linux x64. This isolates pad semantics without changing allocator tunables;
+interior-bin scanning and page discard remain. It does not claim a top-only
+trim mechanism exists.
