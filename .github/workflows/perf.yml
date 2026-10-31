@@ -117,7 +117,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-latest, windows-latest, macos-latest]
+        runner: ${{ fromJSON(inputs.runner == 'all' && '["ubuntu-latest", "windows-latest", "macos-latest"]' || format('["{0}"]', inputs.runner)) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 240
     defaults:
@@ -188,7 +188,7 @@ jobs:
         run: |
           cat > "$RUNNER_TEMP/cpu-review.py" <<'PYTHON'
           """Temporary P2 CPU investigation: real CLI/daemon, fresh homes, loopback SSE."""
-          import argparse,ctypes,hashlib,http.server,json,os,platform,re,shutil,statistics,struct,subprocess,sys,tarfile,threading,time
+          import argparse,ctypes,hashlib,http.server,json,os,platform,re,shutil,stat,statistics,struct,subprocess,sys,tarfile,threading,time
           from pathlib import Path
 
           class Fixture(http.server.BaseHTTPRequestHandler):
@@ -294,7 +294,11 @@ jobs:
                   try:run('daemon','stop')
                   finally:server.shutdown();server.server_close()
               with tarfile.open(folder/'home.tar.gz','w:gz',compresslevel=1) as archive:archive.add(home,arcname='home')
-              shutil.rmtree(home)
+              def remove_readonly(function,path,info):
+                  if os.name != 'nt' or not isinstance(info[1],PermissionError):raise info[1]
+                  os.chmod(path,stat.S_IWRITE)
+                  function(path)
+              shutil.rmtree(home,onerror=remove_readonly)
 
 
           def main():
