@@ -26,11 +26,7 @@ impl PendingRelease {
 }
 
 #[cfg(any(
-    all(
-        target_os = "linux",
-        target_env = "gnu",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ),
+    all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"),
     all(target_os = "macos", target_arch = "x86_64")
 ))]
 mod idle {
@@ -221,11 +217,7 @@ mod idle {
 }
 
 #[cfg(not(any(
-    all(
-        target_os = "linux",
-        target_env = "gnu",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ),
+    all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"),
     all(target_os = "macos", target_arch = "x86_64")
 )))]
 mod idle {
