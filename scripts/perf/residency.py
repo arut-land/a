@@ -1061,7 +1061,7 @@ DEPTH_TRACE = r'''
 '''
 
 
-def engine_suites(source, reference, target, output, rounds, prepare, trial, scope, trace):
+def engine_suites(source, reference, target, output, rounds, prepare, trial, scope, trace, threads):
     env = environment(target)
     env["NEXTEST_PROFILE"] = "windows"
     env["A_TEST_POWERSHELL"] = ";".join([shutil.which("pwsh.exe"),
@@ -1110,7 +1110,8 @@ def engine_suites(source, reference, target, output, rounds, prepare, trial, sco
             command = ["cargo", "nextest", "run", "--archive-file", identities[label]["archive"],
                        "--workspace-remap", str(checkout), "--extract-to", str(target / "engine-run"),
                        "--extract-overwrite", "--no-fail-fast", "--retries", "0", "--no-tests=fail",
-                       *(["--success-output", "final"] if trace else [])]
+                       *(["--success-output", "final"] if trace else []),
+                       *(["--test-threads", str(threads)] if threads else [])]
             result = cargo_run(command, nextest_version="0.9.148", cwd=checkout, env=env,
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             log = output / f"engine-{label}-{round:02}.txt"
@@ -1168,6 +1169,7 @@ def main():
     parser.add_argument("--suite-trial", type=int)
     parser.add_argument("--suite-scope", choices=["engine", "workspace"], default="engine")
     parser.add_argument("--depth-trace", action="store_true")
+    parser.add_argument("--suite-threads", type=int)
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--stored", default="1,8,32")
     parser.add_argument("--active", default="1,4,8")
@@ -1201,7 +1203,7 @@ def main():
     os.environ["A_HOME"] = str(output / "test-home")
     if args.engine_suites:
         engine_suites(source, args.reference_source.resolve() if args.reference_source else None,
-                      target, output, args.rounds, args.prepare_engine, args.suite_trial, args.suite_scope, args.depth_trace)
+                      target, output, args.rounds, args.prepare_engine, args.suite_trial, args.suite_scope, args.depth_trace, args.suite_threads)
         return
     if args.overlap:
         if args.census or args.reference_source or args.reference_binary or args.binary:
