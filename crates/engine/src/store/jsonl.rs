@@ -216,7 +216,7 @@ impl LogStore for Jsonl {
             sys::fs::create_dir_all_durable(&self.dir, dir)?;
             let _ = self.retention.set(());
         }
-        match fs::hard_link(&source, &retained) {
+        match sys::fs::link_ordered(&source, &retained) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(()),
             Err(error) => return Err(error),
@@ -224,7 +224,7 @@ impl LogStore for Jsonl {
         // Both names own the same ordinary log bytes, including later appends.
         // The archive stays outside discovery, so catalog visibility can end independently.
         // The referring admission's shared store barrier covers this ordered name.
-        sys::fs::order_dir(dir)
+        Ok(())
     }
 
     fn cut(

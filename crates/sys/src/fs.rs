@@ -683,6 +683,33 @@ pub fn publish_ordered(from: &Path, to: &Path) -> io::Result<()> {
     move_file(from, to, Replacement::Forbid, Persistence::Durable)
 }
 
+/// Gives an existing file another ordered name without moving its source.
+/// The caller's next durable commit covers the ordered Unix name; Windows
+/// publishes the name with its native write-through rename.
+pub fn link_ordered(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        fs::hard_link(from, to)?;
+        order_dir(to.parent().ok_or(io::ErrorKind::InvalidInput)?)
+    }
+    #[cfg(windows)]
+    {
+        let pending = loop {
+            let pending = to.with_file_name(edit::temporary_name());
+            match fs::hard_link(from, &pending) {
+                Ok(()) => break pending,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        };
+        let result = move_file(&pending, to, Replacement::Forbid, Persistence::Durable);
+        if result.is_err() {
+            let _ = fs::remove_file(pending);
+        }
+        result
+    }
+}
+
 /// Makes `to` a read-only copy of `from`, sharing its storage where the
 /// file system can (an APFS clone, a reflink, a `ReFS` block clone) but never
 /// its file: a write through `to` cannot reach `from`. `to` appears whole or

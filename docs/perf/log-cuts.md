@@ -6,9 +6,9 @@ for phase 2. This implements owner-approved child-storage stage 3. Admission
 record deduplication (stage 4) is not part of this change.
 
 Status: phase 1 is complete. Phase 2 has clean-source n=10 data on three hosts,
-but native Windows publication needs the additional sys file allocation
-described below. That change is not applied. Full CI has not been dispatched;
-phase 2 and final target cleanup remain pending.
+and the owner-approved native Windows publication fix is applied. The Windows
+clean-source n=10 rerun is pending. Full CI has not been dispatched; phase 2
+and final target cleanup remain pending.
 
 ## What changed and why
 
@@ -437,7 +437,7 @@ revision is **1,082 added / 881 deleted**, net **+201**, including tests;
 `phase2-final-size-loc.json` records the count. Phase-1 sizes/counts above describe
 its earlier baseline and artifact, not this final clean build.
 
-### Native Windows publication requires an additional file allocation
+### Native Windows publication
 
 The guarded, clean-build Windows workload (`41256694182`) passes its main/candidate
 format checks, then fails the first candidate case: a model-only result records
@@ -446,21 +446,20 @@ failure, not a model request failure. `Jsonl::retain` calls `order_dir`, whose
 Windows implementation deliberately rejects directory synchronization and requires
 native write-through name publication.
 
-The proposed fix needs **`crates/sys/src/fs.rs`**, outside this lane's allocated
-files. Add `link_ordered(from, to)`: keep the existing Unix hard-link plus
-ordered-directory path; on Windows, hard-link to a private temporary name and
-publish that name with the existing non-replacing write-through rename. The
-owned engine store delegates to that primitive. No new unsafe code or dependency
-is needed. Real-filesystem tests must hold shared identity, later appends and
-non-replacement. The reviewable draft is `proposed-native-link.patch` in the
-evidence directory. No edit to the unallocated sys file has been made.
+The owner approved **`crates/sys/src/fs.rs`** and
+`crates/sys/tests/ordered_link.rs`. The applied `link_ordered(from, to)` keeps the
+existing Unix hard-link plus ordered-directory path. On Windows it hard-links to
+a private temporary name and publishes that name with the existing non-replacing
+write-through rename. The engine store delegates to that primitive. No unsafe
+code or dependency was added. Real-filesystem tests hold shared identity, later
+appends after source-name removal and non-replacement. The original reviewable
+draft remains `proposed-native-link.patch` in the evidence directory.
 
-An owned-files-only alternative uses the existing generic `publish_ordered`
-with a temporary link on every platform. It adds a hard link and unlink to each
-Unix pin, which risks reintroducing the measured CPU cost. The proposed native
-seam preserves the current Unix operation sequence instead. Approval is requested
-under the owner's “For anything else, ask” file-ownership rule. Valid Unix/local data collection is complete; its results are above. Full CI
-has not been dispatched, and the assigned target remains for the pending fix.
+Using the generic `publish_ordered` with a temporary link on every platform
+would add a hard link and unlink to each Unix pin. The approved native seam
+preserves the measured Unix operation sequence instead. Per the owner's follow-up,
+only the Windows x64 clean-source n=10 CPU cohort is rerun for this fix. Full CI
+and final target cleanup follow that validation.
 
 ## Owner-pending items
 
