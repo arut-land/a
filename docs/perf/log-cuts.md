@@ -527,3 +527,28 @@ request/completion audits pass. Current origin/main is `cd04f52d`, already merge
 at `8cdf5565`; the final merge check is up to date. The temporary diagnostic
 workflow is restored to main before the single full CI dispatch. Full CI and
 final target cleanup are pending.
+
+The single dispatch is [CI 41273913903](https://github.com/arut-land/a/actions/runs/41273913903),
+testing `1229d6eb828ca0955a0f6b9c8740617baf917449`. Twelve jobs are green,
+including Linux/macOS checks and budgets, Windows x64/arm64, miri and fuzz.
+The remaining Apple job stays inside `apple:check`; main's corresponding job
+(`41218085528`) completed in 11 minutes. GitHub does not yet expose the active
+job's downloadable log. No CI rerun has been made.
+
+An additional local diagnostic copies only tracked source into the evidence
+directory, builds the FFI package and fixture helper through mise with the one
+assigned Cargo target, then runs Swift tests with an isolated HOME/A_HOME and
+dummy loopback credentials. All **40 Swift tests pass**, including demanded
+history and child navigation; its daemon stops cleanly. The native Xcode app
+also builds successfully using the measured shipped helper and an external
+derived-data directory. Local simulator-version and deployment-target warnings
+do not fail that macOS build. Logs are `apple-local-ffi.log`,
+`apple-local-helper.log`, `apple-local-tests.log` and `apple-local-build.log`.
+No source or build outputs from this diagnostic enter the worktree.
+
+Owner decision pending: cancel the stalled run and rerun only Apple once, or
+continue waiting. The existing rule permits a job rerun only after its failing
+test also fails on main. No such failing test is available here: main's Apple
+job and the local candidate checks pass. An exception was requested; no CI
+cancellation or rerun has occurred. Final `cargo clean` and deletion of the
+assigned target remain pending the complete CI result.
