@@ -5,10 +5,9 @@ Branch `log-cuts`; baseline `ad00daad96bb79f6d11daf80adc895b958719dd5`
 for phase 2. This implements owner-approved child-storage stage 3. Admission
 record deduplication (stage 4) is not part of this change.
 
-Status: phase 1 is complete. Phase 2 has clean-source n=10 data on three hosts,
-and the owner-approved native Windows publication fix is applied. The Windows
-clean-source n=10 rerun is pending. Full CI has not been dispatched; phase 2
-and final target cleanup remain pending.
+Status: phase 1 is complete. Phase 2 has audited clean-source n=10 data on all
+four hosts, including the owner-approved native Windows publication fix. The
+deep median is lower on every host. Full CI and final target cleanup are pending.
 
 ## What changed and why
 
@@ -295,9 +294,9 @@ JSON bytes each. Raw observations, exact binary identities and summaries are in
 An initial replay overlapped build/check activity and is retained separately as
 `page-matrix-diagnostic-contended-*`; none of its times enter this table.
 
-The original 64-turn CPU median qualification remains open; this paging-only
-rerun does not establish full performance acceptance. Further CPU work needs
-owner review rather than extrapolating from faster paging.
+At the end of phase 1 the original 64-turn CPU median qualification remained
+open. The phase-2 CPU investigation and completed clean-source matrix below
+resolve it; this paging-only rerun did not establish CPU acceptance.
 
 ## Code and binary size
 
@@ -365,10 +364,12 @@ credentials and a loopback endpoint. No real model request was sent.
 Values are ms, median [min–max], n=10 fresh homes per cell/arm. Hosts are never
 pooled. Hosted Linux/macOS use the successful native jobs in
 [run 41254498179](https://github.com/arut-land/a/actions/runs/41254498179).
-The Windows job in that run failed before timing; its corrected build launcher
-is in [run 41256694182](https://github.com/arut-land/a/actions/runs/41256694182),
-which then exposed the product publication failure below. No Windows CPU
-acceptance is claimed.
+The completed Windows x64 cohort is
+[run 41267156257](https://github.com/arut-land/a/actions/runs/41267156257),
+comparing main `cd04f52d` against native-link candidate `8e7ca219`. Windows
+waits for pending background work outside timing before the completion audit;
+the measured workload and intervals are unchanged. Earlier Windows failures
+and the resulting corrections are documented below.
 
 | Host | Roots | Turns | Main | Candidate |
 | --- | --- | --- | --- | --- |
@@ -384,19 +385,26 @@ acceptance is claimed.
 | hosted macOS arm64 | 4 | 32 | 107.64 [90.94–159.34] | 112.06 [88.43–153.87] |
 | hosted macOS arm64 | 8 | 32 | 123.94 [91.44–161.92] | 132.91 [90.83–153.52] |
 | hosted macOS arm64 | 1 | 64 | 151.87 [99.26–166.15] | 141.31 [92.95–169.89] |
+| hosted Windows x64 | 1 | 32 | 187.50 [152.34–234.38] | 183.59 [160.16–230.47] |
+| hosted Windows x64 | 4 | 32 | 196.78 [167.97–223.63] | 176.76 [139.65–202.15] |
+| hosted Windows x64 | 8 | 32 | 195.56 [188.96–208.98] | 183.35 [161.13–195.80] |
+| hosted Windows x64 | 1 | 64 | 195.31 [164.06–257.81] | 185.55 [156.25–214.84] |
 
-The deep median is lower on all three completed hosts: local −1.9%, Linux
-−6.1%, hosted macOS −7.0%. The 32-turn controls are lower locally and on Linux;
+The deep median is lower on all four hosts: local −1.9%, Linux −6.1%, hosted
+macOS −7.0%, Windows −5.0%. The 32-turn controls are lower locally, on Linux
+and on Windows;
 hosted macOS has +4.1%/+7.2% medians at 4/8 roots with widely overlapping
 ranges. These data do not show separated deep-CPU spreads after the fix. They
 do not prove zero population-level difference or remove the observed outliers.
-Overall acceptance remains pending the native Windows correction and data.
+The completed matrix does not confirm the original deep-CPU regression after
+the index-path fix. No timing sample was removed from these accepted cohorts.
 
-The independent raw audit checks **240 cases, 230,400 completed tool calls,
-232,080 sessions and 115,200 links**, exact staged-binary hashes, formats 1/2,
+The independent raw audit checks **320 cases, 307,200 completed tool calls,
+309,440 sessions and 153,600 links**, exact staged-binary hashes, formats 1/2,
 recomputed late-CPU means and equal role/turn/fresh/tool request counts between
-arms. Raw accepted records are `cpu-clean-local`, `cpu-clean-hosted-linux` and
-`cpu-clean-hosted-macos`; summaries/audits are `cpu-clean-summary.json` and
+arms. Raw accepted records are `cpu-clean-local`, `cpu-clean-hosted-linux`,
+`cpu-clean-hosted-macos` and `cpu-clean-hosted-windows`; summaries/audits are
+`cpu-clean-summary.json` and
 `cpu-clean-audit.json`. Stopped hosted homes remain in the corresponding full
 run artifacts. The small sample artifacts are also retained locally.
 
@@ -458,13 +466,26 @@ draft remains `proposed-native-link.patch` in the evidence directory.
 Using the generic `publish_ordered` with a temporary link on every platform
 would add a hard link and unlink to each Unix pin. The approved native seam
 preserves the measured Unix operation sequence instead. Per the owner's follow-up,
-only the Windows x64 clean-source n=10 CPU cohort is rerun for this fix. Full CI
-and final target cleanup follow that validation.
+only the Windows x64 clean-source n=10 CPU cohort was rerun for this fix. It
+passes all 80 cases and its independent raw audit. Full CI and final target
+cleanup follow that validation.
 
 Local verification of the native link fix passes **723 sys/engine/protocol
 tests** (19 skipped), clippy with warnings denied, formatting and the Windows
 lint. Logs are `native-link-tests.log`, `native-link-clippy.log` and
 `native-link-windows.log`. The new tests use real files in temporary directories.
+
+The first native-link cohort (`41261944211`) completed 55 cases, then its audit
+found a still-pending background title call after the foreground 64-turn case
+ended. The raw child `01a19503-aae0-7787-a5f2-f99b1838b943` has the completed
+foreground model/tool facts, but title call 7 is interrupted by the harness's
+subsequent daemon stop. These partial timings are excluded from acceptance.
+The diagnostic now waits up to 90 seconds for pending tool/model results outside
+the measured interval, then applies the original completion/outcome assertions;
+it does not suppress title failures or discard an outlier. The complete n=10
+cohort was repeated successfully in `41267156257` with the same product
+revision. Selected raw files are retained under
+`native-link-failed-home`; logs are `native-link-failed.log`.
 
 ## Owner-pending items
 
@@ -497,3 +518,12 @@ ordinary visible-log deletion path, so this conjunction appears unlikely; it
 has not been reproduced. Repeating the barrier on an existing retention name
 would cost an extra directory sync per cut, or require tracking confirmed pins.
 No speculative retry/durability state machine was added.
+
+## Phase 2 integration
+
+The native Windows cohort passes at `8e7ca219`; both source-format probes and
+distinct executable-hash guards pass. All four n=10 CPU rows and their complete
+request/completion audits pass. Current origin/main is `cd04f52d`, already merged
+at `8cdf5565`; the final merge check is up to date. The temporary diagnostic
+workflow is restored to main before the single full CI dispatch. Full CI and
+final target cleanup are pending.
