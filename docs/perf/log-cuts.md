@@ -430,12 +430,12 @@ deleting the visible tree; only their obsolete second-index-directory deletion
 was removed.
 
 Fresh stripped shipped macOS builds (fixtures off, same release profile and
-rebuilt std) are **7,804,224 → 7,787,648 bytes**, **−16,576 bytes** versus current
-main. Metadata/commands are `cpu-fresh-main-shipped-a-build.json` and
-`cpu-fresh-fixed-shipped-a-build.json`. The final Rust diff versus that main
-revision is **1,082 added / 881 deleted**, net **+201**, including tests;
-`phase2-final-size-loc.json` records the count. Phase-1 sizes/counts above describe
-its earlier baseline and artifact, not this final clean build.
+rebuilt std), including the native link fix at `8e7ca219`, are
+**7,804,224 → 7,787,632 bytes**, **−16,592 bytes** versus current main.
+Metadata/commands are `cpu-fresh-main-shipped-a-build.json` and
+`native-link-shipped-a-build.json`. The final Rust diff versus that main
+revision is **1,145 added / 881 deleted**, net **+264**, including tests.
+Phase-1 sizes/counts above describe its earlier baseline and artifact.
 
 ### Native Windows publication
 
@@ -460,6 +460,11 @@ would add a hard link and unlink to each Unix pin. The approved native seam
 preserves the measured Unix operation sequence instead. Per the owner's follow-up,
 only the Windows x64 clean-source n=10 CPU cohort is rerun for this fix. Full CI
 and final target cleanup follow that validation.
+
+Local verification of the native link fix passes **723 sys/engine/protocol
+tests** (19 skipped), clippy with warnings denied, formatting and the Windows
+lint. Logs are `native-link-tests.log`, `native-link-clippy.log` and
+`native-link-windows.log`. The new tests use real files in temporary directories.
 
 ## Owner-pending items
 

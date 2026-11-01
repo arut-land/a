@@ -307,10 +307,16 @@ jobs:
                           sample=dict(turn=turn,root=root,cpu_ms=end-before,wall_ms=(time.monotonic_ns()-start)/1e6);samples.append(sample)
                           with (folder/'turns.jsonl').open('a') as f:f.write(json.dumps(sample)+'\n')
                       if turn%8==7:print(folder.name,'turn',turn+1,flush=True)
-                  # Match the phase-1 audit: every scheduled tool/model must durably finish.
-                  logs={}
-                  for path in (home/'sessions').rglob('log.jsonl'):
-                      rows=[json.loads(line) for line in path.read_text().splitlines()];logs[rows[0]['id']]=rows
+                  # A background title can outlive the last foreground attach.
+                  # Drain it outside timing before auditing or stopping its daemon.
+                  deadline=time.monotonic()+90
+                  while True:
+                      logs={}
+                      for path in (home/'sessions').rglob('log.jsonl'):
+                          rows=[json.loads(line) for line in path.read_text().splitlines()];logs[rows[0]['id']]=rows
+                      pending=[(sid,call) for sid,rows in logs.items() for call,result in [('model_call','model_result'),('tool_call','tool_result')] if {r['seq'] for r in rows if r.get('kind')==call}-{r['call'] for r in rows if r.get('kind')==result}]
+                      if not pending or time.monotonic()>=deadline:break
+                      time.sleep(0.1)
                   tool_count=0;links=0
                   for sid,rows in logs.items():
                       for call,result in [('model_call','model_result'),('tool_call','tool_result')]:
