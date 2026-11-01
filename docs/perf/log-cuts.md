@@ -5,10 +5,10 @@ Branch `log-cuts`; baseline `ad00daad96bb79f6d11daf80adc895b958719dd5`
 for phase 2. This implements owner-approved child-storage stage 3. Admission
 record deduplication (stage 4) is not part of this change.
 
-Status: phase 1 implementation and native checks are complete, including the
-owner-approved terminal-fragment sizing fix and a separate paging replay.
-Performance qualifications are recorded below. Full CI has not been dispatched;
-review and phase 2 remain pending.
+Status: phase 1 is complete. Phase 2 has clean-source n=10 data on three hosts,
+but native Windows publication needs the additional sys file allocation
+described below. That change is not applied. Full CI has not been dispatched;
+phase 2 and final target cleanup remain pending.
 
 ## What changed and why
 
@@ -318,59 +318,149 @@ values and the raw count are in `final-size-loc.json`.
 
 ## Phase 2 CPU review investigation
 
-The sole independent finding was the original n=5 deep CPU increase. Main was
-refetched and merged without conflicts: baseline `cd04f52d`, merged product
-`8cdf5565`. A temporary diagnostic job in `perf.yml` builds native release
-fixtures with rebuilt std, two jobs and one external target per runner. It runs
-10 alternating A/B or B/A rounds at 1/4/8 roots × 32 turns and 1 root × 64 turns,
-80 fresh homes per host. The same loopback SSE workload, five 128 KiB fresh
-agent outputs and eight tools per root turn are preserved. Each case audits
-all durable model/tool completions and child addresses, then stops its daemon
-before archiving the isolated home. Late CPU is the mean of the final four
-turns per root, using native process counters. Controls are CPU-only; clients
-and residency probes from phase 1 are not rerun here.
+Main `cd04f52d1b69363aa7faaa589df45e688f115012` was merged without conflicts
+(`8cdf5565`). The profiled fix is product revision
+`76e28a482fc31d8a469d36932fcde9a8605abd1c`: remove retained disposable-index
+aliases and reuse the ordinary log's index before falling back to retained bytes.
+No change was made to source retention, source-log ordering, provider-prefix
+caches, frozen cuts, publication authority or admission barriers.
 
-The first completed local n=10 run confirms a deep CPU problem: main
-**93.94 [89.06–99.74] ms**, candidate **100.79 [97.89–152.40] ms**. All ten
-paired deltas are positive (median +6.11 ms). The original local observations are in `cpu-local-final`.
-Initial hosted cohorts are excluded: the raw identity audit found identical
-before/after executable hashes in the fixed Linux cohort, despite different
-checkout revisions. Cargo reused the first checkout's release artifacts
-when the second checkout shared its target directory; a guarded retry confirmed
-main format 1 where candidate format 2 was expected, after a 0.70-second fresh
-build. Neither the common target name nor the reported artifact alone was a
-source-identity check. No hosted timing from that staging method is
-accepted. Their raw records and logs remain as invalid diagnostics. The revised
-hosted build clears the assigned build target between source variants,
-stages the reported artifact, bypasses command-wrapper ambiguity, and requires distinct hashes plus each source revision's expected on-disk log
-format before timing. Local format probes independently confirm main format 1
-and candidate format 2; the final local release rebuild is byte-for-byte
-identical to its measured binary. Results remain per native host, never pooled.
+The original +3.0% n=5 deep median was investigated rather than dismissed. A
+preliminary local n=10 run had all ten deep paired deltas positive. An extra
+native `sample` capture during turns 57–64 (excluded from timings) points at
+retained-log publication, hard links and directory ordering. These are wall
+stacks, not CPU-time attribution by themselves. The five-round interleaved
+ablation removes the extra index publication/lookup path and lowers the median
+from 103.07 [97.79–104.99] to 95.08 [92.91–145.59] ms; four of five pairs improve.
+The outlier remains. Profiles, exact UUID-matched symbols and this diagnostic
+cohort stay under `cpu-profile` and `cpu-index-ablation` in the evidence directory.
 
-An extra native `sample` capture during turns 57–64 (excluded from timings)
-shows added retained-log publication work: source and disposable-index hard
-links, directory ordering and metadata lookups under `Jsonl::retain`. Exact
-UUID-matched symbols and both profiles are retained under `cpu-profile`.
-A disposable index needs no retained publication: it can be reused at the
-ordinary log or rebuilt after visible-source removal. The fix removes that
-extra index link and namespace, and reads the ordinary source before falling
-back to its retained alias. The source-log hard link, directory ordering and
-referring admission durability barrier remain. Frozen cuts, recursive retention,
-provider caches and admission authority are unchanged.
+### Accepted clean-source method
 
-A release, five-round interleaved ablation of the previous candidate against
-this change reduces the deep median from **103.07 [97.79–104.99]** to
-**95.08 [92.91–145.59] ms**. Four of five paired deltas improve; the wide outlier
-is retained. These diagnostic results support the narrow cause fix, but do not
-replace final n=10 acceptance. The final candidate must be remeasured against
-main on all three hosted platforms and quietly on this Mac.
+Each host builds both revisions in release mode, with rebuilt std, two Cargo
+jobs and the one assigned external target. Clear that target between source
+variants, stage Cargo's reported executable, then start a real echo-agent daemon
+in an isolated format-probe home. Its log must match the requested source's
+format (main 1, candidate 2), and the executable hashes must differ. Stop each
+probe daemon before timing. The accepted local binaries are `aefabb2871fd…`
+(main) and `67b9bd1ec49f…` (candidate), with full identities in
+`cpu-clean-local-builds.json`.
 
-The revised code passes 523 engine/protocol tests (17 skipped), clippy with
-warnings denied, formatting and the Windows lint. The recursive removal tests
-still recover the same transcript and payloads after deleting the visible tree;
-their obsolete second-index-directory deletion is removed. Detailed logs are
-`cpu-index-ablation-tests.log`, `cpu-index-clippy.log`,
-`cpu-index-fmt.log`, and `cpu-index-windows.log`. No full CI has been dispatched.
+Run 10 alternating A/B or B/A rounds at 1/4/8 roots × 32 turns and one root ×
+64 turns: 80 fresh homes per host. The same loopback SSE workload, five 128 KiB
+fresh-agent outputs and eight tools per root turn are preserved. Every case
+audits durable model/tool completions and child addresses, then stops its daemon
+before archiving the isolated home. Late CPU is the mean of the last four turns
+per root. Native counters are Mach-scaled process CPU on macOS, process-stat
+clock ticks on Linux, and `GetProcessTimes` on Windows. Counters have native
+quantization; reported means do not imply finer counter resolution. Controls
+are CPU-only: phase-1 clients and residency probes are not repeated here.
+
+No build or large download ran alongside the accepted local measurements. Each
+runtime constructs an allowlisted environment, isolated HOME/A_HOME, dummy
+credentials and a loopback endpoint. No real model request was sent.
+
+### Completed clean-source CPU data
+
+Values are ms, median [min–max], n=10 fresh homes per cell/arm. Hosts are never
+pooled. Hosted Linux/macOS use the successful native jobs in
+[run 41254498179](https://github.com/arut-land/a/actions/runs/41254498179).
+The Windows job in that run failed before timing; its corrected build launcher
+is in [run 41256694182](https://github.com/arut-land/a/actions/runs/41256694182),
+which then exposed the product publication failure below. No Windows CPU
+acceptance is claimed.
+
+| Host | Roots | Turns | Main | Candidate |
+| --- | --- | --- | --- | --- |
+| local macOS arm64 | 1 | 32 | 118.89 [95.24–138.21] | 116.34 [109.52–135.61] |
+| local macOS arm64 | 4 | 32 | 134.97 [123.05–145.57] | 124.02 [113.21–136.07] |
+| local macOS arm64 | 8 | 32 | 136.64 [131.25–144.92] | 126.48 [121.62–133.19] |
+| local macOS arm64 | 1 | 64 | 95.15 [91.01–100.15] | 93.39 [89.90–98.56] |
+| hosted Linux x64 | 1 | 32 | 112.50 [107.50–115.00] | 105.00 [102.50–107.50] |
+| hosted Linux x64 | 4 | 32 | 112.81 [108.12–115.62] | 106.88 [105.62–108.12] |
+| hosted Linux x64 | 8 | 32 | 112.97 [110.31–115.00] | 107.97 [104.69–109.69] |
+| hosted Linux x64 | 1 | 64 | 123.75 [120.00–127.50] | 116.25 [115.00–120.00] |
+| hosted macOS arm64 | 1 | 32 | 122.15 [91.77–194.60] | 110.11 [86.28–148.62] |
+| hosted macOS arm64 | 4 | 32 | 107.64 [90.94–159.34] | 112.06 [88.43–153.87] |
+| hosted macOS arm64 | 8 | 32 | 123.94 [91.44–161.92] | 132.91 [90.83–153.52] |
+| hosted macOS arm64 | 1 | 64 | 151.87 [99.26–166.15] | 141.31 [92.95–169.89] |
+
+The deep median is lower on all three completed hosts: local −1.9%, Linux
+−6.1%, hosted macOS −7.0%. The 32-turn controls are lower locally and on Linux;
+hosted macOS has +4.1%/+7.2% medians at 4/8 roots with widely overlapping
+ranges. These data do not show separated deep-CPU spreads after the fix. They
+do not prove zero population-level difference or remove the observed outliers.
+Overall acceptance remains pending the native Windows correction and data.
+
+The independent raw audit checks **240 cases, 230,400 completed tool calls,
+232,080 sessions and 115,200 links**, exact staged-binary hashes, formats 1/2,
+recomputed late-CPU means and equal role/turn/fresh/tool request counts between
+arms. Raw accepted records are `cpu-clean-local`, `cpu-clean-hosted-linux` and
+`cpu-clean-hosted-macos`; summaries/audits are `cpu-clean-summary.json` and
+`cpu-clean-audit.json`. Stopped hosted homes remain in the corresponding full
+run artifacts. The small sample artifacts are also retained locally.
+
+### Invalid diagnostics and build verification
+
+Earlier hosted cohorts are excluded by method and identity, never by timing:
+two checkouts sharing the target caused Cargo to report the second source as
+fresh and return the first binary. The audit found identical before/after
+hashes; a guarded retry observed main format 1 where candidate format 2 was
+expected after a 0.70-second build. Neither a conventional target filename nor
+the reported artifact alone proved source identity. Clearing the assigned target
+between variants and verifying actual formats fixes this. Preliminary local
+cached-builder cohorts are diagnostic only; the local matrix was repeated with
+the same clean-source method as the accepted hosts.
+
+The first Windows cleanup attempt also stopped after successfully auditing a
+baseline case because blobs are read-only; the harness now clears the read-only
+attribute only when deleting its stopped, owned temporary home. A subsequent
+Windows build found a native launcher issue: `os.execv` returned before Cargo
+cleanup ended, racing dependency-file creation. The launcher now waits with
+`subprocess.call` and propagates Cargo's exit status. Both failures are retained
+in the evidence and excluded from acceptance. None is hidden by retrying a full
+CI job; full CI has not been dispatched.
+
+The actual code passes 523 engine/protocol tests (17 skipped), 147 CLI tests
+(10 skipped), clippy with warnings denied, formatting and the Windows lint.
+Logs are `cpu-index-ablation-tests.log`, `cpu-index-cli-tests.log`,
+`cpu-index-clippy.log`, `cpu-index-fmt.log`, and `cpu-index-windows.log`.
+The recursive removal tests still recover the same transcript and payloads after
+deleting the visible tree; only their obsolete second-index-directory deletion
+was removed.
+
+Fresh stripped shipped macOS builds (fixtures off, same release profile and
+rebuilt std) are **7,804,224 → 7,787,648 bytes**, **−16,576 bytes** versus current
+main. Metadata/commands are `cpu-fresh-main-shipped-a-build.json` and
+`cpu-fresh-fixed-shipped-a-build.json`. The final Rust diff versus that main
+revision is **1,082 added / 881 deleted**, net **+201**, including tests;
+`phase2-final-size-loc.json` records the count. Phase-1 sizes/counts above describe
+its earlier baseline and artifact, not this final clean build.
+
+### Native Windows publication requires an additional file allocation
+
+The guarded, clean-build Windows workload (`41256694182`) passes its main/candidate
+format checks, then fails the first candidate case: a model-only result records
+`publish names with write-through rename`. This is a real publication-path
+failure, not a model request failure. `Jsonl::retain` calls `order_dir`, whose
+Windows implementation deliberately rejects directory synchronization and requires
+native write-through name publication.
+
+The proposed fix needs **`crates/sys/src/fs.rs`**, outside this lane's allocated
+files. Add `link_ordered(from, to)`: keep the existing Unix hard-link plus
+ordered-directory path; on Windows, hard-link to a private temporary name and
+publish that name with the existing non-replacing write-through rename. The
+owned engine store delegates to that primitive. No new unsafe code or dependency
+is needed. Real-filesystem tests must hold shared identity, later appends and
+non-replacement. The reviewable draft is `proposed-native-link.patch` in the
+evidence directory. No edit to the unallocated sys file has been made.
+
+An owned-files-only alternative uses the existing generic `publish_ordered`
+with a temporary link on every platform. It adds a hard link and unlink to each
+Unix pin, which risks reintroducing the measured CPU cost. The proposed native
+seam preserves the current Unix operation sequence instead. Approval is requested
+under the owner's “For anything else, ask” file-ownership rule. Valid Unix/local data collection is complete; its results are above. Full CI
+has not been dispatched, and the assigned target remains for the pending fix.
 
 ## Owner-pending items
 
