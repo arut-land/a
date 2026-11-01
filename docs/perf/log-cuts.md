@@ -1,13 +1,15 @@
 # Retained ordinary log cuts
 
 Branch `log-cuts`; baseline `ad00daad96bb79f6d11daf80adc895b958719dd5`
-(app-ux merged). Native macOS arm64, 2026-10-31–2026-11-01 local. Phase 1; full CI is reserved
-for phase 2. This implements owner-approved child-storage stage 3. Admission
+(app-ux merged). Native macOS arm64, 2026-10-31–2026-11-01 local. Phases 1 and 2
+are complete. This implements owner-approved child-storage stage 3. Admission
 record deduplication (stage 4) is not part of this change.
 
-Status: phase 1 is complete. Phase 2 has audited clean-source n=10 data on all
-four hosts, including the owner-approved native Windows publication fix. The
-deep median is lower on every host. Full CI and final target cleanup are pending.
+Status: phase 2 is complete. Audited clean-source n=10 data cover all four
+hosts, including the owner-approved native Windows publication fix; the deep
+median is lower on every host. CI `41273913903` is green on all 13 jobs after
+one owner-approved Apple-only rerun. The assigned Cargo target is cleaned and
+deleted. Raw evidence remains in the external evidence directory.
 
 ## What changed and why
 
@@ -136,7 +138,8 @@ retained bytes. Measurements below determine the performance verdict.
   page shape, both directions, UTF-8 boundaries and continuation recovery. No
   duplicate test was added. Package clippy, formatting and Windows lint pass
   again (`page-fix-clippy.log`, `page-fix-fmt.log`, `page-fix-windows.log`).
-- New wire corpus and view vector generation pass. No full CI dispatched.
+- New wire corpus and view vector generation pass. No full CI was dispatched
+  during phase 1.
 
 All cargo invocations use `mise exec --`, two jobs, and the assigned external
 `tgt-log-cuts`. Runtime probes construct allowlisted environments with isolated
@@ -427,7 +430,7 @@ Windows build found a native launcher issue: `os.execv` returned before Cargo
 cleanup ended, racing dependency-file creation. The launcher now waits with
 `subprocess.call` and propagates Cargo's exit status. Both failures are retained
 in the evidence and excluded from acceptance. None is hidden by retrying a full
-CI job; full CI has not been dispatched.
+CI job. These diagnostic attempts preceded full CI; its final result is below.
 
 The actual code passes 523 engine/protocol tests (17 skipped), 147 CLI tests
 (10 skipped), clippy with warnings denied, formatting and the Windows lint.
@@ -468,7 +471,7 @@ would add a hard link and unlink to each Unix pin. The approved native seam
 preserves the measured Unix operation sequence instead. Per the owner's follow-up,
 only the Windows x64 clean-source n=10 CPU cohort was rerun for this fix. It
 passes all 80 cases and its independent raw audit. Full CI and final target
-cleanup follow that validation.
+cleanup completed after that validation, as recorded below.
 
 Local verification of the native link fix passes **723 sys/engine/protocol
 tests** (19 skipped), clippy with warnings denied, formatting and the Windows
@@ -523,17 +526,19 @@ No speculative retry/durability state machine was added.
 
 The native Windows cohort passes at `8e7ca219`; both source-format probes and
 distinct executable-hash guards pass. All four n=10 CPU rows and their complete
-request/completion audits pass. Current origin/main is `cd04f52d`, already merged
-at `8cdf5565`; the final merge check is up to date. The temporary diagnostic
-workflow is restored to main before the single full CI dispatch. Full CI and
-final target cleanup are pending.
+request/completion audits pass. At the final pre-CI merge check, origin/main was
+`cd04f52d`, already merged at `8cdf5565`; the merge was up to date. The temporary diagnostic
+workflow was restored to main before the single full CI dispatch. Full CI and
+final target cleanup are complete.
 
 The single dispatch is [CI 41273913903](https://github.com/arut-land/a/actions/runs/41273913903),
-testing `1229d6eb828ca0955a0f6b9c8740617baf917449`. Twelve jobs are green,
-including Linux/macOS checks and budgets, Windows x64/arm64, miri and fuzz.
-The remaining Apple job stays inside `apple:check`; main's corresponding job
-(`41218085528`) completed in 11 minutes. GitHub does not yet expose the active
-job's downloadable log. No CI rerun has been made.
+testing `1229d6eb828ca0955a0f6b9c8740617baf917449`. All **13 jobs are green**,
+including Linux/macOS checks and budgets, Windows x64/arm64, miri, fuzz and
+Apple. The first attempt completed twelve jobs but stalled in `apple:check`;
+main's corresponding job (`41218085528`) completed in 11 minutes. Once cancelled,
+its log showed Swift compilation finished at 04:43:31 UTC, followed by no test
+results before cancellation at 06:52:54 UTC. The initial stall's cause remains
+unestablished; no product fix was made for it.
 
 An additional local diagnostic copies only tracked source into the evidence
 directory, builds the FFI package and fixture helper through mise with the one
@@ -546,9 +551,19 @@ do not fail that macOS build. Logs are `apple-local-ffi.log`,
 `apple-local-helper.log`, `apple-local-tests.log` and `apple-local-build.log`.
 No source or build outputs from this diagnostic enter the worktree.
 
-Owner decision pending: cancel the stalled run and rerun only Apple once, or
-continue waiting. The existing rule permits a job rerun only after its failing
-test also fails on main. No such failing test is available here: main's Apple
-job and the local candidate checks pass. An exception was requested; no CI
-cancellation or rerun has occurred. Final `cargo clean` and deletion of the
-assigned target remain pending the complete CI result.
+The owner explicitly approved cancelling that run and rerunning only Apple
+once, with a 45-minute limit before a separate hosted hang diagnostic. That
+single rerun passed in **6 minutes 57 seconds** (06:57:48–07:04:45 UTC), including
+all 40 Swift tests and the app build. The other twelve original successful
+results were retained. There was exactly one full CI dispatch and one targeted
+job rerun; the diagnostic-workflow condition was not reached. Evidence is
+`CI-cancel-status.json`, `CI-apple-rerun.json`, `CI-apple-rerun-status.json`,
+`CI-apple-attempt1.log` and `CI-apple-attempt2.log`. Later commits update only
+this report; product code matches the CI-tested revision.
+
+Final cleanup ran `mise exec -- cargo clean` through the isolated wrapper with
+`CARGO_BUILD_JOBS=2` and the assigned `CARGO_TARGET_DIR`: **20,343 files / 3.0 GiB
+removed**. The target directory was then deleted and its absence verified.
+`phase2-cargo-clean.log` and `phase2-cleanup.json` record the result. Probe daemons
+were stopped through their isolated homes; raw evidence and staged measurement
+artifacts remain outside the worktree.
