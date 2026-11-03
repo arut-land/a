@@ -32,6 +32,7 @@ jobs:
             await page.addInitScript(() => {
               window.rovingTrace = [];
               document.addEventListener('DOMContentLoaded', () => {
+                if (!document.querySelector('#conversations')) return;
                 const snapshot = reason => {
                   const rows = [...document.querySelectorAll('[data-conversation]')];
                   window.rovingTrace.push({reason, at: performance.now(), focus: document.activeElement?.dataset.conversation,
@@ -74,3 +75,12 @@ jobs:
             MBX_CACHE_DIR="$RUNNER_TEMP/mbx" MISE_AUTO_INSTALL=false \
             OPENAI_API_KEY=loopback-dummy OPENAI_BASE_URL=http://127.0.0.1:1/v1 \
             NO_PROXY=127.0.0.1,localhost mise exec -- bash "$RUNNER_TEMP/web-roving.sh"
+      - uses: actions/cache/save@v6
+        if: always()
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ${{ runner.temp }}/mbx/actions
+          key: web-roving-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
