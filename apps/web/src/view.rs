@@ -115,8 +115,18 @@ pub fn chat_page(session: SessionId, tab: &str) -> String {
 const CONVERSATION_KEYS: &str = r"
 const composer = document.getElementById('composer');
 const links = () => [...document.querySelectorAll('[data-conversation]')];
+let rovingSession;
+let focusedSession;
+function rove(link) {
+  rovingSession = link?.dataset.conversation;
+  links().forEach(a => {
+    const tabIndex = a === link ? 0 : -1;
+    if (a.tabIndex !== tabIndex) a.tabIndex = tabIndex;
+  });
+  hint(link);
+}
 function select(link) {
-  links().forEach(a => a.tabIndex = a === link ? 0 : -1);
+  rove(link);
   link?.focus();
 }
 document.addEventListener('keydown', event => {
@@ -148,12 +158,19 @@ function hint(row) {
   const text = row.dataset.stop === 'true' ? '↑/↓ to select · Enter to view · x to stop · Esc to compose' : '↑/↓ to select · Enter to view · Esc to compose';
   if (hint.textContent !== text) hint.textContent = text;
 }
-document.addEventListener('focusin', event => hint(event.target.closest('[data-conversation]')));
+document.addEventListener('focusin', event => {
+  const row = event.target.closest('[data-conversation]');
+  focusedSession = row?.dataset.conversation;
+  if (row) rove(row);
+});
 new MutationObserver(() => {
   const list = document.getElementById('conversations');
   if (list?.dataset.placeholder) composer.placeholder = list.dataset.placeholder;
-  const row = document.activeElement?.closest('[data-conversation]');
-  if (row) { links().forEach(a => a.tabIndex = a === row ? 0 : -1); hint(row); }
+  const rows = links();
+  const row = rows.find(a => a.dataset.conversation === rovingSession)
+    ?? rows.find(a => a.getAttribute('aria-selected') === 'true');
+  rove(row);
+  if (row && row.dataset.conversation === focusedSession && document.activeElement !== row) row.focus();
 }).observe(document.getElementById('conversations').parentNode, {childList: true, subtree: true, attributes: true, attributeFilter: ['data-placeholder']});
 ";
 
@@ -182,6 +199,8 @@ pub fn conversation_list(
                 @for row in rows {
                     div style="display: flex; align-items: center; gap: 0.5rem;" {
                         a id=(format!("conversation_{}", row.session)) role="option" aria-selected=(if row.session == current { "true" } else { "false" })
+                            // The browser owns the roving stop after the first render.
+                            data-preserve-attr="tabindex"
                             tabindex=(if row.session == current { "0" } else { "-1" })
                             data-conversation=(format_args!("{}", row.session))
                             data-stop=(if row.parent.is_some() && row.status == client::ConversationStatus::Running { "true" } else { "false" })
