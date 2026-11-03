@@ -158,6 +158,10 @@ function hint(row) {
   const text = row.dataset.stop === 'true' ? '↑/↓ to select · Enter to view · x to stop · Esc to compose' : '↑/↓ to select · Enter to view · Esc to compose';
   if (hint.textContent !== text) hint.textContent = text;
 }
+// Pointer clicks on non-focusable text can blur a row without a focusin event.
+document.addEventListener('pointerdown', event => {
+  if (!event.target.closest('[data-conversation]')) focusedSession = undefined;
+});
 document.addEventListener('focusin', event => {
   const row = event.target.closest('[data-conversation]');
   focusedSession = row?.dataset.conversation;

@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import { launchBrowser } from './test-browser.mjs';
 
+const replaceConversations = () => {
+  const list = document.getElementById('conversations');
+  list.replaceWith(list.cloneNode(true));
+};
+
 const browser = await launchBrowser();
 try {
   const context = await browser.newContext();
@@ -94,6 +99,14 @@ try {
   assert.deepEqual(await page.evaluate(() => window.rovingViolations), [], 'every live update keeps focus and the sole tab stop on the same session');
   await page.keyboard.press('Enter');
   await page.waitForFunction(id => document.querySelector(`[data-conversation="${id}"]`)?.getAttribute('aria-selected') === 'true', family[2].id);
+  await page.locator(`[data-conversation="${family[1].id}"]`).focus();
+  await page.evaluate(replaceConversations);
+  assert.equal(await page.evaluate(() => document.activeElement.dataset.conversation), family[1].id, 'DOM replacement restores owned focus by session id');
+  await page.locator('#transcript').getByText('$ sleep 30', {exact: true}).first().click();
+  assert.equal(await page.evaluate(() => document.activeElement === document.body), true, 'clicking transcript text releases focus');
+  await page.evaluate(replaceConversations);
+  assert.equal(await page.evaluate(() => document.activeElement === document.body), true, 'a list update must not reclaim deliberately released focus');
+  assert.deepEqual(await page.locator('[data-conversation][tabindex="0"]').evaluateAll(rows => rows.map(row => row.dataset.conversation)), [family[1].id], 'releasing focus preserves the roving tab stop');
   await branch.close();
   assert.deepEqual(errors, [], 'live chat raised a browser exception');
 } finally {

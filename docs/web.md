@@ -77,6 +77,8 @@ browser tab ──GET /s/<id>/events?tab=…──> Live: SessionClient + Page +
   viewed session. Keyboard and pointer focus update the remembered session id.
   After a list update, the browser reconciles the tab stop and restores focus
   by that id, including when a nested child is inserted before the focused row.
+  Pointer interaction outside the rows releases focus ownership while keeping
+  the roving tab stop, so later patches do not pull focus out of transcript text.
 - **Composer admission**: `admitted` is `false` until the server accepts a
   draft, then holds that draft until the effect consumes it. The effect
   clears the composer only if it still contains the accepted text, and
