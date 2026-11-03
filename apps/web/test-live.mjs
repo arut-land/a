@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import { launchBrowser } from './test-browser.mjs';
 
+const replaceConversations = () => {
+  const list = document.getElementById('conversations');
+  list.replaceWith(list.cloneNode(true));
+};
+
 const browser = await launchBrowser();
 try {
   const context = await browser.newContext();
@@ -54,6 +59,7 @@ try {
   await page.waitForFunction(() => document.querySelector('#composer').placeholder.startsWith('Message @'));
   assert.equal(await page.getByRole('link', {name: '← Back to parent'}).count(), 1);
   assert.equal(await page.locator('[data-conversation]').count(), 3);
+  assert.deepEqual(await page.locator('[data-conversation][tabindex="0"]').evaluateAll(rows => rows.map(row => row.dataset.conversation)), [selectedChild], 'the viewed child is the initial tab stop');
   await draft.press('ArrowDown');
   await page.keyboard.press('ArrowDown');
   await page.keyboard.press('x');
@@ -74,6 +80,15 @@ try {
   await page.keyboard.press('ArrowDown');
   await page.keyboard.press('ArrowDown');
   assert.equal(await page.evaluate(() => document.activeElement.dataset.conversation), family[2].id);
+  assert.deepEqual(await page.locator('[data-conversation][tabindex="0"]').evaluateAll(rows => rows.map(row => row.dataset.conversation)), [family[2].id]);
+  await page.evaluate(expected => {
+    window.rovingViolations = [];
+    new MutationObserver(() => {
+      const focus = document.activeElement?.dataset.conversation;
+      const stops = [...document.querySelectorAll('[data-conversation][tabindex="0"]')].map(row => row.dataset.conversation);
+      if (focus !== expected || stops.length !== 1 || stops[0] !== expected) window.rovingViolations.push({focus, stops});
+    }).observe(document.querySelector('#conversations').parentNode, {subtree: true, childList: true, attributes: true, attributeFilter: ['tabindex']});
+  }, family[2].id);
   const branch = await context.newPage();
   await branch.goto(family[1].href);
   await branch.locator('#composer').fill('spawn nested web child');
@@ -81,8 +96,17 @@ try {
   await page.waitForFunction(() => document.querySelectorAll('[data-conversation]').length === 4);
   assert.equal(await page.evaluate(() => document.activeElement.dataset.conversation), family[2].id, 'live insertion must retain focus by session id');
   assert.equal(await page.locator(`[data-conversation="${family[2].id}"]`).getAttribute('tabindex'), '0');
+  assert.deepEqual(await page.evaluate(() => window.rovingViolations), [], 'every live update keeps focus and the sole tab stop on the same session');
   await page.keyboard.press('Enter');
   await page.waitForFunction(id => document.querySelector(`[data-conversation="${id}"]`)?.getAttribute('aria-selected') === 'true', family[2].id);
+  await page.locator(`[data-conversation="${family[1].id}"]`).focus();
+  await page.evaluate(replaceConversations);
+  assert.equal(await page.evaluate(() => document.activeElement.dataset.conversation), family[1].id, 'DOM replacement restores owned focus by session id');
+  await page.locator('#transcript').getByText('$ sleep 30', {exact: true}).first().click();
+  assert.equal(await page.evaluate(() => document.activeElement === document.body), true, 'clicking transcript text releases focus');
+  await page.evaluate(replaceConversations);
+  assert.equal(await page.evaluate(() => document.activeElement === document.body), true, 'a list update must not reclaim deliberately released focus');
+  assert.deepEqual(await page.locator('[data-conversation][tabindex="0"]').evaluateAll(rows => rows.map(row => row.dataset.conversation)), [family[1].id], 'releasing focus preserves the roving tab stop');
   await branch.close();
   assert.deepEqual(errors, [], 'live chat raised a browser exception');
 } finally {
