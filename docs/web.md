@@ -103,7 +103,7 @@ browser tab ──GET /s/<id>/events?tab=…──> Live: SessionClient + Page +
 - `mise run web`: the dev build against an isolated home
   (`target/web-home`) and the model-backed agent with `.env.local`'s keys
   (`agent = "echo"` in its `config.toml` for none); its daemon stops with
-  it.
+  it. Only `web` and `apple:run` load that file; tests and checks do not.
 - `mise run test:web`: `apps/cli/tests/blackbox/web.rs`, black-box against `a web`
   in an isolated `A_HOME` with the echo agent: the link signs in once and
   foreign requests are refused, a chat moves to a host of its own, a tab
