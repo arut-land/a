@@ -69,8 +69,12 @@ impl Page {
     }
 
     pub fn conversations(&mut self, rows: &[client::ConversationRow]) {
+        // A child's head arrives before its ancestors. Publish the family only
+        // once its root head has supplied the siblings as well.
+        if rows.first().is_none_or(|row| row.parent.is_some()) {
+            return;
+        }
         self.pending_conversations = Some(rows.to_vec());
-        self.show_conversations();
     }
 
     fn show_conversations(&mut self) {
@@ -643,6 +647,65 @@ mod tests {
     fn events(page: &mut Page) -> Vec<String> {
         let out = String::from_utf8(page.take()).unwrap();
         out.split_terminator("\n\n").map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn a_child_switcher_waits_for_its_root_and_publishes_one_complete_family() {
+        let mut page = synced();
+        let child = page.session;
+        let root = SessionId::new();
+        let sibling = SessionId::new();
+        let mut tree = client::ConversationTree::new(child);
+        tree.apply(
+            &client::ConversationHead {
+                session: child,
+                seq: 1,
+                identity: protocol::history::Conversation {
+                    parent: Some(root),
+                    title: Some("child".into()),
+                    ..Default::default()
+                },
+                usage: protocol::view::Usage::default(),
+            },
+            None,
+        );
+        page.conversations(&tree.rows());
+        page.settle();
+        assert_eq!(events(&mut page), Vec::<String>::new());
+
+        tree.apply(
+            &client::ConversationHead {
+                session: root,
+                seq: 2,
+                identity: protocol::history::Conversation {
+                    children: [child, sibling]
+                        .into_iter()
+                        .map(|session| protocol::history::Child {
+                            session,
+                            agent: "worker".into(),
+                            title: "child".into(),
+                            admitted_unix_ms: 0,
+                        })
+                        .collect(),
+                    ..Default::default()
+                },
+                usage: protocol::view::Usage::default(),
+            },
+            None,
+        );
+        page.conversations(&tree.rows());
+        page.conversations(&tree.rows());
+        assert_eq!(
+            events(&mut page),
+            Vec::<String>::new(),
+            "updates wait for the batch to settle"
+        );
+        page.settle();
+        let patches = events(&mut page);
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].matches("data-conversation=").count(), 3);
+        assert!(patches[0].contains("← Back to parent"));
+        assert!(patches[0].contains("data-placeholder=\"Message @child…\""));
     }
 
     fn deliver_history(page: &mut Page, message: DaemonMsg) -> Vec<client::Io> {

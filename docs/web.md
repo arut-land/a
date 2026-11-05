@@ -5,8 +5,8 @@ UI on a random port of 127.0.0.1, prints a link that works once, opens the
 browser (`--no-open` only prints), and runs until stopped. Closing it stops
 only the UI; sessions keep running in the daemon. Every page and patch is
 rendered in Rust (hypertext's typed markup); in the browser, Datastar
-applies the patches each tab's event stream sends. There is no JavaScript
-of ours.
+applies the patches each tab's event stream sends. A small inline script
+handles the conversation switcher's keyboard navigation and focus.
 
 ## Design
 
@@ -68,6 +68,17 @@ browser tab ──GET /s/<id>/events?tab=…──> Live: SessionClient + Page +
   the source (`assets/datastar-1.0.4.js.zz`, 13 KB of 34), embedded and
   served compressed under a versioned path so browsers keep it. A unit test
   inflates it and holds it to the `.js` byte for byte.
+- **Conversation switcher**: head-only observers discover the current session's
+  family. A child head can arrive before its ancestors; the page waits for the
+  root head (which supplies its children) before publishing the list, then
+  renders the latest family once per batch. Rows have stable session ids.
+  The browser owns the roving tab stop after the initial render;
+  `data-preserve-attr="tabindex"` keeps server morphs from resetting it to the
+  viewed session. Keyboard and pointer focus update the remembered session id.
+  After a list update, the browser reconciles the tab stop and restores focus
+  by that id, including when a nested child is inserted before the focused row.
+  Pointer interaction outside the rows releases focus ownership while keeping
+  the roving tab stop, so later patches do not pull focus out of transcript text.
 - **Composer admission**: `admitted` is `false` until the server accepts a
   draft, then holds that draft until the effect consumes it. The effect
   clears the composer only if it still contains the accepted text, and
@@ -95,7 +106,9 @@ browser tab ──GET /s/<id>/events?tab=…──> Live: SessionClient + Page +
 - Browser regression: `a_live_composer_never_throws_or_discards_a_newer_draft`
   runs the served page and committed Datastar in real headless Chromium,
   catches uncaught exceptions from initial attach through live echo turns,
-  and preserves edits made while an admission response is pending. It is
+  preserves edits made while an admission response is pending, and checks the
+  conversation family's membership and focused tab stop across navigation and
+  live nested-child insertion. It is
   part of `mise run test:web` and the full suite, without an ignore marker.
   `test:web` requires Node and npm and prepares `playwright-core@1.64.1`
   before running the tests. It uses installed Google Chrome on Linux and
