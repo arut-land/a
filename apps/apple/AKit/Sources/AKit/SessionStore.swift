@@ -44,6 +44,7 @@ public enum AttachmentState: Equatable {
 public final class SessionStore {
     public private(set) var items: [DisplayItem] = []
     public private(set) var history: HistoryWindow?
+    public private(set) var queuedInputs: [QueuedInput] = []
     public private(set) var followsHistory = true
     @ObservationIgnored private var requestingHistory = false
 
@@ -305,7 +306,13 @@ public final class SessionStore {
         }
     }
 
+    public func editQueued(_ seq: UInt64) throws -> String {
+        guard let session else { throw ClientError.notOpen }
+        return try session.editQueued(input: seq)
+    }
+
     private func adopt(_ s: SessionSnapshot) {
+        queuedInputs = session?.queuedInputs() ?? []
         retainedBytes = s.retainedBytes
         history = s.history
         requestingHistory = s.history?.pending == true
@@ -335,6 +342,7 @@ public final class SessionStore {
                 break
             }
         }
+        queuedInputs = session?.queuedInputs() ?? []
         retainedBytes = update.retainedBytes
         history = update.history
         requestingHistory = update.history?.pending == true

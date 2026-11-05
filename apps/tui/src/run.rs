@@ -203,17 +203,22 @@ impl Client {
                 && self
                     .conversation_origin
                     .is_none_or(|origin| origin != session)
-                && !self.app.contains_conversation(session)
             {
-                let post = self.post.clone();
-                self.conversations = Some(client::ConversationWatch::start(
-                    self.runtime.clone(),
-                    self.driver.daemon().clone(),
-                    session,
-                    move |rows| {
-                        let _ = post.send(Event::Conversations(rows));
-                    },
-                ));
+                if self.app.contains_conversation(session)
+                    && let Some(watch) = &self.conversations
+                {
+                    watch.view(session);
+                } else {
+                    let post = self.post.clone();
+                    self.conversations = Some(client::ConversationWatch::start(
+                        self.runtime.clone(),
+                        self.driver.daemon().clone(),
+                        session,
+                        move |rows| {
+                            let _ = post.send(Event::Conversations(rows));
+                        },
+                    ));
+                }
                 self.conversation_origin = Some(session);
             }
             self.ticks.arm(
@@ -369,6 +374,7 @@ impl Client {
                 return Ok(None);
             }
             Effect::Cmd(cmd) => self.app.command(cmd),
+            Effect::EditQueued(input) => self.app.edit_queued(input),
             Effect::Recall(demand) => self.app.client.read_history(1, demand),
             Effect::History(demand) => self.app.client.demand(demand),
             Effect::Restart => self.app.client.restart(),

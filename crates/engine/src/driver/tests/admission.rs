@@ -861,7 +861,7 @@ fn submitted_input_is_cancelled_while_its_publication_flush_is_held() {
         }),
     );
     for entry in log_of(&session) {
-        feed(&mut client, client::EventKind::Msg(DaemonMsg::Entry(entry)));
+        feed(&mut client, client::EventKind::Msg(entry.into()));
     }
     feed(
         &mut client,

@@ -1119,7 +1119,7 @@ mod parity {
     }
 
     fn entry(seq: u64, body: Body) -> DaemonMsg {
-        DaemonMsg::Entry(Entry::new(Seq::new(seq).unwrap(), Epoch(0), body))
+        DaemonMsg::from(Entry::new(Seq::new(seq).unwrap(), Epoch(0), body))
     }
 
     #[test]
@@ -1272,15 +1272,18 @@ mod approval_tests {
             if let DaemonMsg::Entry(entry) = &mut msg
                 && matches!(entry.body, Body::ModelResult { .. })
             {
-                view.fold(&DaemonMsg::Entry(Entry::new(
-                    entry.seq,
-                    Epoch(0),
-                    Body::Answer {
-                        call: CallId::new(1).unwrap(),
-                        value: Json::encode(&true).unwrap(),
-                        origin: None,
-                    },
-                )));
+                view.fold(&DaemonMsg::Entry(
+                    Entry::new(
+                        entry.seq,
+                        Epoch(0),
+                        Body::Answer {
+                            call: CallId::new(1).unwrap(),
+                            value: Json::encode(&true).unwrap(),
+                            origin: None,
+                        },
+                    )
+                    .into(),
+                ));
                 entry.seq = Seq::new(entry.seq.get() + 1).unwrap();
                 view.fold(&msg);
                 assert_eq!(description_update(&view.present(&view.items[0])), None);

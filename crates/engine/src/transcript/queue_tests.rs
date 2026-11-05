@@ -28,6 +28,7 @@ fn input(text: &str, taken: bool) -> Body {
         mode: Mode::Steer,
         taken,
         origin: None,
+        resume: None,
         force: false,
     }
 }

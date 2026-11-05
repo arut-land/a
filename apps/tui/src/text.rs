@@ -115,6 +115,8 @@ impl Style {
 pub enum Action {
     Child(protocol::SessionId),
     Conversation(usize),
+    Compose,
+    Queued(protocol::Seq),
     Output(protocol::BlobId),
     /// Collapses or expands tool call `call`'s card.
     Toggle(protocol::Seq),

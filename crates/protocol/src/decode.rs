@@ -258,6 +258,7 @@ same!(
     crate::Invocation,
     crate::Segments,
     crate::Envelope,
+    crate::Carried,
     crate::EnvelopeId,
     crate::InboxRefusal,
     publication::Publication,
@@ -445,15 +446,17 @@ pub(crate) struct EntryFields {
     pub(crate) refusal: Option<crate::InboxRefusal>,
     pub(crate) recipient: Option<SessionId>,
     pub(crate) recipients: Option<Vec<SessionId>>,
-    pub(crate) payload: Option<String>,
+    pub(crate) payload: Option<crate::Carried>,
     pub(crate) into: Option<u64>,
     pub(crate) force: Option<bool>,
+    pub(crate) resume: Option<SessionId>,
     #[serde(default, deserialize_with = "present")]
     pub(crate) intent: Option<Json>,
     pub(crate) publication: Option<publication::Publication>,
     pub(crate) seq: Option<u64>,
     pub(crate) epoch: Option<u32>,
     pub(crate) execution: Option<Json>,
+    pub(crate) observed_unix_ms: Option<u64>,
     pub(crate) kind: Option<Tag>,
     pub(crate) text: Option<String>,
     pub(crate) segments: Option<crate::Segments>,
@@ -718,6 +721,7 @@ impl EntryFields {
             seq: need(self.seq.take(), "seq")?,
             epoch: need(self.epoch.take(), "epoch")?,
             execution: self.execution.take(),
+            observed_unix_ms: self.observed_unix_ms.take(),
             body: Body::read(self)?,
         })
     }
@@ -813,6 +817,7 @@ fn unknown_entry(bytes: &[u8]) -> Option<Entry> {
         seq: tags.seq,
         epoch: tags.epoch,
         execution: None,
+        observed_unix_ms: None,
         body: Body::Unknown {
             kind: tags.kind,
             raw: serde_json::from_slice(bytes).ok()?,
@@ -836,7 +841,7 @@ fn entry_frame(bytes: &[u8]) -> Result<DaemonMsg> {
     if f.kind.is_some_and(|k| !Body::knows(k.as_str())) {
         return Ok(DaemonMsg::Unknown { seq: f.seq.take() });
     }
-    f.entry().map(DaemonMsg::Entry)
+    f.entry().map(Box::new).map(DaemonMsg::Entry)
 }
 
 /// Unknown kinds never abort a client; a known one that is malformed does.

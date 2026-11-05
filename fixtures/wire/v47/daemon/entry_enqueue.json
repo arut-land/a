@@ -1,0 +1,1 @@
+{"t":"entry","seq":1,"epoch":0,"kind":"enqueue","envelope":{"id":{"sender":"00000000-0000-0000-0000-00000000000a","call":3,"purpose":"subagent:message"},"destination":"00000000-0000-0000-0000-00000000000c","payload":{"message":"hello"}}}

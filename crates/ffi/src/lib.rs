@@ -364,6 +364,14 @@ pub struct ChangeBatch {
     pub title: Option<String>,
 }
 
+/// An editable user input in the session's shared composer queue.
+#[data]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueuedInput {
+    pub seq: u64,
+    pub text: String,
+}
+
 /// What the session's turn is doing, and what the controls offer for it;
 /// see [`client::TurnView`].
 #[data]

@@ -63,7 +63,7 @@ mod tests {
     }
 
     fn entry(seq: u64, body: Body) -> DaemonMsg {
-        DaemonMsg::Entry(Entry::new(Seq::new(seq).unwrap(), Epoch(0), body))
+        DaemonMsg::from(Entry::new(Seq::new(seq).unwrap(), Epoch(0), body))
     }
 
     fn input(origin: Author, taken: bool) -> Body {
@@ -72,6 +72,7 @@ mod tests {
             mode: Mode::Queue,
             taken,
             origin: Some(origin),
+            resume: None,
             force: false,
         }
     }
@@ -202,6 +203,7 @@ mod tests {
                     mode: Mode::Queue,
                     taken: true,
                     origin: Some(id),
+                    resume: None,
                     force: false,
                 },
             ),

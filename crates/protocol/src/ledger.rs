@@ -17,6 +17,7 @@ pub struct Ledger {
     received: Vec<Seq>,
     identities: BTreeMap<String, BTreeSet<(u128, u64)>>,
     outbox: Vec<Sending>,
+    resumption: Option<(Seq, SessionId)>,
     acknowledgements: Vec<(EnvelopeId, Option<InboxRefusal>)>,
     /// Model and tool calls with an intent and no outcome.
     open: Keyed<CallId, Open>,
@@ -218,6 +219,7 @@ impl From<&crate::Envelope> for Item {
         let (sender, call) = (envelope.id().sender, envelope.id().call);
         match envelope.payload() {
             Carried::Message(text) => Self::Message(sender, text.clone()),
+            Carried::Resumed => Self::Message(sender, Carried::resumed_text(sender)),
             Carried::Job(text) => Self::Job(call, text.clone()),
             Carried::Child(outcome) => Self::Child(call.0, outcome.clone()),
             Carried::Detached(outcome) => Self::Detached(call, outcome.clone()),
@@ -267,7 +269,7 @@ pub struct Background {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sending {
     pub id: EnvelopeId,
-    pub payload: String,
+    pub payload: Carried,
     pub pending: Vec<SessionId>,
     /// The first refusal heard, which the send is answered with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -277,12 +279,7 @@ pub struct Sending {
 impl Sending {
     /// The envelope recipient `to` is delivered.
     pub fn to(&self, to: SessionId) -> Result<crate::Envelope, crate::EnvelopeError> {
-        crate::Envelope::new(
-            self.id.clone(),
-            to,
-            Carried::Message(self.payload.clone()),
-            Vec::new(),
-        )
+        crate::Envelope::new(self.id.clone(), to, self.payload.clone(), Vec::new())
     }
 
     /// The envelopes yet to be taken in.
@@ -344,6 +341,9 @@ impl Ledger {
                 recipient,
                 refusal,
             } => {
+                if envelope_id.purpose == EnvelopeId::RESUMED {
+                    self.resumption = None;
+                }
                 // Settled once every recipient has answered, with the first
                 // refusal any gave.
                 let mut settled = refusal.clone();
@@ -373,6 +373,9 @@ impl Ledger {
                     .or_default()
                     .insert((envelope.id().sender.0.as_u128(), envelope.id().call.0.get()))
                 {
+                    if envelope.payload() == &Carried::Resumed {
+                        self.armed.insert(seq, envelope.id().sender);
+                    }
                     let item = Item::from(envelope);
                     if let Item::Detached(call, _) = item {
                         self.detached.retain(|d| d.call != call);
@@ -381,7 +384,7 @@ impl Ledger {
                     self.untaken.push(Queued {
                         seq,
                         // What the session sends itself is no command.
-                        typed: matches!(item, Item::Message(..)),
+                        typed: matches!(envelope.payload(), Carried::Message(_)),
                         item,
                         steer: false,
                     });
@@ -391,8 +394,12 @@ impl Ledger {
                 segments,
                 mode,
                 taken,
+                resume,
                 ..
             } => {
+                if let Some(parent) = resume {
+                    self.resumption = Some((seq, *parent));
+                }
                 if *taken {
                     self.turn = Some(seq);
                 } else {
@@ -708,6 +715,11 @@ impl Ledger {
     pub fn enqueued(&self, seq: Seq) -> bool {
         self.received.binary_search(&seq).is_ok()
     }
+    /// Input whose parent notification has not yet been acknowledged.
+    pub const fn resumption(&self) -> Option<(Seq, SessionId)> {
+        self.resumption
+    }
+
     pub fn received(&self, id: &EnvelopeId) -> bool {
         self.identities
             .get(&id.purpose)
@@ -932,7 +944,7 @@ mod durable_tests {
         let outbox = || Body::Outbox {
             envelope_id: id.clone(),
             recipients: vec![a, b],
-            payload: "large payload".repeat(1024),
+            payload: "large payload".repeat(1024).into(),
         };
         let ack = |recipient, refusal| Body::Ack {
             envelope_id: id.clone(),
@@ -969,6 +981,7 @@ mod durable_tests {
             mode: Mode::Queue,
             taken: false,
             origin: None,
+            resume: None,
             force: false,
         }
     }

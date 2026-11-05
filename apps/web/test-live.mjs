@@ -15,10 +15,12 @@ try {
   await page.goto(process.argv[2]);
   await page.getByRole('button', { name: 'New session' }).click();
   await page.locator('#end').waitFor({ state: 'attached' });
+  const parentUrl = page.url();
   assert.deepEqual(errors, [], 'opening a live chat raised a browser exception');
 
   const draft = page.getByRole('textbox');
   const send = page.getByRole('button', { name: 'Send', exact: true });
+  assert.equal(await draft.evaluate(element => element.closest('form').parentElement.contains(document.getElementById('conversations'))), false, 'the picker is outside the composer bar');
   // Hold the real admission response so an edit can race it deterministically.
   await page.route('**/api/send', async route => {
     const response = await route.fetch();
@@ -60,20 +62,31 @@ try {
   assert.equal(await page.getByRole('link', {name: '← Back to parent'}).count(), 1);
   assert.equal(await page.locator('[data-conversation]').count(), 3);
   assert.deepEqual(await page.locator('[data-conversation][tabindex="0"]').evaluateAll(rows => rows.map(row => row.dataset.conversation)), [selectedChild], 'the viewed child is the initial tab stop');
+  await page.locator(`[data-conversation="${selectedChild}"]`).focus();
+  await draft.click();
+  await page.keyboard.type('queued child message');
+  assert.equal(await draft.inputValue(), 'queued child message', 'clicking the composer leaves picker focus and receives typing');
+  await send.click();
+  await page.locator('#queued-inputs').getByText('Queued: queued child message', {exact: false}).waitFor();
+  await page.locator('#queued-inputs').getByRole('button', {name: 'Edit', exact: true}).click();
+  await page.waitForFunction(() => document.querySelector('#composer').value === 'queued child message');
+  await page.waitForFunction(() => !document.querySelector('[data-edit-queued]'));
+  await draft.fill('');
   await draft.press('ArrowDown');
   await page.keyboard.press('ArrowDown');
   await page.keyboard.press('x');
   await page.waitForFunction(id => document.querySelector(`[data-conversation="${id}"]`)?.textContent.includes('interrupted'), selectedChild);
   await page.keyboard.press('Escape');
   assert.equal(await draft.evaluate(element => element === document.activeElement), true);
-  await draft.fill('follow up from the child composer');
+  await draft.fill('sleep 30');
   await send.click();
-  await page.waitForFunction(() => document.querySelector('#transcript').textContent.split('follow up from the child composer').length === 3);
+  await page.waitForFunction(id => document.querySelector(`[data-conversation="${id}"]`)?.dataset.stop === 'true', selectedChild);
   await page.getByRole('link', {name: '← Back to parent'}).click();
   await page.waitForFunction(() => document.querySelectorAll('[data-conversation]').length === 3);
-  await page.locator('#conversations [data-stop-conversation]').click();
-  await page.waitForFunction(() => !document.querySelector('[data-conversation][data-stop="true"]'));
-  assert.equal(await page.locator('[data-conversation]').count(), 3, 'finished children stay listed');
+  await page.getByText(`The user resumed agent ${selectedChild}. It is running now.`, {exact: false}).first().waitFor();
+  await page.locator(`#conversations [data-stop-conversation="${selectedChild}"]`).click();
+  await page.waitForFunction(id => document.querySelector(`[data-conversation="${id}"]`)?.textContent.includes('interrupted'), selectedChild);
+  assert.equal(await page.locator('[data-conversation]').count(), 3, 'an interrupted child retains its terminal grace interval');
   const family = await page.locator('[data-conversation]').evaluateAll(rows => rows.map(row => ({id: row.dataset.conversation, href: row.href})));
   await draft.focus();
   await draft.press('ArrowDown');
@@ -108,6 +121,28 @@ try {
   assert.equal(await page.evaluate(() => document.activeElement === document.body), true, 'a list update must not reclaim deliberately released focus');
   assert.deepEqual(await page.locator('[data-conversation][tabindex="0"]').evaluateAll(rows => rows.map(row => row.dataset.conversation)), [family[1].id], 'releasing focus preserves the roving tab stop');
   await branch.close();
+  await page.goto(parentUrl);
+  await page.locator('#end').waitFor({state: 'attached'});
+  await draft.fill('spawn expiry child');
+  await send.click();
+  const expiryRow = page.locator('[data-conversation]').filter({hasText: 'expiry child'});
+  await expiryRow.waitFor();
+  const expiredChild = await expiryRow.getAttribute('data-conversation');
+  await page.waitForFunction(id => document.querySelector(`[data-conversation="${id}"]`)?.textContent.includes('finished'), expiredChild);
+  if (process.env.A_EVIDENCE_DIR) await page.screenshot({path: `${process.env.A_EVIDENCE_DIR}/web-footer.png`, fullPage: true});
+  await expiryRow.waitFor({state: 'detached', timeout: 8000});
+  const transcriptLink = page.locator(`#transcript a[href="/s/${expiredChild}"]`);
+  await transcriptLink.click();
+  await page.waitForFunction(id => document.querySelector(`[data-conversation="${id}"]`)?.getAttribute('aria-selected') === 'true', expiredChild);
+  assert.equal(await draft.isEnabled(), true, 'an expired child reopens with its ordinary composer');
+  await page.getByRole('link', {name: '← Back to parent'}).click();
+  await page.waitForFunction(id => !document.querySelector(`[data-conversation="${id}"]`), expiredChild);
+  await page.locator(`#transcript a[href="/s/${expiredChild}"]`).click();
+  await draft.fill('sleep 30');
+  await send.click();
+  await page.waitForFunction(id => document.querySelector(`[data-conversation="${id}"]`)?.dataset.stop === 'true', expiredChild);
+  await page.locator(`#conversations [data-stop-conversation="${expiredChild}"]`).click();
+  await page.waitForFunction(id => document.querySelector(`[data-conversation="${id}"]`)?.textContent.includes('interrupted'), expiredChild);
   assert.deepEqual(errors, [], 'live chat raised a browser exception');
 } finally {
   await browser.close();

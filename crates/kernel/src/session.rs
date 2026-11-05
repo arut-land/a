@@ -52,6 +52,7 @@ pub struct Core {
     registry: Arc<dyn Binding>,
     /// The session's id, which its own envelopes are addressed by.
     session: SessionId,
+    parent: Option<SessionId>,
     generation_context: Option<String>,
     fold: Fold,
     turn: Turn,
@@ -116,6 +117,7 @@ impl Core {
             generation_context: registry.generation_context(),
             registry,
             session: SessionId::NIL,
+            parent: None,
             turn: Turn::Idle,
             child: false,
             owned_cancelled: false,
@@ -147,8 +149,10 @@ impl Core {
         if let Some(session) = load.session {
             self.session = session;
         }
+        self.parent = load.parent;
         self.child = matches!(load.owner, Owner::Present | Owner::Cancelled);
-        self.owned_cancelled = matches!(load.owner, Owner::Gone | Owner::Cancelled);
+        self.owned_cancelled = matches!(load.owner, Owner::Gone | Owner::Cancelled)
+            && self.fold.ledger.resumption().is_none();
         self.busy = load.busy;
         let mut fx = StepPlan::default();
         let installed = self.registry.installed();
@@ -353,7 +357,10 @@ impl Core {
     }
 
     fn finish(&mut self, fx: &mut StepPlan) {
-        self.advance(fx);
+        self.queue_resumption(fx);
+        if self.fold.ledger.resumption().is_none() {
+            self.advance(fx);
+        }
         self.marks(fx);
         let through = self.fold.ledger.seq();
         if !fx.appends.is_empty() {
@@ -464,7 +471,7 @@ impl Core {
                 Body::Outbox {
                     envelope_id: outgoing.id.clone(),
                     recipients: outgoing.recipients.clone(),
-                    payload: outgoing.payload.clone(),
+                    payload: Carried::Message(outgoing.payload.clone()),
                 },
             );
         }
@@ -542,19 +549,26 @@ impl Core {
         ticket: Option<Ticket>,
         fx: &mut StepPlan,
     ) {
-        if self.owned_cancelled {
+        if self.resent(origin) {
+            return reply(fx, ticket, Ok(()));
+        }
+        let resume = (self.child
+            && self.turn == Turn::Idle
+            && self.fold.ledger.resumption().is_none()
+            && self.fold.ledger.result().is_some())
+        .then_some(self.parent)
+        .flatten();
+        if self.owned_cancelled && resume.is_none() {
             return reply(
                 fx,
                 ticket,
                 Err("conversation ownership was cancelled".into()),
             );
         }
-        if self.resent(origin) {
-            return reply(fx, ticket, Ok(()));
-        }
         // Nothing runs or waits, so nothing comes between: it starts now, a
         // turn on the newest registry generation.
-        let taken = self.turn == Turn::Idle
+        let taken = resume.is_none()
+            && self.turn == Turn::Idle
             && self.fold.asked.is_empty()
             && self.fold.ledger.untaken().is_empty();
         let Chained {
@@ -568,6 +582,9 @@ impl Core {
             self.decide(None, &by, d, fx);
         }
         let force = force && mode == Mode::Steer && !taken;
+        if resume.is_some() {
+            self.owned_cancelled = false;
+        }
         self.append(
             fx,
             Body::Input {
@@ -576,6 +593,7 @@ impl Core {
                 taken,
                 origin,
                 force,
+                resume,
             },
         );
         if force {
@@ -2006,6 +2024,41 @@ impl Core {
             self.interrupted_entry(None, fx);
         }
         self.turn = Turn::Idle;
+    }
+
+    /// Input and acknowledgement bound the retry interval, including a crash
+    /// before the outbox entry or after the parent accepted the notice.
+    fn queue_resumption(&mut self, fx: &mut StepPlan) {
+        let Some((input, parent)) = self.fold.ledger.resumption() else {
+            return;
+        };
+        let id = EnvelopeId {
+            sender: self.session,
+            call: CallId(input),
+            purpose: EnvelopeId::RESUMED.into(),
+        };
+        if self
+            .fold
+            .ledger
+            .outbox()
+            .iter()
+            .any(|sending| sending.id == id)
+        {
+            return;
+        }
+        self.append(
+            fx,
+            Body::Outbox {
+                envelope_id: id.clone(),
+                recipients: vec![parent],
+                payload: Carried::Resumed,
+            },
+        );
+        fx.immediate.push(Work::Deliver {
+            envelope: Envelope::new(id, parent, Carried::Resumed, Vec::new())
+                .expect("resumption has its reserved purpose"),
+            ticket: None,
+        });
     }
 
     /// Queues, as the session's own envelopes, the results of children no

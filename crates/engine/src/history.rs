@@ -92,6 +92,20 @@ impl Indexed {
             Body::Assistant { .. } => meta.outcome = Some(OutcomeKind::Done),
             _ => {}
         }
+        if matches!(
+            entry.body,
+            Body::Input { .. } | Body::Take { into: None, .. }
+        ) {
+            meta.settled_unix_ms = None;
+        } else if matches!(
+            entry.body,
+            Body::Assistant { .. }
+                | Body::Interrupt { .. }
+                | Body::ToolResult { .. }
+                | Body::ModelResult { r#for: None, .. }
+        ) {
+            meta.settled_unix_ms = entry.observed_unix_ms;
+        }
         if let Some(fact) = entry
             .execution
             .as_ref()

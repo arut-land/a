@@ -262,6 +262,16 @@ impl ChildOwners {
                     }
                 }
             }
+            Body::Enqueue { envelope } if envelope.payload() == &protocol::Carried::Resumed => {
+                let child = envelope.id().sender;
+                let owner = self.children.entry(child).or_default();
+                owner.cancelled = false;
+                owner.watch_settled = false;
+                if let Some(watch) = owner.watch.replace(entry.seq) {
+                    self.watches.remove(&watch);
+                }
+                self.watches.insert(entry.seq, child);
+            }
             Body::Watch { child } => {
                 let owner = self.children.entry(*child).or_default();
                 if let Some(watch) = owner.watch.replace(entry.seq) {
@@ -842,6 +852,7 @@ impl Live {
         *lock(&session.adopting) = handed;
         let load = Load {
             session: Some(header.id),
+            parent: header.parent.map(|parent| parent.session),
             abandoned: &abandoned,
             fresh,
             owner,
@@ -2298,10 +2309,28 @@ impl Actor {
         Ok(())
     }
 
-    /// An ephemeral turn's result entry ends its attempt's watch; one an
-    /// interrupt wrote first, before the turn reported, settles the attempt
+    /// Outcome observations survive reload; ephemeral results also end their
+    /// attempt's watch. An interruption that won the race settles the attempt
     /// it cut off, sent or not.
-    fn settle_ephemeral(&mut self, entry: &mut Entry) {
+    fn observe_settlement(&mut self, entry: &mut Entry) {
+        if matches!(
+            entry.body,
+            Body::Assistant { .. }
+                | Body::Interrupt { .. }
+                | Body::ToolResult { .. }
+                | Body::ModelResult { r#for: None, .. }
+        ) {
+            entry.observed_unix_ms = Some(
+                u64::try_from(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis(),
+                )
+                .unwrap_or(u64::MAX),
+            );
+        }
+
         let Body::ModelResult { call, outcome, .. } = &entry.body else {
             return;
         };
@@ -2352,7 +2381,7 @@ impl Actor {
             {
                 entry.execution = Some(self.projection.executions.remove(i).1);
             }
-            self.settle_ephemeral(entry);
+            self.observe_settlement(entry);
         }
         let busy = immediate.iter().rev().find_map(|work| match work {
             Effect::MarkBusy(busy) => Some(*busy),
@@ -2652,6 +2681,7 @@ impl Actor {
         self.publish();
         let load = Load {
             session: Some(self.live.id),
+            parent: self.live.parent.map(|parent| parent.session),
             busy: self.live.has_work(),
             abandoned: &abandoned,
             owner,

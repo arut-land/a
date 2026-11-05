@@ -443,6 +443,26 @@ impl SessionClient {
     }
 
     /// Inputs still owned by this client, oldest first. Recorded inputs are
+    /// User-authored inputs waiting in the ordinary session composer queue.
+    pub fn queued_inputs(&self) -> impl Iterator<Item = &protocol::view::Queued> {
+        self.view
+            .state
+            .queued()
+            .filter(|input| input.source.visible())
+    }
+
+    /// Withdraws a queued input for editing through the same path in every view.
+    pub fn edit_queued(&mut self, input: protocol::Seq) -> Result<(String, Vec<Effect>), Notice> {
+        let text = self
+            .queued_inputs()
+            .find(|queued| queued.seq == input)
+            .ok_or(Notice::NotQueued(input))?
+            .text
+            .clone();
+        let effects = self.offer()?.withdraw(input)?;
+        Ok((text, effects))
+    }
+
     /// recalled from the session view instead, including its visible queue.
     pub fn pending_inputs(&self) -> impl DoubleEndedIterator<Item = &Segments> {
         let mut inputs: Vec<_> = self
@@ -1816,17 +1836,21 @@ mod tests {
         ));
         client.step(msg(
             1,
-            DaemonMsg::Entry(Entry::new(
-                Seq::new(1).unwrap(),
-                Epoch(1),
-                Body::Input {
-                    segments: "hi".into(),
-                    mode: Mode::Queue,
-                    taken: true,
-                    origin: None,
-                    force: false,
-                },
-            )),
+            DaemonMsg::Entry(
+                Entry::new(
+                    Seq::new(1).unwrap(),
+                    Epoch(1),
+                    Body::Input {
+                        segments: "hi".into(),
+                        mode: Mode::Queue,
+                        taken: true,
+                        origin: None,
+                        resume: None,
+                        force: false,
+                    },
+                )
+                .into(),
+            ),
         ));
         client.step(msg(
             1,
@@ -1840,34 +1864,40 @@ mod tests {
     }
 
     fn bash_call(seq: u64) -> DaemonMsg {
-        DaemonMsg::Entry(Entry::new(
-            Seq::new(seq).unwrap(),
-            Epoch(1),
-            Body::ToolCall {
-                invoke: None,
-                tool: "bash".into(),
-                input: Json::encode(&serde_json::json!({ "command": "ls" })).unwrap(),
-                id: None,
-                card: None,
-                by: Audience::Model,
-            },
-        ))
+        DaemonMsg::Entry(
+            Entry::new(
+                Seq::new(seq).unwrap(),
+                Epoch(1),
+                Body::ToolCall {
+                    invoke: None,
+                    tool: "bash".into(),
+                    input: Json::encode(&serde_json::json!({ "command": "ls" })).unwrap(),
+                    id: None,
+                    card: None,
+                    by: Audience::Model,
+                },
+            )
+            .into(),
+        )
     }
 
     fn ask(seq: u64, call: u64) -> DaemonMsg {
-        DaemonMsg::Entry(Entry::new(
-            Seq::new(seq).unwrap(),
-            Epoch(1),
-            Body::Decision {
-                by: "policy".into(),
-                call: CallId::new(call),
-                d: Verdict::Permission {
-                    permission: Permission::Ask(protocol::ApprovalReason::Mode {
-                        mode: "ask".into(),
-                    }),
+        DaemonMsg::Entry(
+            Entry::new(
+                Seq::new(seq).unwrap(),
+                Epoch(1),
+                Body::Decision {
+                    by: "policy".into(),
+                    call: CallId::new(call),
+                    d: Verdict::Permission {
+                        permission: Permission::Ask(protocol::ApprovalReason::Mode {
+                            mode: "ask".into(),
+                        }),
+                    },
                 },
-            },
-        ))
+            )
+            .into(),
+        )
     }
 
     #[test]
@@ -1970,17 +2000,21 @@ mod tests {
         };
         client.step(msg(
             1,
-            DaemonMsg::Entry(Entry::new(
-                Seq::new(2).unwrap(),
-                Epoch(0),
-                Body::Input {
-                    segments: pasted.clone(),
-                    mode: Mode::Queue,
-                    taken: false,
-                    origin: Some(author),
-                    force: false,
-                },
-            )),
+            DaemonMsg::Entry(
+                Entry::new(
+                    Seq::new(2).unwrap(),
+                    Epoch(0),
+                    Body::Input {
+                        segments: pasted.clone(),
+                        mode: Mode::Queue,
+                        taken: false,
+                        origin: Some(author),
+                        resume: None,
+                        force: false,
+                    },
+                )
+                .into(),
+            ),
         ));
         assert_eq!(
             client
@@ -2094,20 +2128,24 @@ mod tests {
 
     /// An input `number` of `client`'s, logged at `at`.
     fn logged(client: ClientId, number: u64, at: u64) -> DaemonMsg {
-        DaemonMsg::Entry(Entry::new(
-            Seq::new(at).unwrap(),
-            Epoch(1),
-            Body::Input {
-                segments: "hello".into(),
-                mode: Mode::Queue,
-                taken: true,
-                origin: Some(Author {
-                    client,
-                    seq: ClientSeq::new(number).unwrap(),
-                }),
-                force: false,
-            },
-        ))
+        DaemonMsg::Entry(
+            Entry::new(
+                Seq::new(at).unwrap(),
+                Epoch(1),
+                Body::Input {
+                    segments: "hello".into(),
+                    mode: Mode::Queue,
+                    taken: true,
+                    origin: Some(Author {
+                        client,
+                        seq: ClientSeq::new(number).unwrap(),
+                    }),
+                    resume: None,
+                    force: false,
+                },
+            )
+            .into(),
+        )
     }
 
     fn idle(at: u64) -> DaemonMsg {

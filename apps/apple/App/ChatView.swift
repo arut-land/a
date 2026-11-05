@@ -4,7 +4,6 @@ import SwiftUI
 struct ChatView: View {
     @Bindable var store: SessionStore
     var conversations: ConversationStore?
-    @FocusState private var composing: Bool
     @State private var managing = false
     /// What a typed line asks of the app, rather than of the session.
     var perform: (AppAction) -> Void = { _ in }
@@ -29,30 +28,8 @@ struct ChatView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal).padding(.vertical, 4)
             }
-            Divider()
-            HStack {
-                TextField(composerPlaceholder, text: $input)
-                    .focused($composing)
-                    .onKeyPress(.downArrow) {
-                        guard input.isEmpty, conversations?.rows.isEmpty == false else { return .ignored }
-                        composing = false; managing = true
-                        return .handled
-                    }
-                    .textFieldStyle(.plain)
-                    .onSubmit(send)
-                if store.turn.canInterrupt {
-                    Button("Stop", systemImage: "stop.circle") { Task { await store.interrupt() } }
-                        .keyboardShortcut(".", modifiers: .command)
-                }
-                Button("Send", action: send)
-                    .keyboardShortcut(.return, modifiers: .command)
-                    .disabled(input.trimmingCharacters(in: .whitespaces).isEmpty || !store.turn.canSend)
-            }
-            .padding(10)
-            if let conversations {
-                ConversationSwitcher(store: conversations, current: store.sessionId, managing: $managing, open: openChild)
-                    .onChange(of: managing) { _, active in if !active { composing = true } }
-            }
+            SessionComposer(store: store, conversations: conversations, input: $input, managing: $managing,
+                send: send, open: openChild)
         }
         .navigationTitle(store.title ?? store.sessionId.map { String($0.suffix(8)) } ?? "New session")
         .navigationSubtitle(store.workspace)
@@ -84,13 +61,6 @@ struct ChatView: View {
             else { .text(item.presentation.body?.text.trimmingCharacters(in: .newlines) ?? "") }
         default: nil
         }
-    }
-
-    private var composerPlaceholder: String {
-        if let row = conversations?.rows.first(where: { $0.id == store.sessionId }), row.parent != nil {
-            return "Message @\(row.title)…"
-        }
-        return "Message, or $ command"
     }
 
     private func send() {

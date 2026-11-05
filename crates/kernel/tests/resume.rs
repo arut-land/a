@@ -12,6 +12,7 @@ use serde_json::json;
 
 /// A session the daemon was running when it stopped.
 const BUSY_LOAD: Load<'static> = Load {
+    parent: None,
     fresh: true,
     owner: Owner::None,
     abandoned: &[],
@@ -21,6 +22,68 @@ const BUSY_LOAD: Load<'static> = Load {
     adopted: &[],
     reheld: &[],
 };
+
+#[test]
+fn a_replayed_user_input_cannot_reactivate_cancelled_child_ownership() {
+    let parent = SessionId::new();
+    let child = SessionId::new();
+    let author = protocol::Author {
+        client: protocol::ClientId::new(),
+        seq: protocol::ClientSeq::new(1).unwrap(),
+    };
+    let (mut session, _) = resume(
+        Reg::echo(),
+        [
+            Body::Input {
+                segments: "old input".into(),
+                mode: protocol::Mode::Queue,
+                taken: true,
+                origin: Some(author),
+                force: false,
+                resume: None,
+            },
+            Body::Assistant {
+                text: "old input".into(),
+            },
+            Body::INTERRUPT,
+        ],
+        &Load {
+            session: Some(child),
+            parent: Some(parent),
+            owner: Owner::Cancelled,
+            ..Load::default()
+        },
+    );
+    let replay = session.step(kernel::Event::Input {
+        segments: "old input".into(),
+        mode: protocol::Mode::Queue,
+        force: false,
+        origin: Some(author),
+        ticket: None,
+    });
+    assert_eq!(replay.appends, [] as [protocol::Entry; 0]);
+    let delivery = session.step(kernel::Event::Enqueue {
+        envelope: protocol::Envelope::new(
+            protocol::EnvelopeId {
+                sender: parent,
+                call: CallId::new(1).unwrap(),
+                purpose: "chat".into(),
+            },
+            child,
+            protocol::Carried::Message("still cancelled".into()),
+            Vec::new(),
+        )
+        .unwrap(),
+        ticket: kernel::Ticket(1),
+    });
+    assert!(work(&delivery).any(|work| matches!(
+        work,
+        Work::Delivery {
+            result: Err(protocol::InboxRefusal::Unavailable),
+            ..
+        }
+    )));
+}
 
 fn resume(
     reg: Reg,

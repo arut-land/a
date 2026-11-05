@@ -14,7 +14,7 @@ use super::{
 };
 
 /// A different header format makes the log read-only.
-pub(crate) const FORMAT: u32 = 2;
+pub(crate) const FORMAT: u32 = 3;
 
 /// Owned children nest below their parent's conversation directory.
 /// The daemon lock excludes concurrent writers; sessions share a cache flusher.

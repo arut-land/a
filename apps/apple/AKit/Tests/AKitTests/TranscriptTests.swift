@@ -294,6 +294,53 @@ struct NativeTranscriptTests {
         await parent.detach()
     }
 
+    @Test(.enabled(if: live != nil))
+    func clicking_the_native_composer_leaves_the_picker_and_receives_typed_text() async throws {
+        let client = try Client(helper: live!)
+        let parent = SessionStore(session: Session(client: client))
+        let workspace = FileManager.default.temporaryDirectory.appending(path: "akit-composer-\(UUID())")
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        parent.open(.new(workspace: workspace.path))
+        try await eventually("composer parent attached") { parent.link == .live }
+        let id = try #require(parent.sessionId)
+        let family = try ConversationStore(client: client, origin: id)
+        family.start()
+        defer { family.stop() }
+        await parent.send("spawn sleep 30")
+        try await eventually("running child available") { family.rows.contains { $0.parent == id && $0.running } }
+        let child = try #require(family.rows.first { $0.parent == id })
+        let transcript = SessionStore(session: Session(client: client))
+        transcript.open(.id(id: child.id))
+        try await eventually("child composer attached") { transcript.link == .live }
+        let selection = ConversationSelection()
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 800, height: 240), styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
+        let host = NSHostingView(rootView: SessionComposer(store: transcript, conversations: family,
+            input: Binding(get: { selection.draft }, set: { selection.draft = $0 }),
+            managing: Binding(get: { selection.managing }, set: { selection.managing = $0 }),
+            send: {}, open: { _ in }))
+        window.contentView = host
+        window.makeKeyAndOrderFront(nil)
+        selection.managing = true
+        try await eventually("picker has keyboard focus") { window.firstResponder is NSTableView }
+        let field = try #require(nativeLabels(host).first { $0.isEditable })
+        let point = field.convert(NSPoint(x: field.bounds.midX, y: field.bounds.midY), to: nil)
+        for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+            window.sendEvent(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: 0,
+                windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!)
+        }
+        try await eventually("composer releases picker focus") { !selection.managing && window.firstResponder is NSTextView }
+        window.sendEvent(NSEvent.keyEvent(with: .keyDown, location: point, modifierFlags: [], timestamp: 0,
+            windowNumber: window.windowNumber, context: nil, characters: "typed in child composer", charactersIgnoringModifiers: "typed in child composer",
+            isARepeat: false, keyCode: 0)!)
+        try await eventually("typed text reaches the composer") { selection.draft == "typed in child composer" }
+        #expect(field.convert(field.bounds, to: nil).minY > (findScrollView(host)?.convert(findScrollView(host)!.bounds, to: nil).maxY ?? 0))
+        family.interrupt(child.id)
+        await transcript.detach()
+        await parent.detach()
+    }
 }
 
 private func findScrollView(_ view: NSView) -> NSScrollView? {
@@ -309,6 +356,7 @@ private final class TranscriptFrames {
 private final class ConversationSelection {
     var managing = false
     var opened: String?
+    var draft = ""
 }
 
 private func nativeLabels(_ view: NSView) -> [NSTextField] {

@@ -328,7 +328,7 @@ func spawned_work_has_one_navigable_row_and_output_is_fetched_on_demand() async 
 }
 
 @Test(.enabled(if: live != nil))
-func conversation_store_keeps_children_after_paging_and_stops_them_through_the_sdk() async throws {
+func terminal_children_expire_from_the_picker_while_the_viewed_child_stays_reachable() async throws {
     let client = try Client(helper: live!)
     let parent = SessionStore(session: Session(client: client))
     let workspace = FileManager.default.temporaryDirectory.appending(path: "akit-family-\(UUID())")
@@ -363,6 +363,11 @@ func conversation_store_keeps_children_after_paging_and_stops_them_through_the_s
         fromChild.rows.contains { $0.id == id && $0.depth == 0 } && fromChild.rows.contains { $0.id == child.id && $0.parent == id }
     }
     try await eventually("child approval is reachable in its own transcript") { transcript.turn.asking != nil }
+    await transcript.send("queued child message")
+    try await eventually("the shared child composer queue") { transcript.queuedInputs.contains { $0.text == "queued child message" } }
+    let queued = try #require(transcript.queuedInputs.first { $0.text == "queued child message" })
+    #expect(try transcript.editQueued(queued.seq) == "queued child message")
+    try await eventually("the child queue edit withdraws the original") { transcript.queuedInputs.isEmpty }
     conversations.interrupt(child.id)
     #expect(conversations.problem == nil)
     try await eventually("child interruption published") { conversations.rows.contains { $0.id == child.id && $0.status == "interrupted" } }
@@ -373,6 +378,13 @@ func conversation_store_keeps_children_after_paging_and_stops_them_through_the_s
         transcript.items.contains { $0.kind == .assistant && $0.presentation.body?.text == "follow up for child" }
     }
     try await eventually("a messaged child is observed again after completion") { conversations.rows.contains { $0.id == child.id && $0.status == "finished" } }
+    try await eventually("finished child expires from the parent's picker") { !conversations.rows.contains { $0.id == child.id } }
+    #expect(fromChild.rows.contains { $0.id == child.id })
+    let reopened = try ConversationStore(client: client, origin: child.id)
+    reopened.start()
+    defer { reopened.stop() }
+    try await eventually("reopened expired child is pinned in its own picker") { reopened.rows.contains { $0.id == child.id } }
+    #expect(transcript.turn.canSend)
     await transcript.detach()
     await parent.detach()
 }

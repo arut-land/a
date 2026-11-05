@@ -914,6 +914,7 @@ pub fn input(text: &str) -> Body {
         mode: Mode::Queue,
         taken: true,
         origin: None,
+        resume: None,
         force: false,
     }
 }
@@ -924,6 +925,7 @@ pub fn queued(text: &str) -> Body {
         mode: Mode::Queue,
         taken: false,
         origin: None,
+        resume: None,
         force: false,
     }
 }

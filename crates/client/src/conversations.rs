@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use protocol::{Activity, SessionId, Target, ledger::OutcomeKind, view::Usage};
 
@@ -25,7 +26,20 @@ pub enum ConversationStatus {
     Interrupted,
 }
 
+// Grace intervals apply only to terminal rows outside the current view.
+const TERMINAL_RETENTION: [(ConversationStatus, u64); 3] = [
+    (ConversationStatus::Finished, 5),
+    (ConversationStatus::Failed, 10),
+    (ConversationStatus::Interrupted, 30),
+];
+
 impl ConversationStatus {
+    fn retention(self) -> Option<Duration> {
+        TERMINAL_RETENTION
+            .iter()
+            .find_map(|&(status, seconds)| (self == status).then(|| Duration::from_secs(seconds)))
+    }
+
     pub const fn name(self) -> &'static str {
         match self {
             Self::Connecting => "connecting",
@@ -73,6 +87,7 @@ impl ConversationRow {
 pub struct ConversationTree {
     origin: SessionId,
     nodes: BTreeMap<SessionId, ConversationRow>,
+    expires: BTreeMap<SessionId, (Option<u64>, Instant)>,
 }
 
 impl ConversationTree {
@@ -80,10 +95,27 @@ impl ConversationTree {
         Self {
             origin,
             nodes: BTreeMap::new(),
+            expires: BTreeMap::new(),
         }
     }
 
+    /// Changes the pinned view without resetting any outcome's expiry.
+    pub fn view(&mut self, session: SessionId) {
+        self.origin = session;
+    }
+
     pub fn apply(&mut self, head: &ConversationHead, activity: Option<Activity>) {
+        self.apply_at(head, activity, Instant::now(), unix_ms());
+    }
+
+    /// Folds a head at an explicit clock sample without extending repeated outcomes.
+    pub fn apply_at(
+        &mut self,
+        head: &ConversationHead,
+        activity: Option<Activity>,
+        now: Instant,
+        now_unix_ms: u64,
+    ) {
         let identity = &head.identity;
         let status = match activity {
             Some(Activity::Idle | Activity::Done | Activity::Failed) => match identity.outcome {
@@ -98,6 +130,21 @@ impl ConversationTree {
                 .map_or(ConversationStatus::Connecting, |row| row.status),
             _ => ConversationStatus::Running,
         };
+        if let Some(retention) = status.retention() {
+            let age = identity.settled_unix_ms.map_or(Duration::ZERO, |at| {
+                Duration::from_millis(now_unix_ms.saturating_sub(at)).min(retention)
+            });
+            let deadline = now + retention.saturating_sub(age);
+            let expires = self
+                .expires
+                .entry(head.session)
+                .or_insert((identity.settled_unix_ms, deadline));
+            if expires.0 != identity.settled_unix_ms {
+                *expires = (identity.settled_unix_ms, deadline);
+            }
+        } else {
+            self.expires.remove(&head.session);
+        }
         self.nodes.insert(
             head.session,
             ConversationRow {
@@ -130,13 +177,41 @@ impl ConversationTree {
     }
 
     pub fn rows(&self) -> Vec<ConversationRow> {
+        self.rows_at(Instant::now())
+    }
+
+    /// The current view stays reachable even after its terminal grace interval.
+    /// Expiry changes presentation only; transcript navigation retains the session.
+    pub fn rows_at(&self, now: Instant) -> Vec<ConversationRow> {
         let mut root = self.origin;
         while let Some(parent) = self.nodes.get(&root).and_then(|row| row.parent) {
             root = parent;
         }
         let mut rows = Vec::new();
         self.branch(root, 0, &mut rows);
+        rows.retain(|row| {
+            row.depth == 0
+                || row.session == self.origin
+                || self
+                    .expires
+                    .get(&row.session)
+                    .is_none_or(|(_, deadline)| now < *deadline)
+        });
         rows
+    }
+
+    /// One wake suffices for the earliest unpinned terminal row still visible.
+    pub fn next_expiry(&self, now: Instant) -> Option<Instant> {
+        self.nodes
+            .values()
+            .filter(|row| row.parent.is_some() && row.session != self.origin)
+            .filter_map(|row| {
+                self.expires
+                    .get(&row.session)
+                    .map(|(_, deadline)| *deadline)
+            })
+            .filter(|at| *at > now)
+            .min()
     }
 
     fn branch(&self, session: SessionId, depth: usize, rows: &mut Vec<ConversationRow>) {
@@ -174,6 +249,8 @@ struct Shared {
     state: Mutex<State>,
     sink: Box<dyn Fn(Vec<ConversationRow>) + Send + Sync>,
     ticking: AtomicBool,
+    closed: AtomicBool,
+    wake: Arc<rt::Notify>,
 }
 
 /// Owns head-only connections for one family. Dropping it releases every observer.
@@ -200,6 +277,8 @@ impl ConversationWatch {
             }),
             sink: Box::new(sink),
             ticking: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+            wake: Arc::new(rt::Notify::new()),
         });
         shared.add(origin);
         let weak = Arc::downgrade(&shared);
@@ -216,6 +295,23 @@ impl ConversationWatch {
             shared,
             _catalog: catalog,
         }
+    }
+
+    /// Keeps this family's observations while changing which session is pinned.
+    pub fn view(&self, session: SessionId) {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        state.tree.view(session);
+        let rows = state.tree.rows_at(self.shared.rt.now());
+        if state.published != rows {
+            state.published.clone_from(&rows);
+            (self.shared.sink)(rows);
+        }
+        drop(state);
+        self.shared.arm();
     }
 
     /// Uses the child's existing cancellation path, with normal admission rules.
@@ -289,25 +385,49 @@ impl Shared {
     }
 
     fn arm(self: &Arc<Self>) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        self.wake.notify();
         if self.ticking.swap(true, Ordering::AcqRel) {
             return;
         }
         let weak = Arc::downgrade(self);
         let rt = self.rt.clone();
+        let wake = Arc::clone(&self.wake);
         self.rt.spawn(Box::pin(async move {
+            let mut seen = wake.count();
             loop {
-                rt.sleep(std::time::Duration::from_secs(1)).await;
-                let Some(shared) = weak.upgrade() else { return };
-                let state = shared.state.lock().unwrap_or_else(PoisonError::into_inner);
-                let rows = state.tree.rows();
-                if !rows
-                    .iter()
-                    .any(|row| row.status == ConversationStatus::Running)
-                {
-                    shared.ticking.store(false, Ordering::Release);
-                    return;
-                }
-                (shared.sink)(rows);
+                let delay = {
+                    let Some(shared) = weak.upgrade() else { return };
+                    if shared.closed.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let mut state = shared.state.lock().unwrap_or_else(PoisonError::into_inner);
+                    let now = rt.now();
+                    let rows = state.tree.rows_at(now);
+                    let running = rows
+                        .iter()
+                        .any(|row| row.status == ConversationStatus::Running);
+                    if state.published != rows || running {
+                        state.published.clone_from(&rows);
+                        (shared.sink)(rows);
+                    }
+                    let next = state.tree.next_expiry(now);
+                    let delay = if running {
+                        Some(next.map_or(Duration::from_secs(1), |at| {
+                            (at - now).min(Duration::from_secs(1))
+                        }))
+                    } else {
+                        next.map(|at| at - now)
+                    };
+                    if delay.is_none() {
+                        shared.ticking.store(false, Ordering::Release);
+                    }
+                    delay
+                };
+                let Some(delay) = delay else { return };
+                rt::or(rt.sleep(delay), wake.changed(&mut seen)).await;
             }
         }));
     }
@@ -331,14 +451,16 @@ impl Shared {
             .chain(head.identity.parent)
             .collect();
         state.observed.insert(session, head.seq);
-        state.tree.apply(&head, activity);
+        state
+            .tree
+            .apply_at(&head, activity, self.rt.now(), unix_ms());
         if matches!(
             activity,
             Some(Activity::Idle | Activity::Done | Activity::Failed)
         ) {
             state.monitors.remove(&session);
         }
-        let rows = state.tree.rows();
+        let rows = state.tree.rows_at(self.rt.now());
         if state.published != rows {
             state.published.clone_from(&rows);
             (self.sink)(rows);
@@ -356,5 +478,22 @@ fn send(handle: &crate::ClientHandle, effects: Vec<Effect>) {
         if let Effect::Io(io) = effect {
             let _ = handle.io(io);
         }
+    }
+}
+
+fn unix_ms() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+impl Drop for ConversationWatch {
+    fn drop(&mut self) {
+        self.shared.closed.store(true, Ordering::Release);
+        self.shared.wake.notify();
     }
 }

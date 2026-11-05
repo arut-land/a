@@ -563,6 +563,7 @@ fn attach_never_requires_a_whole_session_image() {
                     mode: protocol::Mode::Queue,
                     taken: true,
                     origin: None,
+                    resume: None,
                     force: false,
                 };
                 Entry::new(Seq::new(seq).unwrap(), Epoch(epoch), body)

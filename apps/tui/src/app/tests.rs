@@ -21,7 +21,7 @@ fn ws() -> protocol::HostPath {
 }
 
 fn entry(seq: u64, body: Body) -> DaemonMsg {
-    DaemonMsg::Entry(Entry::new(Seq::new(seq).unwrap(), Epoch(0), body))
+    DaemonMsg::from(Entry::new(Seq::new(seq).unwrap(), Epoch(0), body))
 }
 
 /// An app attached to a fresh session, with `msgs` folded in.
@@ -40,7 +40,7 @@ fn app(viewport: Viewport, msgs: &[DaemonMsg]) -> (App, SessionId) {
     app.fold(&DaemonMsg::Activity {
         seq: app.view().seq,
         activity: protocol::ledger::Ledger::of(msgs.iter().filter_map(|m| match m {
-            DaemonMsg::Entry(entry) => Some(entry),
+            DaemonMsg::Entry(entry) => Some(entry.as_ref()),
             _ => None,
         }))
         .activity(),
@@ -137,6 +137,7 @@ fn asked_command() -> Vec<DaemonMsg> {
                 mode: protocol::Mode::Queue,
                 taken: true,
                 origin: None,
+                resume: None,
                 force: false,
             },
         ),
@@ -216,6 +217,7 @@ fn a_streamed_reply_shows_live_then_its_committed_text() {
                     mode: protocol::Mode::Queue,
                     taken: true,
                     origin: None,
+                    resume: None,
                     force: false,
                 },
             ),
@@ -394,6 +396,7 @@ fn the_wheel_scrolls_and_new_rows_keep_a_scrolled_view_still() {
                     mode: protocol::Mode::Queue,
                     taken: true,
                     origin: None,
+                    resume: None,
                     force: false,
                 },
             )
@@ -414,6 +417,7 @@ fn the_wheel_scrolls_and_new_rows_keep_a_scrolled_view_still() {
             mode: protocol::Mode::Queue,
             taken: true,
             origin: None,
+            resume: None,
             force: false,
         },
     ));
@@ -518,6 +522,7 @@ fn ctrl_c_interrupts_a_running_model_call_too() {
                 mode: protocol::Mode::Queue,
                 taken: true,
                 origin: None,
+                resume: None,
                 force: false,
             },
         ),
@@ -1100,6 +1105,7 @@ fn render_cost() {
                 mode: protocol::Mode::Queue,
                 taken: true,
                 origin: None,
+                resume: None,
                 force: false,
             },
         ));
@@ -1486,6 +1492,7 @@ fn a_turn_keeps_its_clock_across_entry_gaps_and_stops_only_at_idle() {
                     mode: protocol::Mode::Queue,
                     taken: true,
                     origin: None,
+                    resume: None,
                     force: false,
                 },
             ),
@@ -1548,6 +1555,7 @@ fn a_turn_keeps_its_clock_across_entry_gaps_and_stops_only_at_idle() {
             mode: protocol::Mode::Queue,
             taken: true,
             origin: None,
+            resume: None,
             force: false,
         },
     ));
@@ -1865,6 +1873,7 @@ fn recall_borrows_committed_input_and_restores_a_draft() {
                 mode: protocol::Mode::Queue,
                 taken: true,
                 origin: None,
+                resume: None,
                 force: false,
             },
         ));
@@ -1892,6 +1901,7 @@ fn equal_pending_input_is_retained_until_a_new_daemon_fact_owns_it() {
                 mode: protocol::Mode::Queue,
                 taken: true,
                 origin: None,
+                resume: None,
                 force: false,
             },
         )],
@@ -1913,6 +1923,7 @@ fn equal_pending_input_is_retained_until_a_new_daemon_fact_owns_it() {
             mode: protocol::Mode::Queue,
             taken: false,
             origin: None,
+            resume: None,
             force: false,
         },
     ));
@@ -1979,6 +1990,7 @@ fn opening_a_new_session_hides_the_previous_queue_before_attach() {
                 mode: protocol::Mode::Queue,
                 taken: false,
                 origin: None,
+                resume: None,
                 force: false,
             },
         )],
@@ -2000,6 +2012,7 @@ fn recall_uses_the_command_item_after_it_replaces_user_text() {
                     mode: protocol::Mode::Queue,
                     taken: true,
                     origin: None,
+                    resume: None,
                     force: false,
                 },
             ),
@@ -2145,6 +2158,7 @@ fn recall_crosses_requested_ranges_and_restores_a_draft_with_pastes() {
                     taken: true,
                     mode: protocol::Mode::Queue,
                     origin: None,
+                    resume: None,
                     force: false,
                 },
             )
@@ -2477,5 +2491,69 @@ fn family_insertions_keep_keyboard_actions_on_the_selected_session() {
         assert!(
             matches!(app.input(Input::Key(Key::Enter)), Some(Effect::Cmd(Cmd::Open(Target::Id(id)))) if id == b)
         );
+    }
+}
+
+#[test]
+fn clicking_the_composer_leaves_the_picker_and_typing_edits_the_draft() {
+    for viewport in [Viewport::Full, Viewport::Inline] {
+        let (mut app, main) = app(viewport, &[]);
+        app.conversations(vec![client::ConversationRow {
+            session: main,
+            parent: None,
+            depth: 0,
+            agent: "echo".into(),
+            title: "main".into(),
+            status: client::ConversationStatus::Finished,
+            admitted_unix_ms: None,
+            elapsed_ns: None,
+            usage: protocol::view::Usage::default(),
+        }]);
+        press(&mut app, Key::Down);
+        assert_eq!(app.conversation_at, Some(0));
+        let (_, rows) = frame(&mut app, 100, 30);
+        let y = (0..30)
+            .find(|y| app.canvas.hit(99, *y) == Some(crate::text::Action::Compose))
+            .unwrap();
+        let picker = rows
+            .iter()
+            .position(|row| row.contains("finished"))
+            .unwrap();
+        assert!(
+            picker > usize::from(y) + 1,
+            "the picker is below the composer's lower rule"
+        );
+        app.input(Input::Mouse(Mouse::Press { x: 99, y }));
+        keys(&mut app, "typed in composer");
+        assert_eq!(app.editor.text(), "typed in composer");
+        assert!(app.conversation_at.is_none());
+    }
+}
+
+#[test]
+fn a_child_uses_the_shared_composer_queue_and_edit_path_in_both_buffers() {
+    for viewport in [Viewport::Full, Viewport::Inline] {
+        let (mut app, _) = app(
+            viewport,
+            &[entry(
+                1,
+                Body::Input {
+                    segments: "queued child message".into(),
+                    mode: protocol::Mode::Queue,
+                    taken: false,
+                    origin: None,
+                    force: false,
+                    resume: None,
+                },
+            )],
+        );
+        let (_, rows) = frame(&mut app, 100, 30);
+        assert!(rows.iter().any(|row| row.contains("queued child message")));
+        assert!(
+            matches!(press(&mut app, Key::Alt('e')), Some(Effect::EditQueued(input)) if input.get() == 1)
+        );
+        let effects = app.edit_queued(Seq::new(1).unwrap());
+        assert_eq!(app.editor.text(), "queued child message");
+        assert!(effects.iter().any(|effect| matches!(effect, client::Effect::Io(Io::Send(ClientMsg::Withdraw { input, .. })) if input.get() == 1)));
     }
 }

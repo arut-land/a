@@ -271,6 +271,16 @@ impl ConversationWatch {
         conversation_rows(&lock(&self.rows))
     }
 
+    /// Pins the displayed session while retaining the family's existing expiry deadlines.
+    pub fn view(&self, session: &str) -> Result<(), ClientError> {
+        let session = parse_id(session)?;
+        lock(&self.watch)
+            .as_ref()
+            .ok_or(ClientError::NotOpen)?
+            .view(session);
+        Ok(())
+    }
+
     pub fn interrupt(&self, session: &str) -> Result<(), ClientError> {
         let session = parse_id(session)?;
         lock(&self.watch)
@@ -766,6 +776,29 @@ impl Session {
         };
         self.driver.pump(&mut *feed, effects);
         Ok(())
+    }
+
+    /// Editable user messages waiting in the ordinary session inbox.
+    pub fn queued_inputs(&self) -> Vec<crate::QueuedInput> {
+        lock(&self.feed)
+            .client
+            .queued_inputs()
+            .map(|input| crate::QueuedInput {
+                seq: input.seq.get(),
+                text: input.text.clone(),
+            })
+            .collect()
+    }
+
+    /// Withdraws the queued original and returns its text to the shared composer.
+    pub fn edit_queued(&self, input: u64) -> Result<String, ClientError> {
+        let input = protocol::Seq::new(input).ok_or(ClientError::InvalidArgument {
+            message: "invalid queued input".into(),
+        })?;
+        let mut feed = lock(&self.feed);
+        let (text, effects) = feed.client.edit_queued(input)?;
+        self.driver.pump(&mut *feed, effects);
+        Ok(text)
     }
 
     /// Sends the user's input as it is.

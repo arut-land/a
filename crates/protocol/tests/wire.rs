@@ -441,7 +441,7 @@ const MACHINE: MachineId = MachineId(*b"machine-id-bytes");
 
 /// The entries about input, decisions, waits and answers.
 fn input_samples() -> Vec<Sample<DaemonMsg>> {
-    let entry = |seq, body| DaemonMsg::Entry(Entry::new(Seq::new(seq).unwrap(), Epoch(0), body));
+    let entry = |seq, body| DaemonMsg::from(Entry::new(Seq::new(seq).unwrap(), Epoch(0), body));
     let call = |seq| CallId::new(seq).unwrap();
     let seq = |seq| Seq::new(seq).unwrap();
     let author = Author {
@@ -458,6 +458,7 @@ fn input_samples() -> Vec<Sample<DaemonMsg>> {
                     mode: Mode::Queue,
                     taken: true,
                     origin: None,
+                    resume: None,
                     force: false,
                 },
             ),
@@ -471,6 +472,7 @@ fn input_samples() -> Vec<Sample<DaemonMsg>> {
                     mode: Mode::Queue,
                     taken: true,
                     origin: None,
+                    resume: None,
                     force: false,
                 },
             ),
@@ -484,6 +486,7 @@ fn input_samples() -> Vec<Sample<DaemonMsg>> {
                     mode: Mode::Steer,
                     taken: false,
                     origin: None,
+                    resume: None,
                     force: false,
                 },
             ),
@@ -497,6 +500,7 @@ fn input_samples() -> Vec<Sample<DaemonMsg>> {
                     mode: Mode::Queue,
                     taken: false,
                     origin: Some(author),
+                    resume: None,
                     force: false,
                 },
             ),
@@ -557,55 +561,59 @@ fn input_samples() -> Vec<Sample<DaemonMsg>> {
         ),
         sample(
             "entry_call_fact",
-            DaemonMsg::Entry(Entry {
-                seq: Seq::new(11).unwrap(),
-                epoch: Epoch(0),
-                execution: Some(
-                    (protocol::CallFact {
-                        id: protocol::AttemptId {
-                            executing_session: SESSION,
-                            call: call(8),
-                            attempt: 1,
-                        },
-                        model: "openai:m".into(),
-                        role: "session".into(),
-                        runner: "agent".into(),
-                        agent: "loop".into(),
-                        side: false,
-                        unix_ms: 1000,
-                        clock_epoch: SESSION,
-                        start_ns: 10,
-                        elapsed_ns: Some(20),
-                        usage: Some(
-                            protocol::Json::encode(&[
-                                Some(10),
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                            ])
-                            .unwrap(),
-                        ),
-                        charge: Some(protocol::Charge {
-                            currency: "USD".into(),
-                            nanos: 100,
-                        }),
-                    })
-                    .to_json()
-                    .unwrap(),
-                ),
-                body: Body::ModelResult {
-                    call: call(8),
-                    r#for: None,
-                    outcome: Outcome::Interrupted { output: None },
-                    failure: None,
-                },
-            }),
+            DaemonMsg::Entry(
+                Entry {
+                    seq: Seq::new(11).unwrap(),
+                    epoch: Epoch(0),
+                    observed_unix_ms: Some(1000),
+                    execution: Some(
+                        (protocol::CallFact {
+                            id: protocol::AttemptId {
+                                executing_session: SESSION,
+                                call: call(8),
+                                attempt: 1,
+                            },
+                            model: "openai:m".into(),
+                            role: "session".into(),
+                            runner: "agent".into(),
+                            agent: "loop".into(),
+                            side: false,
+                            unix_ms: 1000,
+                            clock_epoch: SESSION,
+                            start_ns: 10,
+                            elapsed_ns: Some(20),
+                            usage: Some(
+                                protocol::Json::encode(&[
+                                    Some(10),
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                ])
+                                .unwrap(),
+                            ),
+                            charge: Some(protocol::Charge {
+                                currency: "USD".into(),
+                                nanos: 100,
+                            }),
+                        })
+                        .to_json()
+                        .unwrap(),
+                    ),
+                    body: Body::ModelResult {
+                        call: call(8),
+                        r#for: None,
+                        outcome: Outcome::Interrupted { output: None },
+                        failure: None,
+                    },
+                }
+                .into(),
+            ),
         ),
         sample(
             "entry_annotation",
@@ -766,7 +774,7 @@ fn input_samples() -> Vec<Sample<DaemonMsg>> {
 }
 
 fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
-    let entry = |seq, body| DaemonMsg::Entry(Entry::new(Seq::new(seq).unwrap(), Epoch(0), body));
+    let entry = |seq, body| DaemonMsg::from(Entry::new(Seq::new(seq).unwrap(), Epoch(0), body));
     let log = [
         Entry::new(
             Seq::new(1).unwrap(),
@@ -776,6 +784,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 mode: Mode::Queue,
                 taken: true,
                 origin: None,
+                resume: None,
                 force: false,
             },
         ),
@@ -783,6 +792,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
             seq: Seq::new(2).unwrap(),
             epoch: Epoch(0),
             execution: None,
+            observed_unix_ms: None,
             body: Body::ToolCall {
                 invoke: None,
                 tool: "bash".into(),
@@ -813,6 +823,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 mode: Mode::Steer,
                 taken: false,
                 origin: None,
+                resume: None,
                 force: false,
             },
         ),
@@ -1076,6 +1087,15 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 },
             ),
         ),
+        sample("entry_resumed_input", entry(2, Body::Input { segments: "resume work".into(), mode: Mode::Queue, taken: false, origin: None, force: false, resume: Some(SessionId(Uuid::from_u128(0xb))) })),
+        sample("entry_resumed_outbox", entry(3, Body::Outbox {
+            envelope_id: protocol::EnvelopeId { sender: SESSION, call: CallId::new(2).unwrap(), purpose: protocol::EnvelopeId::RESUMED.into() },
+            recipients: vec![SessionId(Uuid::from_u128(0xb))], payload: protocol::Carried::Resumed,
+        })),
+        sample("entry_resumed_enqueue", entry(4, Body::Enqueue { envelope: protocol::Envelope::new(
+            protocol::EnvelopeId { sender: SESSION, call: CallId::new(2).unwrap(), purpose: protocol::EnvelopeId::RESUMED.into() },
+            SessionId(Uuid::from_u128(0xb)), protocol::Carried::Resumed, Vec::new(),
+        ).unwrap() })),
         sample("entry_outbox", entry(1, Body::Outbox { envelope_id: envelope().id().clone(), recipients: vec![envelope().destination, SessionId(Uuid::from_u128(0xd))], payload: "hello".into() })),
         sample("entry_thread_input", entry(1, Body::Enqueue { envelope: protocol::Envelope::new(
             protocol::EnvelopeId { sender: SESSION, call: CallId::new(1).unwrap(), purpose: "example".into() },
@@ -1502,7 +1522,7 @@ fn an_entry_frame_is_its_log_line_tagged() {
         let read = protocol::Frame::from_line(entry.seq.get(), &line).unwrap();
         assert_eq!(read.as_bytes(), frame.as_bytes(), "{}", sample.name);
         assert_eq!((read.seq, read.class), (frame.seq, frame.class));
-        assert_eq!(&Entry::from_json(frame.body()).unwrap(), entry);
+        assert_eq!(&Entry::from_json(frame.body()).unwrap(), entry.as_ref());
     }
 }
 

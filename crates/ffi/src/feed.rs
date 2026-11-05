@@ -690,13 +690,16 @@ mod tests {
 
         let reducer = Reducer::new();
         for seq in 1..=3 {
-            let message = DaemonMsg::Entry(protocol::Entry::new(
-                protocol::Seq::new(seq).unwrap(),
-                protocol::Epoch(0),
-                protocol::Body::Assistant {
-                    text: "x".repeat(1 << 20),
-                },
-            ));
+            let message = DaemonMsg::Entry(
+                protocol::Entry::new(
+                    protocol::Seq::new(seq).unwrap(),
+                    protocol::Epoch(0),
+                    protocol::Body::Assistant {
+                        text: "x".repeat(1 << 20),
+                    },
+                )
+                .into(),
+            );
             reducer
                 .fold(&serde_json::to_string(&message).unwrap())
                 .unwrap();
@@ -744,13 +747,16 @@ mod tests {
     #[test]
     fn retained_payload_releases_replaced_views_and_evicted_updates() {
         let reducer = Reducer::new();
-        let message = DaemonMsg::Entry(protocol::Entry::new(
-            protocol::Seq::new(1).unwrap(),
-            protocol::Epoch(0),
-            protocol::Body::Assistant {
-                text: "x".repeat(1 << 20),
-            },
-        ));
+        let message = DaemonMsg::Entry(
+            protocol::Entry::new(
+                protocol::Seq::new(1).unwrap(),
+                protocol::Epoch(0),
+                protocol::Body::Assistant {
+                    text: "x".repeat(1 << 20),
+                },
+            )
+            .into(),
+        );
         reducer
             .fold(&serde_json::to_string(&message).unwrap())
             .unwrap();
@@ -789,13 +795,16 @@ mod tests {
         for size in [1 << 20, BUDGET.bytes * 2] {
             let reducer = Reducer::new();
             let stream = reducer.updates();
-            let message = DaemonMsg::Entry(protocol::Entry::new(
-                protocol::Seq::new(1).unwrap(),
-                protocol::Epoch(0),
-                protocol::Body::Assistant {
-                    text: "x".repeat(size),
-                },
-            ));
+            let message = DaemonMsg::Entry(
+                protocol::Entry::new(
+                    protocol::Seq::new(1).unwrap(),
+                    protocol::Epoch(0),
+                    protocol::Body::Assistant {
+                        text: "x".repeat(size),
+                    },
+                )
+                .into(),
+            );
             let update = reducer
                 .fold(&serde_json::to_string(&message).unwrap())
                 .unwrap()
@@ -832,13 +841,16 @@ mod tests {
         let reducer = Reducer::new();
         let stream = reducer.updates();
         for seq in 1..=BUFFER + 4 {
-            let message = DaemonMsg::Entry(protocol::Entry::new(
-                protocol::Seq::new(seq as u64).unwrap(),
-                protocol::Epoch(0),
-                protocol::Body::Assistant {
-                    text: format!("output {seq}"),
-                },
-            ));
+            let message = DaemonMsg::Entry(
+                protocol::Entry::new(
+                    protocol::Seq::new(seq as u64).unwrap(),
+                    protocol::Epoch(0),
+                    protocol::Body::Assistant {
+                        text: format!("output {seq}"),
+                    },
+                )
+                .into(),
+            );
             reducer
                 .fold(&serde_json::to_string(&message).unwrap())
                 .unwrap();
@@ -880,30 +892,36 @@ mod tests {
     fn slow_readers_do_not_queue_copies_of_cumulative_output() {
         let reducer = Reducer::new();
         let stream = reducer.updates();
-        let call = DaemonMsg::Entry(protocol::Entry::new(
-            protocol::Seq::new(1).unwrap(),
-            protocol::Epoch(0),
-            protocol::Body::ToolCall {
-                invoke: None,
-                tool: "output".into(),
-                input: protocol::Json::null(),
-                id: None,
-                card: None,
-                by: protocol::Audience::Model,
-            },
-        ));
+        let call = DaemonMsg::Entry(
+            protocol::Entry::new(
+                protocol::Seq::new(1).unwrap(),
+                protocol::Epoch(0),
+                protocol::Body::ToolCall {
+                    invoke: None,
+                    tool: "output".into(),
+                    input: protocol::Json::null(),
+                    id: None,
+                    card: None,
+                    by: protocol::Audience::Model,
+                },
+            )
+            .into(),
+        );
         reducer
             .fold(&serde_json::to_string(&call).unwrap())
             .unwrap();
         for seq in 2..=BUFFER + 1 {
-            let progress = DaemonMsg::Entry(protocol::Entry::new(
-                protocol::Seq::new(seq as u64).unwrap(),
-                protocol::Epoch(0),
-                protocol::Body::Progress {
-                    call: protocol::CallId::new(1).unwrap(),
-                    text: "x".repeat(64 << 10),
-                },
-            ));
+            let progress = DaemonMsg::Entry(
+                protocol::Entry::new(
+                    protocol::Seq::new(seq as u64).unwrap(),
+                    protocol::Epoch(0),
+                    protocol::Body::Progress {
+                        call: protocol::CallId::new(1).unwrap(),
+                        text: "x".repeat(64 << 10),
+                    },
+                )
+                .into(),
+            );
             reducer
                 .fold(&serde_json::to_string(&progress).unwrap())
                 .unwrap();
@@ -943,18 +961,21 @@ mod tests {
     #[test]
     fn large_stream_recovery_keeps_complete_text_without_rebuilding_items() {
         let reducer = Reducer::new();
-        let message = DaemonMsg::Entry(protocol::Entry::new(
-            protocol::Seq::new(1).unwrap(),
-            protocol::Epoch(0),
-            protocol::Body::ModelCall {
-                model: "test".into(),
-                attempt: 0,
-                choice: protocol::ToolChoice::default(),
-                r#for: None,
-                purpose: None,
-                request: None,
-            },
-        ));
+        let message = DaemonMsg::Entry(
+            protocol::Entry::new(
+                protocol::Seq::new(1).unwrap(),
+                protocol::Epoch(0),
+                protocol::Body::ModelCall {
+                    model: "test".into(),
+                    attempt: 0,
+                    choice: protocol::ToolChoice::default(),
+                    r#for: None,
+                    purpose: None,
+                    request: None,
+                },
+            )
+            .into(),
+        );
         reducer
             .fold(&serde_json::to_string(&message).unwrap())
             .unwrap();
@@ -986,25 +1007,31 @@ mod tests {
     fn large_item_patches_do_not_rebuild_unchanged_history() {
         let reducer = Reducer::new();
         for seq in 1..=100 {
-            let message = DaemonMsg::Entry(protocol::Entry::new(
-                protocol::Seq::new(seq).unwrap(),
-                protocol::Epoch(0),
-                protocol::Body::Assistant {
-                    text: "history".into(),
-                },
-            ));
+            let message = DaemonMsg::Entry(
+                protocol::Entry::new(
+                    protocol::Seq::new(seq).unwrap(),
+                    protocol::Epoch(0),
+                    protocol::Body::Assistant {
+                        text: "history".into(),
+                    },
+                )
+                .into(),
+            );
             reducer
                 .fold(&serde_json::to_string(&message).unwrap())
                 .unwrap();
         }
         let from = reducer.snapshot().rev;
-        let message = DaemonMsg::Entry(protocol::Entry::new(
-            protocol::Seq::new(101).unwrap(),
-            protocol::Epoch(0),
-            protocol::Body::Assistant {
-                text: "x".repeat(1 << 20),
-            },
-        ));
+        let message = DaemonMsg::Entry(
+            protocol::Entry::new(
+                protocol::Seq::new(101).unwrap(),
+                protocol::Epoch(0),
+                protocol::Body::Assistant {
+                    text: "x".repeat(1 << 20),
+                },
+            )
+            .into(),
+        );
         reducer
             .fold(&serde_json::to_string(&message).unwrap())
             .unwrap();
@@ -1021,13 +1048,16 @@ mod tests {
     #[test]
     fn invalidated_indices_never_survive_a_view_replacement() {
         let reducer = Reducer::new();
-        let message = DaemonMsg::Entry(protocol::Entry::new(
-            protocol::Seq::new(1).unwrap(),
-            protocol::Epoch(0),
-            protocol::Body::Assistant {
-                text: "x".repeat(1 << 20),
-            },
-        ));
+        let message = DaemonMsg::Entry(
+            protocol::Entry::new(
+                protocol::Seq::new(1).unwrap(),
+                protocol::Epoch(0),
+                protocol::Body::Assistant {
+                    text: "x".repeat(1 << 20),
+                },
+            )
+            .into(),
+        );
         reducer
             .fold(&serde_json::to_string(&message).unwrap())
             .unwrap();
@@ -1045,13 +1075,16 @@ mod tests {
     #[test]
     fn large_view_replacements_queue_metadata_and_recover_the_complete_view() {
         let reducer = Reducer::new();
-        let message = DaemonMsg::Entry(protocol::Entry::new(
-            protocol::Seq::new(1).unwrap(),
-            protocol::Epoch(0),
-            protocol::Body::Assistant {
-                text: "x".repeat(1 << 20),
-            },
-        ));
+        let message = DaemonMsg::Entry(
+            protocol::Entry::new(
+                protocol::Seq::new(1).unwrap(),
+                protocol::Epoch(0),
+                protocol::Body::Assistant {
+                    text: "x".repeat(1 << 20),
+                },
+            )
+            .into(),
+        );
         reducer
             .fold(&serde_json::to_string(&message).unwrap())
             .unwrap();
@@ -1127,7 +1160,7 @@ mod display_tests {
     };
 
     fn fold(reducer: &Reducer, seq: u64, body: Body) -> Option<ChangeBatch> {
-        let message = DaemonMsg::Entry(Entry::new(Seq::new(seq).unwrap(), Epoch(0), body));
+        let message = DaemonMsg::from(Entry::new(Seq::new(seq).unwrap(), Epoch(0), body));
         reducer
             .fold(&serde_json::to_string(&message).unwrap())
             .unwrap()

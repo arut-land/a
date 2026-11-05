@@ -40,6 +40,8 @@ pub struct Conversation {
     /// Observed monotonic spans, summed across daemon clock epochs without inventing downtime.
     pub elapsed_ns: Option<u64>,
     pub outcome: Option<crate::ledger::OutcomeKind>,
+    /// Observation of the latest outcome, shared by every picker and retained across restart.
+    pub settled_unix_ms: Option<u64>,
     pub children: Vec<Child>,
 }
 

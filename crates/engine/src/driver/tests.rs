@@ -55,6 +55,7 @@ fn user(text: &str) -> Body {
         mode: Mode::Queue,
         taken: true,
         origin: None,
+        resume: None,
         force: false,
     }
 }
@@ -66,6 +67,7 @@ fn queued(text: &str) -> Body {
         mode: Mode::Queue,
         taken: false,
         origin: None,
+        resume: None,
         force: false,
     }
 }
@@ -3021,10 +3023,10 @@ fn every_recorded_prefix_is_either_copied_exactly_or_refused_without_a_log() {
                 let mut expected = SessionView::default();
                 let mut actual = SessionView::default();
                 for entry in &log[..=index] {
-                    expected.fold(&DaemonMsg::Entry(entry.clone()));
+                    expected.fold(&DaemonMsg::Entry(entry.clone().into()));
                 }
                 for entry in &imported[..=index] {
-                    actual.fold(&DaemonMsg::Entry(entry.clone()));
+                    actual.fold(&DaemonMsg::Entry(entry.clone().into()));
                 }
                 assert_eq!(expected.state_hash(), actual.state_hash());
                 copied += 1;

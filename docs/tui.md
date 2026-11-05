@@ -157,6 +157,14 @@ both read.
 
 ## Design
 
+The agent picker is a footer below the input's lower rule, hints and status in
+both terminal buffers. Clicking the input, including its blank area, leaves
+picker focus. Queued messages appear above the input; click one or use Alt-E to
+withdraw the latest into the same editor. Child sessions use this same path.
+Terminal-row lifetimes come from the SDK: finished 5 seconds, failed 10 seconds,
+interrupted 30 seconds, with the currently viewed child pinned. A transcript
+child action remains usable after its picker row expires.
+
 ```
 terminal thread ──Input / Resized──┐
  (poll: stdin + signal pipe)       ├─> inbox ─> event loop: App::event / App::input
@@ -186,9 +194,10 @@ crates, three of them proc-macros, for `Buffer`, `Cell` and `Style`.
 
 - One thread owns the app and blocks on its `client::Inbox`. The terminal
   thread blocks in `poll` on stdin and a signal pipe with no timeout; the
-  `Driver` reads each connection on runtime tasks. The only timer is
-  the working indicator's, armed while a turn works with nothing asked
-  and cancelled on transition to idle. Queued ticks carry identities, so
+  `Driver` reads each connection on runtime tasks. The working indicator's timer
+  is armed while a turn works with nothing asked and cancelled on transition to
+  idle. The SDK schedules family progress and the next terminal-row expiry;
+  settled families with no pending expiry have no timer. Queued ticks carry identities, so
   an old tick cannot disarm new work. An idle client waits on its inbox. Elapsed time and
   usage stay with the turn across calls; time awaiting approval or idle
   is excluded. Everything queued is folded before one frame; what the

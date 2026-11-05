@@ -635,6 +635,8 @@ pub struct Load<'a> {
     /// The session's id, which its own envelopes are addressed by; none
     /// for a kernel that sends itself none it keeps (a scratch fork).
     pub session: Option<SessionId>,
+    /// Direct parent of an admitted child; authority stays with its original admission.
+    pub parent: Option<SessionId>,
     /// The first load since the daemon started: unowned background
     /// streams must be settled.
     pub fresh: bool,

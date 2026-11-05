@@ -38,5 +38,10 @@ public final class ConversationStore {
         catch { problem = error.localizedDescription }
     }
 
+    public func view(_ id: String) {
+        do { try watch.view(session: id) }
+        catch { problem = error.localizedDescription }
+    }
+
     deinit { task?.cancel() }
 }

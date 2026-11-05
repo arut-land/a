@@ -857,6 +857,7 @@ mod tests {
                 mode: protocol::Mode::Queue,
                 taken: true,
                 origin: None,
+                resume: None,
                 force: false,
             },
         ))
@@ -1137,6 +1138,7 @@ mod tests {
                     mode: protocol::Mode::Queue,
                     taken: true,
                     origin: None,
+                    resume: None,
                     force: false,
                 })
                 .unwrap();
@@ -1258,6 +1260,7 @@ mod tests {
                     mode: protocol::Mode::Queue,
                     taken: false,
                     origin: None,
+                    resume: None,
                     force: false,
                 })
                 .unwrap();

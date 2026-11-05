@@ -365,12 +365,15 @@ mod tests {
         assert_eq!(stream.project(&view), []);
         stream.inspected = 0;
         let update = view
-            .fold(&DaemonMsg::Entry(entry(
-                50_001,
-                Body::Assistant {
-                    text: "reply".into(),
-                },
-            )))
+            .fold(&DaemonMsg::Entry(
+                entry(
+                    50_001,
+                    Body::Assistant {
+                        text: "reply".into(),
+                    },
+                )
+                .into(),
+            ))
             .unwrap();
         assert_eq!(
             stream.update(&view, &update.change),
@@ -507,17 +510,20 @@ mod tests {
             let mut stream = ReplyStream::default();
             stream.project(&view);
             let call = CallId::new(history + 1).unwrap();
-            view.fold(&DaemonMsg::Entry(entry(
-                history + 1,
-                Body::ModelCall {
-                    model: "m".into(),
-                    purpose: None,
-                    r#for: None,
-                    attempt: 0,
-                    choice: protocol::ToolChoice::None,
-                    request: None,
-                },
-            )));
+            view.fold(&DaemonMsg::Entry(
+                entry(
+                    history + 1,
+                    Body::ModelCall {
+                        model: "m".into(),
+                        purpose: None,
+                        r#for: None,
+                        attempt: 0,
+                        choice: protocol::ToolChoice::None,
+                        request: None,
+                    },
+                )
+                .into(),
+            ));
             for index in 0..100 {
                 let update = view
                     .fold(&DaemonMsg::Delta {
@@ -632,7 +638,7 @@ mod tests {
                 .unwrap(),
             },
         },
-    )));
+    ).into()));
         assert!(matches!(&daemon_view.items[0], Item::Reply { text, .. } if text == "hello"));
         let update = view
             .fold(&DaemonMsg::Snapshot(Box::new(daemon_view.snapshot())))
@@ -662,6 +668,7 @@ mod tests {
                         mode: Mode::Queue,
                         taken: true,
                         origin: Some(id),
+                        resume: None,
                         force: false,
                     },
                 ),

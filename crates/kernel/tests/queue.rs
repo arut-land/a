@@ -52,7 +52,11 @@ fn a_forced_steer_cuts_the_model_call_short_and_its_turn_goes_on_from_the_steer(
     assert!(work(&fx).any(|w| *w == Work::Cancel { call: id(2) }));
     assert!(matches!(
         s.log.last().unwrap().body,
-        Body::Input { force: true, .. }
+        Body::Input {
+            resume: None,
+            force: true,
+            ..
+        }
     ));
     let steer = s.log.last().unwrap().seq.get();
     let fx = s.step(Event::ModelDone {

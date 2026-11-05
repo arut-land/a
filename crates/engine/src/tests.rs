@@ -490,7 +490,7 @@ fn fired(bodies: &[Body]) -> Vec<&protocol::ToolOutcome> {
 }
 
 #[test]
-fn a_parent_hears_from_its_child_exactly_once() {
+fn a_parent_hears_from_each_run_of_its_child_exactly_once() {
     let (root, home) = home("links");
     let daemon = Daemon::load(&home, &echo()).unwrap();
     let parent = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
@@ -514,8 +514,7 @@ fn a_parent_hears_from_its_child_exactly_once() {
         .session()
         .id;
     settle(&daemon);
-    // The child working again reports nothing: the parent's watch fired,
-    // so the hibernated parent stays unloaded.
+    // A new user message rearms result delivery even to a hibernated parent.
     daemon.hibernate(Duration::ZERO);
     let again = daemon
         .attach_to(&Target::Id(child), || "/w".into())
@@ -525,6 +524,7 @@ fn a_parent_hears_from_its_child_exactly_once() {
     drop(again);
     let parent_slot = daemon.slots().into_iter().find(|s| s.header.id == id);
     let parent_loaded = parent_slot.unwrap().live().is_some();
+    let before_restart = bodies(&*daemon.shared.store, id);
     drop(daemon);
 
     // A restart finds nothing left to fire.
@@ -573,7 +573,10 @@ fn a_parent_hears_from_its_child_exactly_once() {
         ]
     );
     assert!(matches!(&got[2], Body::ToolCall { tool, .. } if tool == "task"));
-    assert!(!parent_loaded, "a moot report loaded the parent");
+    assert!(
+        parent_loaded,
+        "the resumption notice must reach a hibernated parent"
+    );
     assert_eq!(child_header.unwrap().parent.unwrap().call, 4);
     assert_eq!(resumed, id, "resuming picks the parent, not its child");
     assert_eq!(
@@ -584,12 +587,14 @@ fn a_parent_hears_from_its_child_exactly_once() {
                 mode: protocol::Mode::Queue,
                 taken: true,
                 origin: None,
+                resume: None,
                 force: false,
             },
             Body::Assistant { text: "hi".into() },
         ]
     );
-    assert_eq!(after, got);
+    assert_eq!(after, before_restart);
+    assert_eq!(child_deliveries(after.iter()), (1, 2));
 }
 
 #[test]
@@ -655,6 +660,7 @@ fn watches_rearm_after_a_crash_and_fire_once() {
                 mode: protocol::Mode::Queue,
                 taken: true,
                 origin: None,
+                resume: None,
                 force: false,
             },
             Body::ToolCall {
@@ -685,6 +691,7 @@ fn watches_rearm_after_a_crash_and_fire_once() {
         mode: protocol::Mode::Queue,
         taken: true,
         origin: None,
+        resume: None,
         force: false,
     };
     let sleep = || Body::ToolCall {
@@ -779,7 +786,7 @@ fn until(daemon: &Daemon, id: SessionId, done: impl Fn(&[Body]) -> bool + Sync) 
 }
 
 #[test]
-fn an_owned_child_interrupted_by_its_parent_stays_cancelled_after_reload() {
+fn a_parent_interrupted_child_stays_stopped_after_reload_until_the_user_resumes_it() {
     let (root, home) = home("owned");
     std::fs::create_dir_all(&root).unwrap();
     let daemon = Daemon::load(&home, &echo()).unwrap();
@@ -829,11 +836,16 @@ fn an_owned_child_interrupted_by_its_parent_stays_cancelled_after_reload() {
     let again = Daemon::load(&home, &echo()).unwrap();
     let restored = again.attach_to(&Target::Id(*child), PathBuf::new).unwrap();
     restored.session().barrier();
+    assert!(!restored.session().has_work());
+    restored
+        .session()
+        .submit("user resumes this child")
+        .unwrap();
+    settle(&again);
     assert!(
-        restored
-            .session()
-            .submit("cannot restart cancelled ownership")
-            .is_err()
+        bodies(&*again.shared.store, *child).iter().any(
+            |body| matches!(body, Body::Assistant { text } if text == "user resumes this child")
+        )
     );
     drop(restored);
     drop(again);
@@ -874,6 +886,7 @@ fn an_orphan_does_not_resume_what_it_was_doing() {
             mode: protocol::Mode::Queue,
             taken: true,
             origin: None,
+            resume: None,
             force: false,
         },
         Body::ToolCall {
@@ -1705,10 +1718,10 @@ fn every_forkable_prefix_has_the_sources_view_and_unfinished_prefixes_create_not
                 let mut source_view = protocol::view::SessionView::default();
                 let mut fork_view = protocol::view::SessionView::default();
                 for entry in prefix {
-                    source_view.fold(&protocol::DaemonMsg::Entry(entry.clone()));
+                    source_view.fold(&protocol::DaemonMsg::Entry(entry.clone().into()));
                 }
                 for entry in &copied[..seq] {
-                    fork_view.fold(&protocol::DaemonMsg::Entry(entry.clone()));
+                    fork_view.fold(&protocol::DaemonMsg::Entry(entry.clone().into()));
                 }
                 assert_eq!(source_view, fork_view);
             }
@@ -2184,7 +2197,7 @@ fn interrupt_cancels_detached_descendants_after_the_spawning_call_completes() {
 
 struct PairTasks;
 #[test]
-fn a_cancelled_detached_child_stays_cancelled_across_partial_delivery() {
+fn cancelled_child_work_stays_stopped_until_the_user_resumes_it() {
     let (root, home) = home("cancel-source");
     let config = Config {
         ext: exts("[ext.policy]\nask = [\"bash\"]"),
@@ -2250,8 +2263,8 @@ fn a_cancelled_detached_child_stays_cancelled_across_partial_delivery() {
             assert!(
                 attachment
                     .session()
-                    .submit("cannot restart cancelled ownership")
-                    .is_err()
+                    .submit("user resumes cancelled child")
+                    .is_ok()
             );
             assert!(
                 !bodies(&*restored.shared.store, child.id)
@@ -2876,4 +2889,133 @@ fn activity_replaces_its_deadline_and_only_expiry_unloads_the_session() {
     drop(reloaded);
     drop(daemon);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn resumed_children_notify_their_direct_parent_once_across_every_delivery_crash_cut() {
+    for nested in [false, true] {
+        let (root, home) = home("resume-notice");
+        let daemon = Daemon::load(&home, &echo()).unwrap();
+        let parent = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
+        let main = parent.session().id;
+        parent
+            .session()
+            .submit(if nested {
+                "spawn spawn initial"
+            } else {
+                "spawn initial"
+            })
+            .unwrap();
+        settle(&daemon);
+        let headers = daemon.shared.store.headers().unwrap();
+        let child = headers
+            .iter()
+            .find(|header| {
+                header
+                    .parent
+                    .is_some_and(|parent| !nested || parent.session != main)
+            })
+            .unwrap();
+        let direct_parent = child.parent.unwrap().session;
+        let attached = daemon
+            .attach_to(&Target::Id(child.id), PathBuf::new)
+            .unwrap();
+        attached.session().submit("resumed work").unwrap();
+        settle(&daemon);
+        let logs: std::collections::BTreeMap<_, _> = headers
+            .iter()
+            .map(|header| (header.id, daemon.shared.store.entries(header.id).unwrap()))
+            .collect();
+        let child_log = &logs[&child.id];
+        let input = child_log
+            .iter()
+            .position(|entry| {
+                matches!(
+                    entry.body,
+                    Body::Input {
+                        resume: Some(_),
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        let outbox = child_log
+            .iter()
+            .position(|entry| {
+                matches!(
+                    &entry.body,
+                    Body::Outbox {
+                        payload: protocol::Carried::Resumed,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        let parent_log = &logs[&direct_parent];
+        let notice = parent_log.iter().position(|entry| matches!(&entry.body, Body::Enqueue { envelope } if envelope.payload() == &protocol::Carried::Resumed)).unwrap();
+        drop(attached);
+        drop(parent);
+        drop(daemon);
+        for child_cut in [input + 1, outbox + 1] {
+            for parent_cut in [notice, notice + 1] {
+                let (case_root, case_home) = self::home("resume-cut");
+                let cuts = [(child.id, child_cut), (direct_parent, parent_cut)];
+                import_cuts(&case_home, &headers, &logs, &cuts);
+                let restarted = Daemon::load(&case_home, &echo()).unwrap();
+                settle(&restarted);
+                let child_after = restarted.shared.store.entries(child.id).unwrap();
+                let parent_after = restarted.shared.store.entries(direct_parent).unwrap();
+                assert_eq!(
+                    child_after[0], child_log[0],
+                    "resumption keeps admitted authority"
+                );
+                assert!(child_after.iter().any(|entry| matches!(&entry.body, Body::Assistant { text } if text == "resumed work")));
+                assert_eq!(
+                    child_deliveries(parent_after.iter().map(|entry| &entry.body)),
+                    (1, 2)
+                );
+                drop(restarted);
+                let replayed = Daemon::load(&case_home, &echo()).unwrap();
+                settle(&replayed);
+                assert_eq!(
+                    replayed.shared.store.entries(direct_parent).unwrap(),
+                    parent_after
+                );
+                assert_eq!(
+                    replayed.shared.store.entries(child.id).unwrap(),
+                    child_after
+                );
+                drop(replayed);
+                std::fs::remove_dir_all(case_root).unwrap();
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+fn child_deliveries<'a>(bodies: impl Iterator<Item = &'a Body>) -> (usize, usize) {
+    bodies.fold((0, 0), |(notices, outcomes), body| match body {
+        Body::Enqueue { envelope } if envelope.payload() == &protocol::Carried::Resumed => {
+            (notices + 1, outcomes)
+        }
+        Body::Fired { .. } => (notices, outcomes + 1),
+        _ => (notices, outcomes),
+    })
+}
+
+fn import_cuts(
+    home: &Home,
+    headers: &[Header],
+    logs: &std::collections::BTreeMap<SessionId, Vec<Entry>>,
+    cuts: &[(SessionId, usize)],
+) {
+    let store = Jsonl::open(home.sessions_dir()).unwrap();
+    for header in headers {
+        let log = &logs[&header.id];
+        let cut = cuts
+            .iter()
+            .find_map(|(id, cut)| (*id == header.id).then_some(*cut))
+            .unwrap_or(log.len());
+        store.import(header, &log[..cut]).unwrap();
+    }
 }

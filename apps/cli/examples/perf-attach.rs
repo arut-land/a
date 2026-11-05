@@ -145,6 +145,7 @@ mod tests {
                         mode: protocol::Mode::Queue,
                         taken: true,
                         origin: None,
+                        resume: None,
                         force: false,
                     },
                 )

@@ -92,6 +92,17 @@ created ancestor before acknowledging creation.
 
 ## Admitted requests
 
+A user message from a terminal child's view resumes that existing session under
+its frozen admission. The input records its direct parent as the resume-notice
+recipient. A typed `Carried::Resumed` envelope uses the ordinary durable outbox,
+acknowledgement and deduplicated inbox. The child waits for that acknowledgement
+before running the input. Accepting the envelope rearms the outcome watch in the
+same fact, so a crash cannot leave a notice without result delivery or arm twice
+on retry. The notice uses the model's existing inbox sender/channel tags and
+wakes an idle parent like another inbox message. The next outcome follows the
+same watch/result lane as the original run; nested children notify their direct
+parent. Clients render the notice as one compact transcript item.
+
 A task's `Spawn` contains a prompt, context, runner selection, typed budget
 and placement. Context is `Fresh` or `Owner`; an owner prefix runs through
 the owning call's sequence, which must be committed. Runner selection

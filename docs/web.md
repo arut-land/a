@@ -8,6 +8,15 @@ rendered in Rust (hypertext's typed markup); in the browser, Datastar
 applies the patches each tab's event stream sends. A small inline script
 handles the conversation switcher's keyboard navigation and focus.
 
+The picker occupies its own footer below the composer bar. Main and child
+views share submission and queued-message editing; Edit withdraws the queued
+original into the composer. Clicking the text area leaves picker focus.
+The SDK retains terminal rows for 5 seconds when finished, 10 seconds when
+failed and 30 seconds when interrupted, pinning the currently viewed child.
+Expired children reopen through their inline links with the ordinary composer.
+Sending a message resumes the session; the parent receives one compact resume
+notice and the new outcome through its existing inbox/watch delivery.
+
 ## Design
 
 ```

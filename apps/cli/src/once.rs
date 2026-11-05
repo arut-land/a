@@ -520,17 +520,21 @@ mod tests {
         ] {
             receive(
                 &mut once,
-                DaemonMsg::Entry(Entry::new(
-                    Seq::new(seq).unwrap(),
-                    Epoch(0),
-                    Body::Input {
-                        segments: "same".into(),
-                        mode: Mode::Queue,
-                        taken: true,
-                        origin: Some(origin),
-                        force: false,
-                    },
-                )),
+                DaemonMsg::Entry(
+                    Entry::new(
+                        Seq::new(seq).unwrap(),
+                        Epoch(0),
+                        Body::Input {
+                            segments: "same".into(),
+                            mode: Mode::Queue,
+                            taken: true,
+                            origin: Some(origin),
+                            resume: None,
+                            force: false,
+                        },
+                    )
+                    .into(),
+                ),
             );
             assert!(once.ended.is_none());
             receive(

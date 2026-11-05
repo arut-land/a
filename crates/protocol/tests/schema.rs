@@ -77,7 +77,7 @@ fn a_log_replays_byte_identically() {
         let DaemonMsg::Entry(read) = DaemonMsg::from_json(frame.body()).unwrap() else {
             panic!("{}", String::from_utf8_lossy(&line));
         };
-        assert_eq!(read, entry);
+        assert_eq!(*read, entry);
     }
 }
 
@@ -330,6 +330,7 @@ fn the_log_knows_each_clients_last_mutation() {
             mode: protocol::Mode::Queue,
             taken: true,
             origin: Some(author(1)),
+            resume: None,
             force: false,
         },
         Body::Interrupt {

@@ -144,6 +144,38 @@ fn inbox_text(id: &EnvelopeId, text: &str) -> String {
     .to_string()
 }
 
+#[cfg(test)]
+mod resumption_tests {
+    use super::*;
+
+    #[test]
+    fn resumed_agent_notices_use_the_existing_inbox_sender_and_channel_tags() {
+        let child = protocol::SessionId::new();
+        let envelope = protocol::Envelope::new(
+            EnvelopeId {
+                sender: child,
+                call: CallId::new(7).unwrap(),
+                purpose: EnvelopeId::RESUMED.into(),
+            },
+            protocol::SessionId::new(),
+            Carried::Resumed,
+            Vec::new(),
+        )
+        .unwrap();
+        let ContextValue::Inbox(id, text) = context_fact(&Body::Enqueue { envelope }).unwrap()
+        else {
+            panic!("resumption must use ordinary inbox context");
+        };
+        let shown = inbox_text(&id, &text);
+        assert!(shown.contains(&format!("from=\"{child}\"")));
+        assert!(shown.contains("channel=\"resumed\""));
+        assert!(shown.contains(&format!(
+            "The user resumed agent {child}. It is running now."
+        )));
+        assert_eq!(shown.matches("<message ").count(), 1);
+    }
+}
+
 pub(super) fn context_fact(body: &Body) -> Option<ContextValue> {
     Some(match body {
         Body::Input {
@@ -162,6 +194,8 @@ pub(super) fn context_fact(body: &Body) -> Option<ContextValue> {
             let (call, held) = (envelope.id().call, envelope.held.clone());
             match envelope.payload() {
                 Carried::Message(text) => ContextValue::Inbox(envelope.id().clone(), text.clone()),
+                Carried::Resumed => ContextValue::Inbox(
+                    envelope.id().clone(), Carried::resumed_text(envelope.id().sender)),
                 Carried::Job(text) => ContextValue::Job(call, text.clone(), held),
                 Carried::Child(outcome) => ContextValue::Child(outcome.clone()),
                 Carried::Detached(outcome) => ContextValue::Background(call, outcome.clone(), held),
@@ -1141,6 +1175,7 @@ mod tests {
             mode,
             taken,
             origin: None,
+            resume: None,
             force: false,
         }
     }
@@ -1412,6 +1447,7 @@ mod tests {
                     mode: Mode::Queue,
                     taken: false,
                     origin: None,
+                    resume: None,
                     force: false,
                 }
             ),

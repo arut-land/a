@@ -95,18 +95,35 @@ Completed duration spans monotonic execution observations within each clock epoc
 unknown duration stays absent. Usage comes from the existing public head counter.
 
 `ConversationTree` folds those heads and public activity into one list of the
-session's ancestors and descendants. It retains finished, failed and interrupted
-children independently of the transcript's demanded history range. `ConversationWatch`
+session's ancestors and descendants. Terminal rows remain for 5 seconds when
+finished, 10 seconds when failed and 30 seconds when interrupted. One SDK table
+defines these intervals. The current view stays pinned; leaving it uses the
+original deadline. The pure `rows_at` and `next_expiry` functions use public head
+state and an instant. Logged outcome observations keep reopening or restarting a
+client from extending that interval. Expired children remain reachable through
+their inline transcript items, and reopening one pins its row for that view.
+`ConversationWatch`
 observes heads without demanding transcripts, releases settled observers, and
 uses catalog revision notifications to reattach when a settled session changes.
 Only public heads supply displayed metadata. Its shared formatter supplies status,
-elapsed time and token counts; running families refresh once a second.
+elapsed time and token counts; running families refresh once a second. A settled
+family arms one timer for its next expiry, then has no timer when none remains.
 
 All clients render that model below the composer. Empty-composer Down enters the
 list; arrows select, Enter opens the selected session, Escape or Up past the first
 row returns to the composer, and x stops a running child through the existing
 interrupt path. Child composers send through the ordinary session inbox and
-show `Message @<title>…`. The parent row and parent navigation return to the
+show `Message @<title>…`. Main and child views share `queued_inputs` and
+`edit_queued`: editing withdraws the queued original into the ordinary composer.
+Clicking the text area leaves picker focus. Sending from a terminal child resumes
+its existing session and admitted authority. Its durable input records the direct
+parent to notify; the typed `resumed` payload uses the existing acknowledged
+outbox/inbox lane. Accepting that envelope atomically rearms outcome delivery.
+It wakes an idle parent like an ordinary inbox message, appears as one compact
+transcript item, and reaches the model with the existing sender/channel tags.
+The child waits for acknowledgement before executing the resumed input. Replay
+reconstructs a missing outbox and deduplicates a notice already accepted.
+The parent row and parent navigation return to the
 parent transcript. TUI alternate-screen and inline modes share the same input
 and compose model; web rows use roving tabindex and accessible options; macOS
 uses an NSTableView. The native sidebar omits children of the displayed family,

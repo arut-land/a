@@ -428,6 +428,7 @@ fn a_steer_reaches_the_running_turn_before_the_model_is_next_asked() {
         mode: Mode::Steer,
         taken: false,
         origin: None,
+        resume: None,
         force: false,
     };
     modeled().table(vec![
@@ -850,6 +851,7 @@ fn a_pasted_slash_line_is_input_not_a_command() {
         mode: Mode::Queue,
         taken,
         origin: None,
+        resume: None,
         force: false,
     };
     echo().table(vec![
@@ -1262,6 +1264,7 @@ fn a_resend_runs_once() {
         mode: Mode::Queue,
         taken: true,
         origin: Some(author(1)),
+        resume: None,
         force: false,
     };
     echo().table(vec![

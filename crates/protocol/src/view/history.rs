@@ -680,6 +680,7 @@ mod tests {
                 mode: crate::Mode::Queue,
                 taken: true,
                 origin: None,
+                resume: None,
                 force: false,
             },
         );

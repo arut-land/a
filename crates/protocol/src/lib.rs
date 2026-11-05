@@ -18,7 +18,7 @@ pub use question::{
 };
 
 /// The exact protocol this build speaks.
-pub const PROTO: u32 = 46;
+pub const PROTO: u32 = 47;
 
 /// Ordinary payloads leave 4 KiB per reserved control slot for cancellation.
 #[derive(Clone, Copy)]
@@ -347,6 +347,9 @@ pub struct Entry {
     pub epoch: Epoch,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub execution: Option<Json>,
+    /// Wall-clock observation recorded by the writer, independent of execution spans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_unix_ms: Option<u64>,
     #[serde(flatten)]
     pub body: Body,
 }
@@ -357,6 +360,7 @@ impl Entry {
             seq,
             epoch,
             execution: None,
+            observed_unix_ms: None,
             body,
         }
     }
@@ -383,7 +387,7 @@ kinds! {
         /// a `force`d one cuts the model call short and detaches the
         /// running calls that can go on in the background, so that
         /// boundary comes now.
-        Input "input" { segments: Segments, mode: Mode = default, taken: bool = default, origin: Option<Author> = default, force: bool = default } = Durable;
+        Input "input" { segments: Segments, mode: Mode = default, taken: bool = default, origin: Option<Author> = default, force: bool = default, resume: Option<SessionId> = default } = Durable;
         /// Queued item `input` was taken up: it starts a turn, is read by
         /// the next model call, or, `into` a call, is read with that
         /// call's result, keeping each call beside its result.
@@ -478,7 +482,7 @@ kinds! {
         /// The committed intent to send `payload` to `recipients`, the set
         /// the session's route resolved its address to, once: each is
         /// delivered an [`Envelope`] under the one id.
-        Outbox "outbox" { envelope_id: EnvelopeId, recipients: Vec<SessionId>, payload: String } = Durable;
+        Outbox "outbox" { envelope_id: EnvelopeId, recipients: Vec<SessionId>, payload: Carried } = Durable;
         /// An envelope taken into this session's queue, once per id.
         Enqueue "enqueue" { envelope: Envelope } = Durable;
         /// Recipient `recipient` took in envelope `envelope_id`, or refused it.
@@ -629,7 +633,7 @@ fn envelope_blobs(envelope: &Envelope, found: &mut Vec<Held>) {
     found.extend(envelope.held.iter().cloned());
     match &envelope.payload {
         Carried::Child(outcome) | Carried::Detached(outcome) => outcome_blob(outcome, found),
-        Carried::Message(_) | Carried::Job(_) => {}
+        Carried::Message(_) | Carried::Job(_) | Carried::Resumed => {}
     }
 }
 
@@ -1896,7 +1900,7 @@ kinds! {
         /// the client cannot be served meanwhile: `a daemon stop` ends it.
         Draining "draining" { held: Option<String> = default } = Control;
         Attached "attached" { session: SessionId, workspace: HostPath } = Durable;
-        Entry "entry" (Entry) = (entry_class), read decode::entry_msg;
+        Entry "entry" (Box<Entry>) = (entry_class), read decode::entry_msg;
         /// Live text of an unfinished model call, of its `attempt`th try: a
         /// client shows the text of the latest only. Never logged: the
         /// committed `model_result` is the fact.
@@ -1957,6 +1961,12 @@ kinds! {
     /// entry's.
     unknown Unknown { seq: Option<u64> } = Control;
     else Ok(Self::Unknown { seq: None })
+}
+
+impl From<Entry> for DaemonMsg {
+    fn from(entry: Entry) -> Self {
+        Self::Entry(Box::new(entry))
+    }
 }
 
 /// An entry's frame is as its kind is: every one so far is durable (bash
@@ -2059,7 +2069,7 @@ impl Frame {
         Ok(frame)
     }
 
-    /// The frame of `DaemonMsg::Entry(entry.clone())`, without the clone:
+    /// The frame of `DaemonMsg::Entry(entry.clone().into())`, without the clone:
     /// the entry's own JSON with the tag spliced in first, as serde puts it.
     pub fn entry(entry: &Entry) -> io::Result<Self> {
         let mut bytes = Self::start();
@@ -2259,6 +2269,8 @@ impl EnvelopeId {
     /// The purpose of the envelope a child no call waits on settles into,
     /// under its watch: it carries the child's outcome ([`Carried::Child`]).
     pub const CHILD: &str = "child";
+    /// A user restarted a settled child through its ordinary composer.
+    pub const RESUMED: &str = "resumed";
     /// The purpose of a detached call's outcome, under the call
     /// ([`Carried::Detached`]).
     pub const DETACHED: &str = "detached";
@@ -2275,6 +2287,8 @@ impl EnvelopeId {
 pub enum Carried {
     /// Another session's message, under a purpose of its own.
     Message(String),
+    /// The sender is running again after the user resumed it.
+    Resumed,
     /// The end of a process group a call left to the session, as the model
     /// reads it ([`EnvelopeId::JOB`]).
     Job(String),
@@ -2285,10 +2299,16 @@ pub enum Carried {
 }
 
 impl Carried {
+    /// The user action represented by a resumed envelope from `sender`.
+    pub fn resumed_text(sender: SessionId) -> String {
+        format!("The user resumed agent {sender}. It is running now.")
+    }
+
     /// The purpose it is sent under, unless the sender names one.
     pub const fn purpose(&self) -> Option<&'static str> {
         match self {
             Self::Message(_) => None,
+            Self::Resumed => Some(EnvelopeId::RESUMED),
             Self::Job(_) => Some(EnvelopeId::JOB),
             Self::Child(_) => Some(EnvelopeId::CHILD),
             Self::Detached(_) => Some(EnvelopeId::DETACHED),
@@ -2362,8 +2382,13 @@ impl Envelope {
     ) -> Result<Self, EnvelopeError> {
         let fits = match payload.purpose() {
             Some(purpose) => id.purpose == purpose,
-            None => ![EnvelopeId::JOB, EnvelopeId::CHILD, EnvelopeId::DETACHED]
-                .contains(&id.purpose.as_str()),
+            None => ![
+                EnvelopeId::JOB,
+                EnvelopeId::CHILD,
+                EnvelopeId::DETACHED,
+                EnvelopeId::RESUMED,
+            ]
+            .contains(&id.purpose.as_str()),
         };
         if !fits {
             return Err(EnvelopeError);
@@ -2412,7 +2437,7 @@ impl Envelope {
     /// carries says.
     pub const fn source(&self) -> Source {
         match &self.payload {
-            Carried::Message(_) => Source::Agent(self.id.sender),
+            Carried::Message(_) | Carried::Resumed => Source::Agent(self.id.sender),
             Carried::Job(_) | Carried::Detached(_) => Source::Job(self.id.call),
             Carried::Child(_) => Source::Child(self.id.call.0),
         }
@@ -2672,7 +2697,7 @@ mod tests {
             Body::Assistant { text: "hi".into() },
         );
         let mut written = Vec::new();
-        write_frame(&mut written, &DaemonMsg::Entry(entry.clone())).unwrap();
+        write_frame(&mut written, &DaemonMsg::Entry(entry.clone().into())).unwrap();
         assert_eq!(Frame::entry(&entry).unwrap().as_bytes(), written);
         let msg = DaemonMsg::Synced { seq: 7 };
         written.clear();
@@ -2807,6 +2832,7 @@ mod tests {
                 mode: Mode::Queue,
                 taken: true,
                 origin: None,
+                resume: None,
                 force: false,
             },
         );
@@ -2947,7 +2973,7 @@ mod tests {
                 "{tag}: {msg:?}"
             );
         }
-        let entry = DaemonMsg::Entry(Entry::new(Seq::new(1).unwrap(), Epoch(0), Body::INTERRUPT));
+        let entry = DaemonMsg::from(Entry::new(Seq::new(1).unwrap(), Epoch(0), Body::INTERRUPT));
         assert_eq!(serde_json::to_value(&entry).unwrap()["t"], "entry");
         assert!(DaemonMsg::knows("entry") && !DaemonMsg::knows("hello"));
         assert!(Verdict::knows("retry") && !Body::knows("retry"));
@@ -2968,6 +2994,7 @@ mod tests {
                 mode: Mode::Queue,
                 taken: true,
                 origin: Some(author),
+                resume: None,
                 force: false,
             },
             Body::Input {
@@ -2975,6 +3002,7 @@ mod tests {
                 mode: Mode::Steer,
                 taken: false,
                 origin: None,
+                resume: None,
                 force: false,
             },
             Body::Take {

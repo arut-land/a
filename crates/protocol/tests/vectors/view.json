@@ -588,6 +588,215 @@
   {
     "frames": [
       "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
+      "{\"call\":1,\"child\":\"00000000-0000-0000-0000-00000000000c\",\"epoch\":0,\"input\":\"work\",\"intent\":null,\"kind\":\"link\",\"seq\":1,\"t\":\"entry\"}",
+      "{\"child\":\"00000000-0000-0000-0000-00000000000c\",\"epoch\":0,\"kind\":\"watch\",\"seq\":2,\"t\":\"entry\"}",
+      "{\"epoch\":0,\"kind\":\"fired\",\"outcome\":{\"status\":\"interrupted\"},\"seq\":3,\"t\":\"entry\",\"watch\":2}",
+      "{\"envelope\":{\"destination\":\"00000000-0000-0000-0000-00000000000a\",\"id\":{\"call\":8,\"purpose\":\"resumed\",\"sender\":\"00000000-0000-0000-0000-00000000000c\"},\"payload\":\"resumed\"},\"epoch\":0,\"kind\":\"enqueue\",\"seq\":4,\"t\":\"entry\"}",
+      "{\"epoch\":0,\"input\":4,\"kind\":\"take\",\"seq\":5,\"t\":\"entry\"}",
+      "{\"epoch\":0,\"kind\":\"fired\",\"outcome\":{\"output\":\"resumed result\",\"status\":\"done\"},\"seq\":6,\"t\":\"entry\",\"watch\":4}",
+      "{\"seq\":6,\"t\":\"synced\"}"
+    ],
+    "hash": "8b3014849fc763bc",
+    "messages": [
+      {
+        "session": "00000000-0000-0000-0000-00000000000a",
+        "t": "attached",
+        "workspace": "/w"
+      },
+      {
+        "call": 1,
+        "child": "00000000-0000-0000-0000-00000000000c",
+        "epoch": 0,
+        "input": "work",
+        "intent": null,
+        "kind": "link",
+        "seq": 1,
+        "t": "entry"
+      },
+      {
+        "child": "00000000-0000-0000-0000-00000000000c",
+        "epoch": 0,
+        "kind": "watch",
+        "seq": 2,
+        "t": "entry"
+      },
+      {
+        "epoch": 0,
+        "kind": "fired",
+        "outcome": {
+          "status": "interrupted"
+        },
+        "seq": 3,
+        "t": "entry",
+        "watch": 2
+      },
+      {
+        "envelope": {
+          "destination": "00000000-0000-0000-0000-00000000000a",
+          "id": {
+            "call": 8,
+            "purpose": "resumed",
+            "sender": "00000000-0000-0000-0000-00000000000c"
+          },
+          "payload": "resumed"
+        },
+        "epoch": 0,
+        "kind": "enqueue",
+        "seq": 4,
+        "t": "entry"
+      },
+      {
+        "epoch": 0,
+        "input": 4,
+        "kind": "take",
+        "seq": 5,
+        "t": "entry"
+      },
+      {
+        "epoch": 0,
+        "kind": "fired",
+        "outcome": {
+          "output": "resumed result",
+          "status": "done"
+        },
+        "seq": 6,
+        "t": "entry",
+        "watch": 4
+      },
+      {
+        "seq": 6,
+        "t": "synced"
+      }
+    ],
+    "name": "a resumed child has one compact notice and a new outcome watch",
+    "state": {
+      "items": [
+        {
+          "call": 1,
+          "child": "00000000-0000-0000-0000-00000000000c",
+          "fired": {
+            "output": "resumed result",
+            "status": "done"
+          },
+          "input": "work",
+          "type": "child",
+          "watch": 4
+        },
+        {
+          "decision": "The user resumed agent 0000000000000000000000000000000c. It is running now.",
+          "hook": "agent",
+          "seq": 4,
+          "type": "hook"
+        }
+      ],
+      "seq": 6,
+      "session": "00000000-0000-0000-0000-00000000000a",
+      "state": {
+        "calls": [],
+        "queued": [],
+        "taken": [],
+        "turn": 5
+      },
+      "workspace": "/w"
+    },
+    "updates": [
+      {
+        "change": {
+          "change": "attached",
+          "reset": true,
+          "session": "00000000-0000-0000-0000-00000000000a",
+          "workspace": "/w"
+        },
+        "rev": 1,
+        "seq": 0
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 0,
+          "item": {
+            "call": 1,
+            "child": "00000000-0000-0000-0000-00000000000c",
+            "fired": null,
+            "input": "work",
+            "type": "child",
+            "watch": null
+          }
+        },
+        "rev": 2,
+        "seq": 1
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 0,
+          "part": {
+            "part": "watch"
+          }
+        },
+        "rev": 3,
+        "seq": 2
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 0,
+          "part": {
+            "part": "outcome"
+          }
+        },
+        "rev": 4,
+        "seq": 3
+      },
+      {
+        "change": {
+          "change": "batch",
+          "changes": [
+            {
+              "change": "updated",
+              "index": 0,
+              "part": {
+                "part": "watch"
+              }
+            },
+            {
+              "change": "added",
+              "index": 1,
+              "item": {
+                "decision": "The user resumed agent 0000000000000000000000000000000c. It is running now.",
+                "hook": "agent",
+                "seq": 4,
+                "type": "hook"
+              }
+            }
+          ]
+        },
+        "rev": 5,
+        "seq": 4
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 0,
+          "part": {
+            "part": "outcome"
+          }
+        },
+        "rev": 6,
+        "seq": 6
+      },
+      {
+        "change": {
+          "change": "synced"
+        },
+        "rev": 7,
+        "seq": 6
+      }
+    ]
+  },
+  {
+    "frames": [
+      "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
       "{\"epoch\":0,\"kind\":\"model_call\",\"model\":\"m\",\"seq\":1,\"t\":\"entry\"}",
       "{\"seq\":1,\"t\":\"synced\"}",
       "{\"call\":1,\"t\":\"delta\",\"text\":\"a\\nold\"}",

@@ -96,6 +96,7 @@ pub fn chat_page(session: SessionId, tab: &str) -> String {
                 }
             }
             div style=(style::COMPOSER_BAR) {
+                div #queued-inputs {}
                 form style=(style::COMPOSER)
                     data-effect="if ($admitted !== false) { if ($draft === $admitted) $draft = ''; $admitted = false; }"
                     data-on:submit="$draft.trim() && @post('/api/send')" {
@@ -103,6 +104,8 @@ pub fn chat_page(session: SessionId, tab: &str) -> String {
                         autofocus data-bind:draft;
                     button type="submit" style=(style::BUTTON) { "Send" }
                 }
+            }
+            footer aria-label="Agent picker" {
                 nav #conversations aria-label="Conversations" {}
             }
             // XSS SAFETY: the script is a static literal without interpolated content.
@@ -150,7 +153,18 @@ async function stop(session) {
 document.addEventListener('click', event => {
   const button = event.target.closest('[data-stop-conversation]');
   if (button) stop(button.dataset.stopConversation);
+  const edit = event.target.closest('[data-edit-queued]');
+  if (edit) editQueued(edit.dataset.editQueued);
 });
+async function editQueued(input) {
+  const tab = document.querySelector('[data-signals]').getAttribute('data-signals').match(/tab: '([^']+)'/)[1];
+  const response = await fetch('/api/queue/edit', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({tab, input: Number(input)})});
+  if (!response.ok) return;
+  composer.value = await response.json();
+  composer.dispatchEvent(new Event('input', {bubbles: true}));
+  focusedSession = undefined;
+  composer.focus();
+}
 function hint(row) {
   const hint = document.getElementById('conversation-hint');
   if (!row || !hint) return;
@@ -228,6 +242,19 @@ pub fn conversation_list(
 #[component]
 pub fn document_title<'a>(title: Option<&'a str>) -> impl Renderable {
     maud! { title #document-title { (title.unwrap_or("a")) } }
+}
+
+pub fn queued_inputs(client: &client::SessionClient) -> String {
+    html(maud! {
+        div #queued-inputs {
+            @for input in client.queued_inputs() {
+                div style=(style::NOTE) {
+                    "Queued: " (input.text.as_str()) " "
+                    button type="button" data-edit-queued=(input.seq.get()) { "Edit" }
+                }
+            }
+        }
+    })
 }
 
 /// The session's title, once its model named it.
@@ -654,27 +681,30 @@ mod tests {
     #[test]
     fn question_urls_are_explicit_links_and_answers_use_a_post_body() {
         let mut view = SessionView::default();
-        view.fold(&DaemonMsg::Entry(protocol::Entry::new(
-            protocol::Seq::new(1).unwrap(),
-            protocol::Epoch(1),
-            protocol::Body::Question {
-                question: protocol::Question {
-                    source: "server <untrusted>".into(),
-                    prompts: std::collections::BTreeMap::from([(
-                        "url".into(),
-                        protocol::Prompt::Url {
-                            message: "Continue".into(),
-                            destination: protocol::Destination {
-                                origin: "https://example.com".into(),
-                                raw_origin: None,
-                                suspicious: false,
+        view.fold(&DaemonMsg::Entry(
+            protocol::Entry::new(
+                protocol::Seq::new(1).unwrap(),
+                protocol::Epoch(1),
+                protocol::Body::Question {
+                    question: protocol::Question {
+                        source: "server <untrusted>".into(),
+                        prompts: std::collections::BTreeMap::from([(
+                            "url".into(),
+                            protocol::Prompt::Url {
+                                message: "Continue".into(),
+                                destination: protocol::Destination {
+                                    origin: "https://example.com".into(),
+                                    raw_origin: None,
+                                    suspicious: false,
+                                },
+                                url: "https://example.com/authorize?secret=opaque&next=1".into(),
                             },
-                            url: "https://example.com/authorize?secret=opaque&next=1".into(),
-                        },
-                    )]),
+                        )]),
+                    },
                 },
-            },
-        )));
+            )
+            .into(),
+        ));
         let rendered = html(ItemRow {
             item: &view.items[0],
             view: &view,

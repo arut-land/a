@@ -48,19 +48,22 @@ fn answered_questions_discard_late_annotations() {
         if let DaemonMsg::Entry(entry) = &mut msg
             && matches!(entry.body, Body::Fact { .. })
         {
-            view.fold(&DaemonMsg::Entry(Entry::new(
-                entry.seq,
-                Epoch(0),
-                Body::Answer {
-                    call: CallId::new(1).unwrap(),
-                    value: Json::encode(&protocol::QuestionAnswer::confirm(
-                        Seq::new(3).unwrap(),
-                        protocol::Response::accept(),
-                    ))
-                    .unwrap(),
-                    origin: None,
-                },
-            )));
+            view.fold(&DaemonMsg::Entry(
+                Entry::new(
+                    entry.seq,
+                    Epoch(0),
+                    Body::Answer {
+                        call: CallId::new(1).unwrap(),
+                        value: Json::encode(&protocol::QuestionAnswer::confirm(
+                            Seq::new(3).unwrap(),
+                            protocol::Response::accept(),
+                        ))
+                        .unwrap(),
+                        origin: None,
+                    },
+                )
+                .into(),
+            ));
             entry.seq = Seq::new(entry.seq.get() + 1).unwrap();
             view.fold(&msg);
             let shown = view.present(&view.items[0]);
@@ -90,7 +93,7 @@ struct Session {
 impl Session {
     fn commit(&mut self, body: Body) -> u64 {
         self.seq += 1;
-        let msg = DaemonMsg::Entry(Entry::new(Seq::new(self.seq).unwrap(), Epoch(0), body));
+        let msg = DaemonMsg::from(Entry::new(Seq::new(self.seq).unwrap(), Epoch(0), body));
         self.log.push(msg.clone());
         self.live.push(msg);
         self.seq
@@ -155,6 +158,7 @@ impl Session {
             mode,
             taken,
             origin: None,
+            resume: None,
             force: false,
         });
         if !taken && rng.chance(70) {
@@ -307,7 +311,7 @@ impl Session {
             .log
             .iter()
             .filter_map(|m| match m {
-                DaemonMsg::Entry(e) if e.seq.get() <= upto => Some(e.clone()),
+                DaemonMsg::Entry(e) if e.seq.get() <= upto => Some(e.as_ref().clone()),
                 _ => None,
             })
             .collect();
@@ -524,6 +528,7 @@ fn queue_entries() -> Vec<Entry> {
         mode: Mode::Queue,
         taken: false,
         origin: None,
+        resume: None,
         force: false,
     };
     let job = protocol::Envelope::own(
@@ -538,6 +543,7 @@ fn queue_entries() -> Vec<Entry> {
             mode: Mode::Queue,
             taken: true,
             origin: None,
+            resume: None,
             force: false,
         },
         queued("later"),
@@ -569,7 +575,7 @@ fn queue_scenario() -> Vec<Value> {
         workspace: "/w".into(),
     };
     std::iter::once(attached)
-        .chain(queue_entries().into_iter().map(DaemonMsg::Entry))
+        .chain(queue_entries().into_iter().map(DaemonMsg::from))
         .chain([DaemonMsg::Synced { seq: 8 }])
         .map(|m| serde_json::to_value(m).unwrap())
         .collect()
@@ -696,11 +702,9 @@ fn each_spawn_replaces_its_tool_without_duplicate_rows_or_keys() {
 fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
     let msg = |m: DaemonMsg| serde_json::to_value(m).unwrap();
     let entry = |seq, body| {
-        msg(DaemonMsg::Entry(Entry::new(
-            Seq::new(seq).unwrap(),
-            Epoch(0),
-            body,
-        )))
+        msg(DaemonMsg::Entry(
+            Entry::new(Seq::new(seq).unwrap(), Epoch(0), body).into(),
+        ))
     };
     let attached = || {
         msg(DaemonMsg::Attached {
@@ -713,6 +717,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
         mode: Mode::Queue,
         taken: true,
         origin: None,
+        resume: None,
         force: false,
     };
     let call = |seq| CallId::new(seq).unwrap();
@@ -763,6 +768,21 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
         ("awaited spawns replace their tool rows", spawned_operations(false)),
         ("background spawns replace their tool rows", spawned_operations(true)),
 
+        ("a resumed child has one compact notice and a new outcome watch", {
+            let child = SessionId(Uuid::from_u128(0xc));
+            vec![attached(),
+                entry(1, Body::Link { call: call(1), child, input: "work".into(), intent: Json::null() }),
+                entry(2, Body::Watch { child }),
+                entry(3, Body::Fired { watch: Seq::new(2).unwrap(), outcome: Outcome::Interrupted { output: None } }),
+                entry(4, Body::Enqueue { envelope: protocol::Envelope::new(
+                    protocol::EnvelopeId { sender: child, call: call(8), purpose: protocol::EnvelopeId::RESUMED.into() },
+                    SESSION, protocol::Carried::Resumed, Vec::new()).unwrap() }),
+                entry(5, Body::Take { input: Seq::new(4).unwrap(), into: None }),
+                entry(6, Body::Fired { watch: Seq::new(4).unwrap(), outcome: Outcome::Done { output: Json::encode("resumed result").unwrap().into() } }),
+                msg(DaemonMsg::Synced { seq: 6 }),
+            ]
+        }),
+
         ("retry replaces streamed text at every length", vec![
             attached(),
             entry(1, Body::ModelCall { request: None, model: "m".into(), attempt: 0, choice: protocol::ToolChoice::Auto, r#for: None, purpose: None }),
@@ -785,7 +805,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
         ("the queue folds withdrawals and keeps what it hides out of the transcript", queue_scenario()),
         ("queued submission origins survive snapshots and ownership transfer", {
             let origin = protocol::Author { client: protocol::ClientId(Uuid::from_u128(0xc)), seq: protocol::ClientSeq::new(7).unwrap() };
-            let queued = entry(1, Body::Input { segments: "same".into(), mode: Mode::Queue, taken: false, origin: Some(origin), force: false });
+            let queued = entry(1, Body::Input { segments: "same".into(), mode: Mode::Queue, taken: false, origin: Some(origin), force: false, resume: None });
             let mut view = SessionView::default();
             view.fold(&DaemonMsg::from_json(queued.to_string().as_bytes()).unwrap());
             vec![attached(), msg(DaemonMsg::Snapshot(Box::new(view.snapshot()))), entry(2, Body::Take { input: Seq::new(1).unwrap(), into: None }), msg(DaemonMsg::Activity { seq: 2, activity: protocol::Activity::Idle }), msg(DaemonMsg::Synced { seq: 2 })]
@@ -808,7 +828,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
         ("flat inherited publications survive snapshots and later publications", {
             let spawned = inherited_publications();
             let view = SessionView::from_log(SESSION, "/w".into(), [&spawned]);
-            vec![attached(), msg(DaemonMsg::Entry(spawned)), msg(DaemonMsg::Snapshot(Box::new(view.snapshot()))),
+            vec![attached(), msg(DaemonMsg::from(spawned)), msg(DaemonMsg::Snapshot(Box::new(view.snapshot()))),
                 entry(2, Body::Context { text: "later schema".into(), publication: Some(Publication { namespace: "mcp-schemas".into(), key: Json::encode("later-publication").unwrap() }) }),
                 msg(DaemonMsg::Synced { seq: 2 }),
             ]
@@ -1019,6 +1039,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                         mode: Mode::Steer,
                         taken: false,
                         origin: None,
+                        resume: None,
                         force: false,
                     },
                 ),
@@ -1571,7 +1592,7 @@ fn vectors() {
 /// user's last message, what the turn did since, and what waits.
 #[test]
 fn a_recap_tells_what_the_replay_held() {
-    let entry = |seq, body| DaemonMsg::Entry(Entry::new(Seq::new(seq).unwrap(), Epoch(0), body));
+    let entry = |seq, body| DaemonMsg::from(Entry::new(Seq::new(seq).unwrap(), Epoch(0), body));
     let mut view = SessionView::default();
     let attached = DaemonMsg::Attached {
         session: SESSION,
@@ -1585,6 +1606,7 @@ fn a_recap_tells_what_the_replay_held() {
                 mode: Mode::Queue,
                 taken: true,
                 origin: None,
+                resume: None,
                 force: false,
             },
         ),
@@ -1715,11 +1737,9 @@ fn answered_and_cancelled_questions_stop_presenting_existing_descriptions() {
             view.fold(&DaemonMsg::from_json(value.to_string().as_bytes()).unwrap());
         }
         assert!(view.present(&view.items[0]).description.is_some());
-        view.fold(&DaemonMsg::Entry(Entry::new(
-            Seq::new(view.seq + 1).unwrap(),
-            Epoch(0),
-            terminal,
-        )));
+        view.fold(&DaemonMsg::Entry(
+            Entry::new(Seq::new(view.seq + 1).unwrap(), Epoch(0), terminal).into(),
+        ));
         assert!(view.present(&view.items[0]).description.is_none());
     }
 }
@@ -1857,15 +1877,18 @@ fn execution_context_edits_do_not_install_publications_in_client_views() {
                 .contains(namespace)
         );
     }
-    restored.fold(&DaemonMsg::Entry(Entry::new(
-        Seq::new(2).unwrap(),
-        Epoch(0),
-        Body::Edit {
-            target: Seq::new(1).unwrap(),
-            upto: None,
-            replace: None,
-        },
-    )));
+    restored.fold(&DaemonMsg::Entry(
+        Entry::new(
+            Seq::new(2).unwrap(),
+            Epoch(0),
+            Body::Edit {
+                target: Seq::new(1).unwrap(),
+                upto: None,
+                replace: None,
+            },
+        )
+        .into(),
+    ));
     assert!(
         !serde_json::to_string(&restored.state)
             .unwrap()
@@ -1944,27 +1967,28 @@ fn call_annotations_present_generic_cards_until_the_call_finishes() {
     .into_iter()
     .enumerate()
     {
-        view.fold(&DaemonMsg::Entry(Entry::new(
-            Seq::new(seq as u64 + 1).unwrap(),
-            Epoch(0),
-            body,
-        )));
+        view.fold(&DaemonMsg::Entry(
+            Entry::new(Seq::new(seq as u64 + 1).unwrap(), Epoch(0), body).into(),
+        ));
     }
     let shown = view.present(&view.items[0]);
     assert_eq!(shown.title, "Extension status");
     assert_eq!(shown.body.text(), "Typed presentation");
     assert_eq!(shown.status, "working");
     assert_eq!(shown.glyph, protocol::view::Glyph::Warn);
-    view.fold(&DaemonMsg::Entry(Entry::new(
-        Seq::new(3).unwrap(),
-        Epoch(0),
-        Body::ModelResult {
-            call,
-            r#for: None,
-            failure: None,
-            outcome: Outcome::Interrupted { output: None },
-        },
-    )));
+    view.fold(&DaemonMsg::Entry(
+        Entry::new(
+            Seq::new(3).unwrap(),
+            Epoch(0),
+            Body::ModelResult {
+                call,
+                r#for: None,
+                failure: None,
+                outcome: Outcome::Interrupted { output: None },
+            },
+        )
+        .into(),
+    ));
     assert_eq!(view.present(&view.items[0]).title, "custom");
 }
 

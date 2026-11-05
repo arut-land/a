@@ -965,6 +965,45 @@ impl SessionView {
                 text: segments.text(),
             },
             Body::Input { .. } => return None,
+            Body::Enqueue { envelope } if envelope.payload() == &crate::Carried::Resumed => {
+                let changed = self.items.iter_mut().enumerate().find_map(|(index, item)| {
+                    if let Item::Child {
+                        child,
+                        watch,
+                        fired,
+                        ..
+                    } = item
+                        && *child == envelope.id().sender
+                    {
+                        *watch = Some(seq);
+                        *fired = None;
+                        Some(Change::Updated {
+                            index,
+                            part: Part::Watch,
+                        })
+                    } else {
+                        None
+                    }
+                });
+                let item = Item::Hook {
+                    seq,
+                    hook: "agent".into(),
+                    call: None,
+                    tool: String::new(),
+                    decision: crate::Carried::resumed_text(envelope.id().sender),
+                };
+                let added = Change::Added {
+                    index: self.items.len(),
+                    item: item.clone(),
+                };
+                self.items.push(item);
+                return Some(match changed {
+                    Some(changed) => Change::Batch {
+                        changes: vec![changed, added],
+                    },
+                    None => added,
+                });
+            }
             Body::Take { .. } => Item::User { seq, text: taken? },
             Body::ToolCall {
                 tool,
@@ -1122,11 +1161,13 @@ impl SessionView {
             }
             Body::Wait { call, .. } | Body::ToolProcess { call, .. } => self.rephase(*call),
             Body::Watch { child } => {
-                let at = self.items.iter().rposition(
-                    |item| matches!(item, Item::Child { child: c, watch: None, .. } if c == child),
-                )?;
-                if let Item::Child { watch, .. } = &mut self.items[at] {
+                let at = self
+                    .items
+                    .iter()
+                    .rposition(|item| matches!(item, Item::Child { child: c, .. } if c == child))?;
+                if let Item::Child { watch, fired, .. } = &mut self.items[at] {
                     *watch = Some(seq);
+                    *fired = None;
                 }
                 Some(Change::Updated {
                     index: at,
@@ -1517,27 +1558,33 @@ mod question_tests {
     fn answering_a_service_question_releases_its_live_tracking() {
         let mut view = SessionView::default();
         let id = Seq::new(1).unwrap();
-        view.fold(&DaemonMsg::Entry(Entry::new(
-            id,
-            crate::Epoch(1),
-            Body::Question {
-                question: crate::Question::confirm("Continue?".into()),
-            },
-        )));
+        view.fold(&DaemonMsg::Entry(
+            Entry::new(
+                id,
+                crate::Epoch(1),
+                Body::Question {
+                    question: crate::Question::confirm("Continue?".into()),
+                },
+            )
+            .into(),
+        ));
         assert!(view.state.calls.iter().next().is_some());
-        view.fold(&DaemonMsg::Entry(Entry::new(
-            Seq::new(2).unwrap(),
-            crate::Epoch(1),
-            Body::Answer {
-                call: CallId(id),
-                value: Json::encode(&crate::QuestionAnswer::confirm(
-                    id,
-                    crate::Response::accept(),
-                ))
-                .unwrap(),
-                origin: None,
-            },
-        )));
+        view.fold(&DaemonMsg::Entry(
+            Entry::new(
+                Seq::new(2).unwrap(),
+                crate::Epoch(1),
+                Body::Answer {
+                    call: CallId(id),
+                    value: Json::encode(&crate::QuestionAnswer::confirm(
+                        id,
+                        crate::Response::accept(),
+                    ))
+                    .unwrap(),
+                    origin: None,
+                },
+            )
+            .into(),
+        ));
         assert!(view.state.calls.iter().next().is_none());
         assert!(matches!(
             view.items[0],

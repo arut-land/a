@@ -27,6 +27,7 @@ pub enum Effect {
     StopConversation(protocol::SessionId),
     History(client::HistoryDemand),
     Recall(client::HistoryDemand),
+    EditQueued(protocol::Seq),
     OpenUrl(String),
     Output(protocol::BlobId),
     /// Replace an unresponsive daemon.
@@ -477,6 +478,23 @@ impl App {
         self.redraw = true;
     }
 
+    pub fn edit_queued(&mut self, input: protocol::Seq) -> Vec<client::Effect> {
+        match self.client.edit_queued(input) {
+            Ok((text, effects)) => {
+                self.editor.recalled(&text);
+                self.conversation_at = None;
+                self.recall = None;
+                self.redraw = true;
+                self.composed = None;
+                effects
+            }
+            Err(notice) => {
+                self.notice(notice.to_string(), true);
+                Vec::new()
+            }
+        }
+    }
+
     pub fn contains_conversation(&self, id: protocol::SessionId) -> bool {
         self.conversations.iter().any(|row| row.session == id)
     }
@@ -646,6 +664,13 @@ impl App {
         let last = menu.len().saturating_sub(1);
         let at = self.menu_at.unwrap_or(0).min(last);
         match key {
+            Key::Alt('e') => {
+                return self
+                    .client
+                    .queued_inputs()
+                    .last()
+                    .map(|input| Effect::EditQueued(input.seq));
+            }
             Key::Up | Key::Ctrl('p') if !menu.is_empty() => {
                 self.menu_at = Some(at.saturating_sub(1));
             }
@@ -1079,6 +1104,8 @@ impl App {
 
     fn act(&mut self, action: Action) -> Option<Effect> {
         match action {
+            Action::Compose => self.conversation_at = None,
+            Action::Queued(input) => return Some(Effect::EditQueued(input)),
             Action::Conversation(at) => {
                 self.conversation_at = Some(at);
                 return Some(Effect::Cmd(Cmd::Open(Target::Id(
@@ -1322,11 +1349,9 @@ mod display_tests {
         .into_iter()
         .enumerate()
         {
-            app.fold(&DaemonMsg::Entry(Entry::new(
-                Seq::new(seq as u64 + 1).unwrap(),
-                Epoch(0),
-                body,
-            )));
+            app.fold(&DaemonMsg::Entry(
+                Entry::new(Seq::new(seq as u64 + 1).unwrap(), Epoch(0), body).into(),
+            ));
         }
         app.cache = (0..2)
             .map(|i| {
@@ -1344,17 +1369,20 @@ mod display_tests {
                 )
             })
             .collect();
-        app.fold(&DaemonMsg::Entry(Entry::new(
-            Seq::new(3).unwrap(),
-            Epoch(0),
-            Body::Decision {
-                by: "rewrite".into(),
-                call: CallId::new(2),
-                d: Verdict::PreTool {
-                    input: Json::encode(&"effective").unwrap(),
+        app.fold(&DaemonMsg::Entry(
+            Entry::new(
+                Seq::new(3).unwrap(),
+                Epoch(0),
+                Body::Decision {
+                    by: "rewrite".into(),
+                    call: CallId::new(2),
+                    d: Verdict::PreTool {
+                        input: Json::encode(&"effective").unwrap(),
+                    },
                 },
-            },
-        )));
+            )
+            .into(),
+        ));
         assert_eq!(app.cache.len(), 1);
         assert_eq!(app.cache[&0].width, 80);
         assert!(!app.cache.contains_key(&1));

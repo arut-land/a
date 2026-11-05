@@ -141,6 +141,7 @@ fn resume_after_the_terminal_closes_mid_turn_replays_every_entry() {
         mode: Mode::Queue,
         taken: true,
         origin: None,
+        resume: None,
         force: false,
     };
     let opened = bodies.remove(0);

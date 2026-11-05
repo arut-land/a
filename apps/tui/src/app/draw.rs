@@ -173,6 +173,16 @@ impl App {
         }
         out.extend(working);
         out.extend(self.menu_rows(width));
+        for input in self.client.queued_inputs() {
+            out.push(Line::from([Span::button(
+                ellipsize(
+                    &format!("queued · {} · alt-e edits latest", sanitize(&input.text)),
+                    width,
+                ),
+                MUTED,
+                Action::Queued(input.seq),
+            )]));
+        }
         out.push(rule.clone());
         let (mut rows, (cx, cy)) = if self.question_edit.as_ref().is_some_and(|edit| {
             edit.fields
@@ -197,8 +207,18 @@ impl App {
         // The caret's row stays in view.
         let skip = usize::from(cy).saturating_sub(INPUT_ROWS - 1);
         let caret_row = out.len() + usize::from(cy) - skip;
-        out.extend(rows.into_iter().skip(skip).take(INPUT_ROWS));
-        out.extend(self.conversation_rows(width, time.unix_ms));
+        out.extend(rows.into_iter().skip(skip).take(INPUT_ROWS).map(|mut row| {
+            let used: usize = row.spans.iter().map(|span| width_of(&span.text)).sum();
+            for span in &mut row.spans {
+                span.action = Some(Action::Compose);
+            }
+            row.spans.push(Span::button(
+                " ".repeat(width.saturating_sub(used)),
+                Style::new(),
+                Action::Compose,
+            ));
+            row
+        }));
         out.push(rule);
         let hint = if asked {
             "↑/↓ choose · enter confirms · 1/y yes · 2/n/esc no"
@@ -209,6 +229,7 @@ impl App {
         };
         out.push(Line::plain(ellipsize(hint, width), MUTED));
         out.push(self.status(width, summary.reply));
+        out.extend(self.conversation_rows(width, time.unix_ms));
         let last_col = u16::try_from(width.saturating_sub(1)).unwrap_or(u16::MAX);
         let caret = (self.overlay.is_none() && self.conversation_at.is_none()).then(|| {
             (

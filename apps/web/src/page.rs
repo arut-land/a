@@ -34,6 +34,7 @@ pub struct Page {
     /// Events not yet sent.
     out: Vec<u8>,
     pending_conversations: Option<Vec<client::ConversationRow>>,
+    shown_queue: String,
 }
 
 impl Page {
@@ -49,6 +50,7 @@ impl Page {
         });
         let open = client.attach(Attach::new(Target::Id(session), Env::Keep));
         let page = Self {
+            shown_queue: view::queued_inputs(&client),
             client,
             session,
             dom_end: 0,
@@ -329,6 +331,11 @@ impl Page {
         if self.synced() {
             self.show_end();
             self.show_title();
+            let queue = view::queued_inputs(&self.client);
+            if self.shown_queue != queue {
+                self.patch(&Patch::Replace(&queue));
+                self.shown_queue = queue;
+            }
         }
         self.show_conversations();
     }
@@ -600,7 +607,7 @@ mod tests {
     }
 
     fn entry(seq: u64, body: Body) -> DaemonMsg {
-        DaemonMsg::Entry(Entry::new(Seq::new(seq).unwrap(), Epoch(1), body))
+        DaemonMsg::from(Entry::new(Seq::new(seq).unwrap(), Epoch(1), body))
     }
 
     fn user(seq: u64, text: &str) -> DaemonMsg {
@@ -611,6 +618,7 @@ mod tests {
                 mode: protocol::Mode::Queue,
                 taken: true,
                 origin: None,
+                resume: None,
                 force: false,
             },
         )
@@ -762,6 +770,7 @@ mod tests {
                 mode: protocol::Mode::Queue,
                 taken: true,
                 origin: None,
+                resume: None,
                 force: false,
             },
         )];
@@ -869,6 +878,7 @@ mod tests {
                         mode: protocol::Mode::Queue,
                         taken: true,
                         origin: None,
+                        resume: None,
                         force: false,
                     }
                 } else {

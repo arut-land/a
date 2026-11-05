@@ -33,6 +33,7 @@ enum TabIn {
     Client(Event),
     Conversations(Vec<client::ConversationRow>),
     StopConversation(SessionId),
+    EditQueued(protocol::Seq, rt::oneshot::Sender<Option<String>>),
     /// A line typed in the composer.
     Line(String, rt::oneshot::Sender<bool>),
     Cmd(Cmd),
@@ -157,6 +158,32 @@ impl App {
         }
     }
 
+    async fn edit_queued(&self, body: &[u8]) -> http::Response<Vec<u8>> {
+        #[derive(Deserialize)]
+        struct Edit {
+            tab: String,
+            input: u64,
+        }
+        let Some((tab, input)) = serde_json::from_slice::<Edit>(body)
+            .ok()
+            .and_then(|edit| Some((edit.tab, protocol::Seq::new(edit.input)?)))
+        else {
+            return text(StatusCode::BAD_REQUEST, "invalid queued input");
+        };
+        let (reply, result) = rt::oneshot::channel();
+        if !self.tell(&tab, TabIn::EditQueued(input, reply)) {
+            return done(false);
+        }
+        match result.await.flatten() {
+            Some(value) => whole(
+                StatusCode::OK,
+                "application/json",
+                serde_json::to_vec(&value).expect("text encodes"),
+            ),
+            None => text(StatusCode::CONFLICT, "This message is no longer queued."),
+        }
+    }
+
     fn stop_conversation(&self, body: &[u8]) -> http::Response<Vec<u8>> {
         #[derive(Deserialize)]
         struct Stop {
@@ -242,6 +269,7 @@ impl App {
                     None => done(false),
                 }
             }
+            (&Method::POST, "/api/queue/edit", _) => self.edit_queued(&body).await,
             (&Method::POST, "/api/conversation/stop", _) => self.stop_conversation(&body),
             (&Method::POST, "/api/answer", _) => self.answer(&body),
             (&Method::POST, "/api/approve", _) => {
@@ -322,7 +350,7 @@ impl Live {
                 + match input {
                     TabIn::Client(event) => event.retained_bytes(),
                     TabIn::Line(text, _) => text.len(),
-                    TabIn::Cmd(_) | TabIn::StopConversation(_) => 4096,
+                    TabIn::Cmd(_) | TabIn::StopConversation(_) | TabIn::EditQueued(..) => 4096,
                     TabIn::Conversations(rows) => rows.len() * 512,
                     TabIn::Question { values, .. } => {
                         values.iter().map(|(k, v)| k.len() + v.len()).sum()
@@ -383,6 +411,15 @@ impl Live {
                             .into_iter()
                             .collect();
                         (effects, None)
+                    }
+                    TabIn::EditQueued(input, reply) => {
+                        if let Ok((text, effects)) = self.page.client.edit_queued(input) {
+                            reply.send(Some(text));
+                            (effects, None)
+                        } else {
+                            reply.send(None);
+                            (Vec::new(), None)
+                        }
                     }
                     TabIn::Client(event) => (self.page.client.step(event), None),
                     TabIn::Line(text, reply) => (self.page.line(&text), Some(reply)),
