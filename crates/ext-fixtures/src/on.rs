@@ -18,7 +18,9 @@ impl Extension for Fixtures {
     const VERSION: u32 = 1;
 
     fn contribute(&self, r: &mut Registrar) {
-        r.provide::<dyn ext::SideProvider>(std::sync::Arc::new(Fixtures));
+        if std::env::var("A_FIXTURE_SIDE_PROVIDER").as_deref() != Ok("off") {
+            r.provide::<dyn ext::SideProvider>(std::sync::Arc::new(Fixtures));
+        }
         r.tool(Sleep)
             .query(Said)
             .agent(crate::ECHO, || Box::new(Echo));
@@ -193,15 +195,44 @@ impl ext::SideProvider for Fixtures {
     fn reply<'a>(
         &'a self,
         side: &'a ext::ModelTurn,
-        _: &'a llm::Messages,
+        messages: &'a llm::Messages,
     ) -> ext::BoxFuture<'a, Result<llm::Response, llm::Error>> {
         Box::pin(async move {
+            // Explicit naming instructions let real clients exercise unusable
+            // replies and transport failures without contacting a provider.
+            let text = messages
+                .iter()
+                .rev()
+                .find_map(|message| match message {
+                    llm::Message::User(user) => Some(user),
+                    _ => None,
+                })
+                .and_then(|user| {
+                    user.content.iter().find_map(|part| {
+                        let llm::UserPart::Text(text) = part else {
+                            return None;
+                        };
+                        text.text
+                            .split_once("Naming instructions: fixture:title:")
+                            .map(|(_, text)| text.to_owned())
+                    })
+                })
+                .unwrap_or_else(|| format!("fixture {}", side.thread.purpose));
+            if text == "error" {
+                return Err(llm::Error::new(
+                    llm::Kind::Other,
+                    "fixture title generation failed",
+                ));
+            }
+            let text = match text.as_str() {
+                "empty" => "",
+                "whitespace" => " \t\n ",
+                "quotes" => " \"\" ",
+                text => text,
+            };
             Ok(llm::Response {
                 message: llm::Assistant {
-                    content: vec![llm::AssistantPart::Text(llm::Text::new(format!(
-                        "fixture {}",
-                        side.thread.purpose
-                    )))],
+                    content: vec![llm::AssistantPart::Text(llm::Text::new(text))],
                     origin: None,
                 },
                 finish: llm::Finish::new(llm::Reason::Stop, None),

@@ -36,6 +36,18 @@ REPL changes only console output/encoding, preserving cooked input. A
 redirected side stays byte-oriented. Guards and panic hooks restore modes
 and code pages; termination restores them even if screen cleanup times out.
 
+The terminal window title follows the viewed conversation's title, including
+live renames and conversation switches, with `a` until a title exists. Titles
+are written with OSC 2 after removing control characters, and only when they
+change. Both viewports save and restore the previous window title through the
+XTWINOPS title stack on terminals that support it. Normal exit, suspension,
+panic and signal cleanup share the same restoration path.
+
+`/title` asks the fast model to name the conversation; an argument supplies
+naming instructions. A failed generation or an empty or quote-only answer
+shows an error and keeps the previous projected title. It also works before
+the first user turn; a request during a turn follows command admission.
+
 ## What it shows
 
 Everything comes from the shared reducer, `protocol::view::SessionView`:

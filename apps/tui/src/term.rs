@@ -154,10 +154,39 @@ pub const LEAVE_FULL: &[u8] = b"\x1b[?1006l\x1b[?1000l\x1b[?1049l";
 
 /// The viewport we hold the terminal for and its mode before: a panic hook
 /// and the input thread restore it too.
-static HELD: Mutex<Option<(Viewport, RawMode)>> = Mutex::new(None);
+struct Held {
+    viewport: Viewport,
+    cooked: RawMode,
+    title_saved: bool,
+}
+
+static HELD: Mutex<Option<Held>> = Mutex::new(None);
 
 pub struct Terminal {
     viewport: Viewport,
+    title: TerminalTitle,
+}
+
+#[derive(Default)]
+struct TerminalTitle(Option<String>);
+
+impl TerminalTitle {
+    fn write(&mut self, out: &mut impl Write, title: Option<&str>) -> io::Result<()> {
+        let title: String = title
+            .unwrap_or("a")
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect();
+        let title = title.trim();
+        let title = if title.is_empty() { "a" } else { title };
+        if self.0.as_deref() == Some(title) {
+            return Ok(());
+        }
+        write!(out, "\x1b]2;{title}\x1b\\")?;
+        out.flush()?;
+        self.0 = Some(title.to_owned());
+        Ok(())
+    }
 }
 
 impl Terminal {
@@ -174,18 +203,40 @@ impl Terminal {
                 previous(info);
             }));
         });
-        *HELD.lock().unwrap_or_else(PoisonError::into_inner) = Some((viewport, cooked));
-        Ok(Self { viewport })
+        *HELD.lock().unwrap_or_else(PoisonError::into_inner) = Some(Held {
+            viewport,
+            cooked,
+            title_saved: false,
+        });
+        Ok(Self {
+            viewport,
+            title: TerminalTitle::default(),
+        })
     }
 
-    pub fn show(&self) -> io::Result<()> {
+    pub fn show(&mut self) -> io::Result<()> {
+        self.title = TerminalTitle::default();
         let mut out = sys::terminal::Stdout::default();
+        // XTWINOPS saves only the window title, leaving the icon title alone.
+        let mut held = HELD.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(held) = held.as_mut()
+            && !held.title_saved
+        {
+            out.write_all(b"\x1b[22;2t")?;
+            held.title_saved = true;
+        }
+        drop(held);
         if self.viewport == Viewport::Full {
             out.write_all(ENTER_FULL)?;
         }
         out.write_all(ENTER)?;
         out.flush()?;
         Ok(())
+    }
+
+    pub fn title(&mut self, title: Option<&str>) -> io::Result<()> {
+        self.title
+            .write(&mut sys::terminal::Stdout::default(), title)
     }
 }
 
@@ -198,7 +249,7 @@ pub fn suspend() -> io::Result<()> {
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .as_ref()
-        .map(|(viewport, _)| *viewport);
+        .map(|held| held.viewport);
     if let Some(viewport) = viewport {
         restore();
         sys::terminal::suspend()?;
@@ -218,13 +269,21 @@ impl Drop for Terminal {
 /// terminal that reads them.
 fn restore() {
     let held = HELD.lock().unwrap_or_else(PoisonError::into_inner).take();
-    if let Some((viewport, cooked)) = held {
+    if let Some(Held {
+        viewport,
+        cooked,
+        title_saved,
+    }) = held
+    {
         let _output = sys::terminal::OutputGuard::enter();
         let _ = cooked.restore_input();
         let mut out = sys::terminal::Stdout::restoring();
         let _ = out.write_all(LEAVE);
         if viewport == Viewport::Full {
             let _ = out.write_all(LEAVE_FULL);
+        }
+        if title_saved {
+            let _ = out.write_all(b"\x1b[23;2t");
         }
         let _ = out.write_all(b"\x1b[?25h");
         if viewport == Viewport::Inline {
@@ -337,6 +396,23 @@ fn send_input(tx: &client::Post<Event>, control: &Control, input: super::keys::I
 mod tests {
     use super::super::keys::{Input as KeyInput, Key};
     use super::*;
+
+    #[test]
+    fn terminal_titles_strip_controls_and_write_only_when_changed() {
+        let mut title = TerminalTitle::default();
+        let mut output = Vec::new();
+        title.write(&mut output, None).unwrap();
+        title.write(&mut output, None).unwrap();
+        title
+            .write(&mut output, Some("  Fix\nparser\x07\x1b\u{009c}  "))
+            .unwrap();
+        title.write(&mut output, Some("Fixparser")).unwrap();
+        title.write(&mut output, Some("\x1b\x07")).unwrap();
+        assert_eq!(
+            output,
+            b"\x1b]2;a\x1b\\\x1b]2;Fixparser\x1b\\\x1b]2;a\x1b\\"
+        );
+    }
 
     #[test]
     fn native_console_batches_preserve_vt_keys_and_pastes() {

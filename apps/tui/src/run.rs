@@ -403,6 +403,8 @@ impl Client {
                     self.screen.draw(&mut self.app, term::size()?)
                 })
             };
+            let drawn =
+                drawn.and_then(|()| self.terminal.title(self.app.client.view().side("title")));
             match drawn {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     self.screen.invalidate();

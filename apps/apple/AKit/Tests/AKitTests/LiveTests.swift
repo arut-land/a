@@ -376,3 +376,35 @@ func conversation_store_keeps_children_after_paging_and_stops_them_through_the_s
     await transcript.detach()
     await parent.detach()
 }
+
+@Test(.enabled(if: live != nil))
+func conversation_titles_follow_live_updates_and_reattachment() async throws {
+    let client = try Client(helper: live!)
+    let workspace = FileManager.default.temporaryDirectory.appending(path: "akit-titles-\(UUID())")
+    try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: workspace) }
+    let store = SessionStore(session: Session(client: client))
+    store.open(.new(workspace: workspace.path))
+    try await eventually("untitled session attached") { store.link == .live }
+    #expect(store.title == nil)
+    let id = try #require(store.sessionId)
+    _ = try await store.submit("/title fixture:title:Mac conversation")
+    try await eventually("title update used by the window") { store.title == "Mac conversation" }
+    _ = try await store.submit("/title fixture:title:quotes")
+    try await eventually("empty title rejected") {
+        store.items.contains { $0.presentation.body?.text.contains("Title was not changed:") == true }
+    }
+    #expect(store.title == "Mac conversation")
+    await store.detach()
+    let other = SessionStore(session: Session(client: client))
+    other.open(.new(workspace: workspace.path))
+    try await eventually("new conversation has no title") { other.link == .live }
+    #expect(other.title == nil && other.sessionId != id)
+    let reopened = SessionStore(session: Session(client: client))
+    reopened.open(.id(id: id))
+    try await eventually("original conversation title restored") {
+        reopened.link == .live && reopened.title == "Mac conversation"
+    }
+    await reopened.detach()
+    await other.detach()
+}

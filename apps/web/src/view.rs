@@ -28,7 +28,7 @@ fn document<'a, R: Renderable>(title: &'a str, children: &R) -> impl Renderable 
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
-                title { (title) }
+                title #document-title { (title) }
                 script type="module" src=(http::SCRIPT_PATH) {}
             }
             body style=(style::BODY) { (children) }
@@ -82,9 +82,8 @@ pub fn sessions_page(listed: &Result<Vec<SessionSummary>, String>) -> String {
 /// A chat page for browser tab `tab`: its transcript arrives over the
 /// tab's event stream, and what the tab sends names the tab.
 pub fn chat_page(session: SessionId, tab: &str) -> String {
-    let title = format!("a · {}", session.short());
     html(maud! {
-        Document title=(&title) {
+        Document title="a" {
             header style=(style::BAR) data-signals={ "{tab: '" (tab) "', draft: '', admitted: false}" } {
                 a style=(style::BRAND) href="/" { "← a" }
                 span style=(style::MONO) { (format_args!("{}", session.short())) }
@@ -223,6 +222,12 @@ pub fn conversation_list(
             p #conversation-hint style=(style::NOTE) { "↓ from an empty message to manage conversations" }
         }
     }
+}
+
+/// The browser tab follows the same projected title as the page bar.
+#[component]
+pub fn document_title<'a>(title: Option<&'a str>) -> impl Renderable {
+    maud! { title #document-title { (title.unwrap_or("a")) } }
 }
 
 /// The session's title, once its model named it.

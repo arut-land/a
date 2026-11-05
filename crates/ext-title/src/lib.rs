@@ -67,10 +67,15 @@ impl Tool for Rename {
         } else {
             format!("{TITLE}\nNaming instructions: {}", args.args)
         };
-        title(prompt)
+        let reply = title(prompt)
             .ask(cx)
             .await
-            .map(|reply| reply.message.text())
-            .map_err(|error| error.to_string())
+            .map_err(|error| format!("Title was not changed: {error}"))?;
+        let text = reply.message.text();
+        let text = text.trim().trim_matches('"').trim();
+        if text.is_empty() {
+            return Err("Title was not changed: the model returned an empty title.".into());
+        }
+        Ok(text.to_owned())
     }
 }

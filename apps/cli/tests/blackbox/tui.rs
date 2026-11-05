@@ -289,3 +289,227 @@ fn suspension_and_termination_restore_a_terminal_that_does_not_drain() {
     assert_eq!(term.wait().signal(), Some(Signal::TERM.as_raw()));
     assert!(term.cooked());
 }
+
+#[test]
+fn an_empty_title_reports_failure_and_preserves_the_previous_title() {
+    rejected_title("empty");
+}
+
+#[test]
+fn a_whitespace_title_reports_failure_and_preserves_the_previous_title() {
+    rejected_title("whitespace");
+}
+
+#[test]
+fn a_quote_only_title_reports_failure_and_preserves_the_previous_title() {
+    rejected_title("quotes");
+}
+
+#[test]
+fn title_generation_errors_are_visible_and_preserve_the_previous_title() {
+    rejected_title("error");
+}
+
+fn rejected_title(reply: &str) {
+    let env = Env::new("tui-title-failure");
+    env.ext("retry", "attempts = 0\ntransport = 0");
+    let mut term = env.tty(&[], 120, 40);
+    term.wait_for("● live");
+    term.send(b"/title fixture:title:Previous title\r");
+    term.wait_for("⎿  Previous title");
+    crate::common::wait_for("previous terminal title", || {
+        term.bytes()
+            .windows(b"\x1b]2;Previous title\x1b\\".len())
+            .any(|w| w == b"\x1b]2;Previous title\x1b\\")
+    });
+    term.send(format!("/title fixture:title:{reply}\r").as_bytes());
+    let screen = term.wait_for("Title was not changed:");
+    assert!(
+        screen.text().contains(if reply == "error" {
+            "fixture title generation failed"
+        } else {
+            "the model returned an empty title"
+        }),
+        "{}",
+        screen.text()
+    );
+    term.send(b"\x04");
+    assert!(term.wait().success());
+    let bytes = term.bytes();
+    let titles: Vec<_> = bytes
+        .split(|b| *b == 0x1b)
+        .filter(|part| part.starts_with(b"]2;"))
+        .collect();
+    assert_eq!(
+        titles,
+        [b"]2;a".as_slice(), b"]2;Previous title".as_slice()]
+    );
+}
+
+#[test]
+fn a_title_without_a_provider_explains_why_it_was_not_changed() {
+    unavailable_title(None);
+}
+
+#[test]
+fn terminal_titles_follow_early_and_repeated_requests_and_restore_in_both_viewports() {
+    for viewport in ["full", "inline"] {
+        let mut env = Env::new("tui-title-lifecycle");
+        env.vars.push(("A_TUI", viewport));
+        let mut term = env.tty(&[], 120, 40);
+        term.wait_for("● live");
+        // No user turn has run yet.
+        term.send(b"/title\r");
+        term.wait_for("⎿  fixture title");
+        term.send(b"/title fixture:title:Named conversation\r");
+        term.wait_for("⎿  Named conversation");
+        term.send(b"/title\r");
+        crate::common::wait_for("regenerated title", || {
+            String::from_utf8_lossy(&term.bytes())
+                .matches("\x1b]2;fixture title\x1b\\")
+                .count()
+                == 2
+        });
+        term.send(b"\x04");
+        assert!(term.wait().success());
+        let bytes = term.bytes();
+        let text = String::from_utf8_lossy(&bytes);
+        assert_eq!(text.matches("\x1b[22;2t").count(), 1);
+        assert_eq!(text.matches("\x1b[23;2t").count(), 1);
+        let titles: Vec<_> = text
+            .split('\x1b')
+            .filter(|s| s.starts_with("]2;"))
+            .collect();
+        assert_eq!(
+            titles,
+            [
+                "]2;a",
+                "]2;fixture title",
+                "]2;Named conversation",
+                "]2;fixture title"
+            ]
+        );
+        assert!(term.cooked());
+    }
+}
+
+#[test]
+fn a_title_requested_during_a_turn_eventually_changes_the_terminal_title() {
+    let env = Env::new("tui-title-running");
+    let mut term = env.tty(&[], 120, 40);
+    term.wait_for("● live");
+    term.send(b"sleep 1\r");
+    term.wait_for("Working…");
+    term.send(b"/title fixture:title:While running\r");
+    term.wait_for("⎿  While running");
+    term.send(b"\x04");
+    assert!(term.wait().success());
+    assert!(String::from_utf8_lossy(&term.bytes()).contains("\x1b]2;While running\x1b\\"));
+}
+
+#[test]
+fn termination_restores_the_saved_terminal_title_in_both_viewports() {
+    for viewport in ["full", "inline"] {
+        let mut env = Env::new("tui-title-signal");
+        env.vars.push(("A_TUI", viewport));
+        let mut term = env.tty(&[], 100, 30);
+        term.wait_for("● live");
+        kill_process(Pid::from_child(&term.child), Signal::TERM).unwrap();
+        assert_eq!(term.wait().signal(), Some(libc::SIGTERM));
+        let bytes = term.bytes();
+        let text = String::from_utf8_lossy(&bytes);
+        assert_eq!(text.matches("\x1b[22;2t").count(), 1);
+        assert_eq!(text.matches("\x1b[23;2t").count(), 1);
+        assert!(term.cooked());
+    }
+}
+
+#[test]
+fn switching_the_viewed_conversation_changes_the_terminal_title() {
+    for viewport in ["full", "inline"] {
+        let mut env = Env::new("tui-title-switch");
+        env.vars.push(("A_TUI", viewport));
+        let mut term = env.tty(&[], 120, 40);
+        term.wait_for("● live");
+        term.send(b"/title fixture:title:Parent title\r");
+        term.wait_for("⎿  Parent title");
+        term.send(b"call background_task {\"prompt\":\"child greeting\",\"messages\":[]}\r");
+        term.wait_for("child greeting");
+        term.wait_until("child in the conversation switcher", |screen| {
+            screen.text().contains("agent main") && screen.text().contains("echo child greeting")
+        });
+        term.send(b"\x1b[B\x1b[B\r");
+        term.wait_for("Message @");
+        term.send(b"/title fixture:title:Child title\r");
+        term.wait_for("⎿  Child title");
+        term.send(b"\x1b[B\r");
+        crate::common::wait_for("parent terminal title after switching back", || {
+            String::from_utf8_lossy(&term.bytes())
+                .matches("\x1b]2;Parent title\x1b\\")
+                .count()
+                == 2
+        });
+        term.send(b"\x04");
+        assert!(term.wait().success());
+        let bytes = term.bytes();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("\x1b]2;Child title\x1b\\"));
+        assert_eq!(text.matches("\x1b[22;2t").count(), 1);
+        assert_eq!(text.matches("\x1b[23;2t").count(), 1);
+    }
+}
+
+#[test]
+fn a_title_without_a_resolvable_model_explains_why_it_was_not_changed() {
+    unavailable_title(Some("openai:"));
+}
+
+fn unavailable_title(model: Option<&str>) {
+    let env = Env::new("tui-title-unavailable");
+    if let Some(model) = model {
+        let config = env.home.config_file();
+        fs::write(
+            &config,
+            format!(
+                "fast_model = {model:?}\n{}",
+                fs::read_to_string(&config).unwrap()
+            ),
+        )
+        .unwrap();
+    }
+    env.ext("retry", "attempts = 0\ntransport = 0");
+    // Bootstrap clears client variables; start this owned foreground daemon
+    // explicitly so its fixture transport can be disabled.
+    let mut daemon = title_command(&env, &["__daemon"])
+        .env("A_FIXTURE_SIDE_PROVIDER", "off")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    crate::common::wait_for("fixture daemon", || env.pid().is_some());
+    let mut term = Env::tty_of(title_command(&env, &[]), 120, 40);
+    term.wait_for("● live");
+    term.send(b"/title\r");
+    term.wait_for("Title was not changed:");
+    if model.is_some() {
+        term.wait_for("names no model");
+    }
+    term.send(b"\x04");
+    assert!(term.wait().success());
+    env.run(&["daemon", "stop"]);
+    assert!(daemon.wait().unwrap().success());
+}
+
+fn title_command(env: &Env, args: &[&str]) -> std::process::Command {
+    let mut command = env.cmd(args);
+    command
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap())
+        .env("HOME", env.root.join("user"))
+        .env("A_HOME", env.home.root())
+        .env("OPENAI_API_KEY", "loopback-dummy")
+        .env("OPENAI_BASE_URL", "http://127.0.0.1:1/v1")
+        .env("NO_PROXY", "127.0.0.1,localhost");
+    command
+}

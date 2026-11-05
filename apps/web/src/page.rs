@@ -342,8 +342,10 @@ impl Page {
         let title = self.client.view().side("title");
         if title != self.titled.as_deref() {
             let span = html(TitleSpan { title });
+            let document_title = html(view::DocumentTitle { title });
             self.titled = title.map(str::to_owned);
             self.patch(&Patch::Replace(&span));
+            self.patch(&Patch::Replace(&document_title));
         }
     }
 
@@ -1148,7 +1150,7 @@ mod tests {
     }
 
     #[test]
-    fn a_titling_reply_titles_the_bar_and_not_the_transcript() {
+    fn a_titling_reply_titles_the_bar_and_browser_tab_without_entering_the_transcript() {
         let mut page = synced();
         assert!(!page.title_dirty);
         let [call, result] = title(2, "Greeting <you>");
@@ -1165,7 +1167,11 @@ mod tests {
         let titled = events(&mut page);
         let title = "data: elements <span id=\"title\"";
         let shown: Vec<_> = titled.iter().filter(|e| e.contains("Greeting")).collect();
-        assert_eq!(shown.len(), 1, "{titled:?}");
+        assert_eq!(shown.len(), 2, "{titled:?}");
+        assert!(
+            shown[1].contains("<title id=\"document-title\">Greeting &lt;you&gt;</title>"),
+            "{titled:?}"
+        );
         assert!(
             shown[0].contains(title) && shown[0].contains("Greeting &lt;you&gt;"),
             "{titled:?}"
@@ -1305,10 +1311,16 @@ mod tests {
         ]);
         assert_eq!(page.titled, None);
         assert!(!page.title_dirty);
+        let patches = events(&mut page);
         assert!(
-            events(&mut page)
+            patches
                 .iter()
                 .any(|e| e.contains("id=\"title\"") && !e.contains("Old"))
+        );
+        assert!(
+            patches
+                .iter()
+                .any(|e| e.contains("<title id=\"document-title\">a</title>"))
         );
     }
 
