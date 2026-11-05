@@ -9,10 +9,6 @@ cargo.binstall_only = false
 # Tool versions resolve through mise.lock, checksums included.
 lockfile = true
 
-[env]
-# Local secrets (gitignored), e.g. OPENAI_API_KEY and OPENAI_BASE_URL.
-_.file = { path = ".env.local", redact = true }
-
 [task_config]
 # Git Bash on Windows, so task scripts are the same everywhere.
 shell = "bash -o errexit -o pipefail -c"
@@ -134,15 +130,15 @@ done
 # picks its module by name. The M1 acceptance tests on the dev build:
 acceptance = "cargo nextest run -p a --test blackbox -E 'test(/^(acceptance|daemon_acceptance)::/)' --no-tests=fail"
 # `a web` on the dev build against an isolated home (target/web-home) and
-# the model-backed agent, with the keys .env.local gives its sessions
+# the model-backed agent; only this task and apple:run load .env.local
 # (`[daemon]` `agent = "echo"` in its config.toml for none); its daemon
 # stops with it.
-web = '''
+web = { env = { _.file = { path = ".env.local", redact = true } }, run = '''
 cargo build -p a --features fixtures
 export A_HOME=$PWD/target/web-home
 trap 'target/debug/a daemon stop >/dev/null' EXIT
 target/debug/a web
-'''
+''' }
 # The black-box web UI tests (apps/cli/tests/blackbox/web.rs) on the dev build.
 "test:web" = { run = [
     "node apps/web/test-browser.mjs",
@@ -208,4 +204,4 @@ swift test --package-path apps/apple/AKit
 # In the foreground, with this shell's environment (and .env.local's keys):
 # `A_HOME=... mise run apple:run` gives the app and the daemon it starts
 # their own home.
-"apple:run" = { depends = ["apple:build"], run = "apps/apple/build/Build/Products/Debug/A.app/Contents/MacOS/A" }
+"apple:run" = { depends = ["apple:build"], env = { _.file = { path = ".env.local", redact = true } }, run = "apps/apple/build/Build/Products/Debug/A.app/Contents/MacOS/A" }
