@@ -10,9 +10,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: windows-latest
-            package: tui
-            test: agent_switching_and_stopping_work_in_both_terminal_buffers
           - os: macos-latest
             package: engine
             test: the_supervisor_sleeps_until_a_deadline_and_never_polls
@@ -35,11 +32,13 @@ jobs:
           channel=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
           echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
           rustup toolchain install "$channel" --profile minimal --component rust-src,rustfmt,clippy
+          mkdir -p "$RUNNER_TEMP/test-flakes-bin"
+          echo "$RUNNER_TEMP/test-flakes-bin" >> "$GITHUB_PATH"
           if [[ "$RUNNER_OS" == Windows ]]; then
             curl --fail --location --output "$RUNNER_TEMP/nextest.zip" https://get.nexte.st/0.9.148/windows
-            powershell -NoProfile -Command 'Expand-Archive -Path "$env:RUNNER_TEMP/nextest.zip" -DestinationPath "$env:USERPROFILE/.cargo/bin" -Force'
+            powershell -NoProfile -Command 'Expand-Archive -Path "$env:RUNNER_TEMP/nextest.zip" -DestinationPath "$env:RUNNER_TEMP/test-flakes-bin" -Force'
           else
-            curl --fail --location https://get.nexte.st/0.9.148/mac | tar xz -C "$HOME/.cargo/bin"
+            curl --fail --location https://get.nexte.st/0.9.148/mac | tar xz -C "$RUNNER_TEMP/test-flakes-bin"
           fi
       - name: 200 consecutive runs
         env:
