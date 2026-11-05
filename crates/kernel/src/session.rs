@@ -1964,7 +1964,8 @@ impl Core {
         // Settled with something new since it last reported (one given no
         // input yet has not run).
         let settled = self.turn == Turn::Idle && !queued && !armed && !outgoing && !background;
-        let ran = ledger.turn_start().is_some();
+        let ran = ledger.turn_start().is_some()
+            || (matches!(ledger.run(), RunId::Resumed(_)) && ledger.result().is_some());
         if self.child {
             for (run, outcome) in ledger.prior_runs() {
                 if self.reported_runs.insert(run) {

@@ -7,6 +7,22 @@ import Testing
 
 @Suite(.serialized)
 struct NativeTranscriptTests {
+    @Test @MainActor
+    func successful_withdrawals_preserve_newer_drafts_and_session_identity() {
+        let drafts = ComposerDrafts()
+        let pending = drafts.begin(session: "child", draft: "existing draft")
+        drafts.changed()
+        #expect(drafts.complete(pending, text: "withdrawn", session: "child", draft: "newer draft") == nil)
+        #expect(drafts.saved.map(\.text) == ["withdrawn"])
+        #expect(drafts.restore(0, draft: "newer draft", session: "child") == "withdrawn")
+        #expect(drafts.saved.map(\.text) == ["newer draft"])
+        let oldSession = drafts.begin(session: "child", draft: "")
+        #expect(drafts.complete(oldSession, text: "child text", session: "parent", draft: "") == nil)
+        let unchanged = drafts.begin(session: "parent", draft: "displaced draft")
+        #expect(drafts.complete(unchanged, text: "recalled", session: "parent", draft: "displaced draft") == "recalled")
+        #expect(drafts.saved.contains { $0.text == "displaced draft" && $0.session == "parent" })
+    }
+
     @Test
     func streaming_growth_remeasures_only_the_reply_and_preserves_viewport_pinning() async throws {
         let vector = try #require(Vector.all.first { $0.name == "retry replaces streamed text at every length" })

@@ -267,6 +267,12 @@ impl Actor {
                 }
             }
         }
+        let freed = entries.iter().any(|entry| {
+            matches!(
+                entry.body,
+                Body::Take { .. } | Body::Withdraw { .. } | Body::Interrupt { .. }
+            )
+        });
         let frames = Arc::clone(&self.live.frames);
         let indexed = frames.history.is_indexed();
         let publish = move || {
@@ -290,6 +296,9 @@ impl Actor {
             .await;
         } else {
             publish();
+        }
+        if freed {
+            self.live.session.inbox_space.notify();
         }
         self.live.shown();
         lock(&self.live.followers).retain(|c| c.wake().is_ok());

@@ -289,6 +289,37 @@ fn an_unavailable_parent_settles_the_resume_without_running_queued_work() {
     }
 }
 
+#[test]
+fn withdrawing_an_unexecuted_resume_reports_cancellation_for_that_run_after_replay() {
+    let (mut s, envelope) = pending_resume();
+    let input = envelope.id().call.0;
+    s.step(kernel::Event::Withdraw {
+        input,
+        origin: None,
+        ticket: None,
+    });
+    let load = Load {
+        session: Some(envelope.id().sender),
+        parent: Some(envelope.destination),
+        owner: Owner::Present,
+        ..Load::default()
+    };
+    let (mut restarted, _) = Session::resume(Reg::echo().arc(), s.log, &load);
+    let fx = restarted.step(kernel::Event::Delivered {
+        id: envelope.id().clone(),
+        recipient: envelope.destination,
+        result: Ok(()),
+        ticket: None,
+    });
+    assert!(work(&fx).any(|work| matches!(work, Work::Report { run: protocol::RunId::Resumed(run), outcome: Outcome::Interrupted { .. } } if *run == input)), "{fx:?}");
+    assert!(
+        !restarted
+            .log
+            .iter()
+            .any(|entry| matches!(&entry.body, Body::Assistant { text } if text == "resumed"))
+    );
+}
+
 fn resume(
     reg: Reg,
     bodies: impl IntoIterator<Item = Body>,

@@ -434,3 +434,8 @@ A state-only Continue prompt uses `{"continue":"proceed"}` (or `"decline"` /
 `"cancel"` inside that response). Batches support a separate response for each
 prompt. Client disconnect leaves questions open. Explicit Cancel is an answer; Stop
 is an interrupt. Opening a URL is local and never submits an answer.
+
+Web and native composers keep a revision and session identity for pending queue
+edits. A successful withdrawal recalls text only if the draft is unchanged;
+otherwise Restore draft retains it without replacing newer text. Recalling
+also retains a displaced nonempty draft.

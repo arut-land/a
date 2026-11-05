@@ -42,6 +42,8 @@ public enum AttachmentState: Equatable {
 /// A session view follows numbered Rust updates; gaps require resynchronization.
 @Observable
 public final class SessionStore {
+    let composerDrafts = ComposerDrafts()
+
     public private(set) var items: [DisplayItem] = []
     public private(set) var history: HistoryWindow?
     public private(set) var queuedInputs: [QueuedInput] = []

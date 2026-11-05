@@ -109,8 +109,9 @@ report cannot fire a resumed watch. Previous outcomes remain derivable from
 the child log and are reported again after restart; fired watches deduplicate
 them independently.
 
-A full parent inbox keeps the resume gated and retries notification after a
-short delay. A terminal refusal cancels the queued resume and records the
+A full parent inbox keeps the resume gated and waits for inbox capacity
+notifications. Stopping or withdrawing its remaining queued work ends the
+blocked notification without another delivery attempt. A terminal refusal cancels the queued resume and records the
 interrupt before settling the refusal. Stop during notification atomically
 discards its queued work in the interrupt fact. Notification can still settle,
 but acknowledgement or replay cannot execute the cancelled input.

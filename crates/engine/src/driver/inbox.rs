@@ -37,6 +37,7 @@ impl Actor {
             return;
         };
         self.transport_active = true;
+        let source = Arc::clone(&self.live);
         let session = Arc::clone(&self.live.session);
         let daemon = session.shared.daemon.upgrade();
         let fence = session.fence.load(super::Ordering::SeqCst);
@@ -49,27 +50,19 @@ impl Actor {
             |cancel| {
                 Box::pin(async move {
                     let (id, recipient) = (envelope.id().clone(), envelope.destination);
-                    let result = match daemon {
+                    let (result, stopped) = match daemon {
                         Some(daemon) => super::unless(&cancel, async {
-                            loop {
-                                let result = daemon.deliver(envelope.clone()).await;
-                                if result != Err(InboxRefusal::Full)
-                                    || envelope.payload() != &protocol::Carried::Resumed
-                                {
-                                    break result;
-                                }
-                                session
-                                    .shared
-                                    .rt
-                                    .sleep(std::time::Duration::from_millis(100))
-                                    .await;
+                            if envelope.payload() == &protocol::Carried::Resumed {
+                                resume_delivery(&daemon, &source, &envelope).await
+                            } else {
+                                (daemon.deliver(envelope).await, false)
                             }
                         })
                         .await
-                        .unwrap_or(Err(InboxRefusal::Interrupted)),
-                        None => Err(InboxRefusal::Unavailable),
+                        .unwrap_or((Err(InboxRefusal::Interrupted), false)),
+                        None => (Err(InboxRefusal::Unavailable), false),
                     };
-                    let message = if result == Err(InboxRefusal::Interrupted) {
+                    let message = if result == Err(InboxRefusal::Interrupted) && !stopped {
                         super::Completion::DeliveryLost { ticket }
                     } else {
                         super::Completion::Delivered {
@@ -136,5 +129,56 @@ impl CallPorts {
             self.origin.send(session, request);
             result.await.unwrap_or(Err(InboxRefusal::Interrupted))
         })
+    }
+}
+
+async fn resume_delivery(
+    daemon: &super::super::Daemon,
+    source: &Arc<Live>,
+    envelope: &Envelope,
+) -> (Result<(), InboxRefusal>, bool) {
+    let mut changed = source.session.changed.count();
+    loop {
+        let Some(slot) = daemon.slot(envelope.destination) else {
+            return (Err(InboxRefusal::Unavailable), false);
+        };
+        let Ok(recipient) = daemon.live(&slot).await else {
+            return (Err(InboxRefusal::Unavailable), false);
+        };
+        let mut space = recipient.session.inbox_space.count();
+        let result = recipient.enqueue(envelope.clone()).await;
+        if result != Err(InboxRefusal::Full) {
+            return (result, false);
+        }
+        loop {
+            let frames = Arc::clone(&source.frames);
+            let Ok(queued) = rt::unblock(&*source.session.shared.rt, move || {
+                frames
+                    .history
+                    .head_for(&frames, 0, &[])
+                    .map(|head| head.state.queued().next().is_some())
+            })
+            .await
+            else {
+                return (Err(InboxRefusal::Unavailable), false);
+            };
+            if !queued {
+                return (Err(InboxRefusal::Interrupted), true);
+            }
+            let capacity = rt::or(
+                async {
+                    recipient.session.inbox_space.changed(&mut space).await;
+                    true
+                },
+                async {
+                    source.session.changed.changed(&mut changed).await;
+                    false
+                },
+            )
+            .await;
+            if capacity {
+                break;
+            }
+        }
     }
 }

@@ -469,6 +469,7 @@ struct Session {
     /// ending, a job ending, the actor ending. What waits on the session
     /// waits here, never by polling.
     changed: rt::Notify,
+    inbox_space: rt::Notify,
     shared: Arc<Shared>,
 }
 
@@ -1553,6 +1554,7 @@ impl Actor {
             actor.run_actor(mail, first).await
         };
         ended.set();
+        session.inbox_space.notify();
         session.changed.notify();
         let retirement = session
             .shared
@@ -3417,6 +3419,10 @@ impl Live {
         rt::block_on(result).unwrap()
     }
 
+    pub(crate) fn changes(&self) -> u64 {
+        self.session.changed.count()
+    }
+
     /// Returns once the actor has taken every message sent before.
     pub fn barrier(&self) {
         let (done, taken) = oneshot::channel();
@@ -3541,6 +3547,7 @@ impl Session {
             adopting: Mutex::default(),
             work: Mutex::default(),
             changed: rt::Notify::new(),
+            inbox_space: rt::Notify::new(),
             shared: Arc::clone(shared),
         })
     }

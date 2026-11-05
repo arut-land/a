@@ -119,6 +119,31 @@ const composer = document.getElementById('composer');
 const links = () => [...document.querySelectorAll('[data-conversation]')];
 let rovingSession;
 let focusedSession;
+let composerRevision = 0;
+const savedDrafts = [];
+const draftList = document.createElement('div');
+composer.closest('form').after(draftList);
+const composingSession = () => location.pathname;
+composer.addEventListener('input', () => { composerRevision++; });
+function retainDraft(text, session) {
+  if (text && !savedDrafts.some(draft => draft.text === text && draft.session === session)) savedDrafts.push({text, session});
+  draftList.replaceChildren();
+  savedDrafts.forEach((draft, at) => {
+    if (draft.session !== composingSession()) return;
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = 'Restore draft: ' + draft.text;
+    button.addEventListener('click', () => {
+      savedDrafts.splice(at, 1);
+      retainDraft(composer.value, composingSession());
+      composer.value = draft.text;
+      composer.dispatchEvent(new Event('input', {bubbles: true}));
+      composer.focus();
+    });
+    draftList.append(button);
+  });
+}
+
 function rove(link) {
   rovingSession = link?.dataset.conversation;
   links().forEach(a => {
@@ -157,10 +182,17 @@ document.addEventListener('click', event => {
   if (edit) editQueued(edit.dataset.editQueued);
 });
 async function editQueued(input) {
+  const revision = composerRevision, session = composingSession(), draft = composer.value;
   const tab = document.querySelector('[data-signals]').getAttribute('data-signals').match(/tab: '([^']+)'/)[1];
   const response = await fetch('/api/queue/edit', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({tab, input: Number(input)})});
   if (!response.ok) return;
-  composer.value = await response.json();
+  const text = await response.json();
+  if (revision !== composerRevision || session !== composingSession() || draft !== composer.value) {
+    retainDraft(text, session);
+    return;
+  }
+  retainDraft(composer.value, session);
+  composer.value = text;
   composer.dispatchEvent(new Event('input', {bubbles: true}));
   focusedSession = undefined;
   composer.focus();

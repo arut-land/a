@@ -414,6 +414,8 @@ impl Ledger {
                         self.prior_runs.push((self.run, outcome.clone()));
                     }
                     self.run = RunId::Resumed(seq);
+                    self.result = None;
+                    self.turn = None;
                     self.resumption = Some((seq, *parent));
                 }
                 if *taken {
@@ -437,6 +439,9 @@ impl Ledger {
             }
             Body::Withdraw { input, .. } => {
                 self.untaken.retain(|q| q.seq != *input);
+                if self.run == RunId::Resumed(*input) && self.turn.is_none() {
+                    self.result = Some(ToolOutcome::Interrupted { output: None });
+                }
             }
             Body::Detached { call } => {
                 if let Some(Open {

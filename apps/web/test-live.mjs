@@ -68,9 +68,22 @@ try {
   assert.equal(await draft.inputValue(), 'queued child message', 'clicking the composer leaves picker focus and receives typing');
   await send.click();
   await page.locator('#queued-inputs').getByText('Queued: queued child message', {exact: false}).waitFor();
+  // a successful withdrawal never replaces text typed while confirmation is pending
+  await page.route('**/api/queue/edit', async route => {
+    const response = await route.fetch();
+    await draft.fill('newer draft while withdrawal waits');
+    await route.fulfill({response});
+  });
+  const edited = page.waitForResponse(response => response.url().endsWith('/api/queue/edit'));
   await page.locator('#queued-inputs').getByRole('button', {name: 'Edit', exact: true}).click();
-  await page.waitForFunction(() => document.querySelector('#composer').value === 'queued child message');
+  await (await edited).finished();
   await page.waitForFunction(() => !document.querySelector('[data-edit-queued]'));
+  assert.equal(await draft.inputValue(), 'newer draft while withdrawal waits', 'successful_withdrawals_never_overwrite_a_newer_composer_revision');
+  await page.unroute('**/api/queue/edit');
+  await page.getByRole('button', {name: 'Restore draft: queued child message', exact: true}).click();
+  assert.equal(await draft.inputValue(), 'queued child message');
+  await page.getByRole('button', {name: 'Restore draft: newer draft while withdrawal waits', exact: true}).click();
+  assert.equal(await draft.inputValue(), 'newer draft while withdrawal waits');
   await draft.fill('');
   await draft.press('ArrowDown');
   await page.keyboard.press('ArrowDown');
@@ -138,7 +151,7 @@ try {
   await page.getByRole('link', {name: '← Back to parent'}).click();
   await page.waitForFunction(id => !document.querySelector(`[data-conversation="${id}"]`), expiredChild);
   await page.locator(`#transcript a[href="/s/${expiredChild}"]`).click();
-  await draft.fill('sleep 30');
+  await draft.fill('$ sleep 30');
   await send.click();
   await page.waitForFunction(id => document.querySelector(`[data-conversation="${id}"]`)?.dataset.stop === 'true', expiredChild);
   await page.locator(`#conversations [data-stop-conversation="${expiredChild}"]`).click();

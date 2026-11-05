@@ -3085,3 +3085,75 @@ fn import_cuts(
         store.import(header, &log[..cut]).unwrap();
     }
 }
+
+#[test]
+fn full_resume_inboxes_sleep_until_capacity_changes_and_stopped_resumes_stop_waiting() {
+    for stop in [false, true] {
+        let (root, home) = home("resume-capacity");
+        let config = Config {
+            ext: exts("[ext.policy]\nask = [\"bash\"]"),
+            ..echo()
+        };
+        let daemon = Daemon::load(&home, &config).unwrap();
+        let parent = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
+        parent.session().submit("spawn initial").unwrap();
+        settle(&daemon);
+        let child = daemon
+            .shared
+            .store
+            .headers()
+            .unwrap()
+            .into_iter()
+            .find(|header| header.parent.is_some())
+            .unwrap()
+            .id;
+        parent.session().submit("$ printf blocked").unwrap();
+        parent.session().wait("parent approval", PATIENCE, || {
+            parent.session().summary().activity == Activity::Approval
+        });
+        for n in 1..=protocol::INBOX_CAPACITY {
+            let envelope = protocol::Envelope::new(
+                protocol::EnvelopeId {
+                    sender: SessionId::new(),
+                    call: CallId::new(n as u64).unwrap(),
+                    purpose: "capacity-test".into(),
+                },
+                parent.session().id,
+                protocol::Carried::Message("queued".into()),
+                Vec::new(),
+            )
+            .unwrap();
+            assert_eq!(rt::block_on(parent.session().enqueue(envelope)), Ok(()));
+        }
+        let child = daemon.attach_to(&Target::Id(child), PathBuf::new).unwrap();
+        child.session().submit("resumed after capacity").unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        parent.session().barrier();
+        std::thread::sleep(Duration::from_millis(20));
+        let before = parent.session().changes();
+        std::thread::sleep(Duration::from_millis(350));
+        assert_eq!(
+            parent.session().changes(),
+            before,
+            "a full inbox must do zero work while blocked"
+        );
+        if stop {
+            child.session().interrupt();
+            child
+                .session()
+                .wait("stopped resume released", PATIENCE, || {
+                    child.session().summary().activity == Activity::Idle
+                });
+            assert!(!bodies(&*daemon.shared.store, child.session().id).iter().any(|body| matches!(body, Body::Assistant { text } if text == "resumed after capacity")));
+        }
+        parent.session().interrupt();
+        settle(&daemon);
+        if !stop {
+            assert!(bodies(&*daemon.shared.store, child.session().id).iter().any(|body| matches!(body, Body::Assistant { text } if text == "resumed after capacity")));
+        }
+        drop(child);
+        drop(parent);
+        drop(daemon);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
