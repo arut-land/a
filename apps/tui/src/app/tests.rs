@@ -76,12 +76,21 @@ struct Drawn {
 }
 
 /// Draws a frame, and checks it is what drawing it on a blank canvas gives:
-/// the rows kept from the frame before are the ones it would draw.
+/// the rows kept from the frame before are the ones it would draw. Both
+/// renders observe the same clocks, including when `height` composed first.
 fn frame(app: &mut App, w: u16, h: u16) -> (Drawn, Vec<String>) {
-    let caret = app.draw(w, h);
+    let time = app
+        .composed
+        .as_ref()
+        .map_or_else(super::draw::FrameTime::now, |frame| frame.time);
+    frame_at(app, w, h, time)
+}
+
+fn frame_at(app: &mut App, w: u16, h: u16, time: super::draw::FrameTime) -> (Drawn, Vec<String>) {
+    let caret = app.draw_at(w, h, time);
     let grid = app.canvas().grid().clone();
     let kept = std::mem::take(&mut app.canvas);
-    assert_eq!(app.draw(w, h), caret);
+    assert_eq!(app.draw_at(w, h, time), caret);
     assert_eq!(app.canvas().grid(), &grid, "kept rows are stale");
     app.canvas = kept;
     let rows = grid.rows();
@@ -2402,7 +2411,16 @@ fn agent_switching_and_stopping_work_in_both_terminal_buffers() {
         assert!(app.input(Input::Key(Key::Down)).is_none());
         assert_eq!(app.conversation_at, Some(0));
         app.input(Input::Key(Key::Down));
-        let (_, lines) = frame(&mut app, 120, 40);
+        let mut time = super::draw::FrameTime::now();
+        for (unix_ms, detail) in [(1999, "running · 0s"), (2000, "running · 1s")] {
+            time.unix_ms = unix_ms;
+            let (_, lines) = frame_at(&mut app, 120, 40, time);
+            assert!(
+                lines.iter().any(|line| line.contains(detail)),
+                "{viewport:?}: {lines:?}"
+            );
+        }
+        let (_, lines) = frame_at(&mut app, 120, 40, time);
         assert!(
             lines.iter().any(|line| line.contains("Check rendering")),
             "{viewport:?}: {lines:?}"

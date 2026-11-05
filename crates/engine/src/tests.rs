@@ -946,50 +946,22 @@ impl rt::EventSink for Recorder {
 fn the_supervisor_sleeps_until_a_deadline_and_never_polls() {
     use super::{EVENTS, Exit, Lifecycle};
     use std::future::Future;
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Waker};
-
-    struct Timers(rt::Threads, Mutex<Vec<Duration>>, Instant);
-    impl rt::Runtime for Timers {
-        fn spawn(&self, task: rt::BoxFuture<'static, ()>) {
-            self.0.spawn(task);
-        }
-        fn spawn_blocking(
-            &self,
-            class: rt::BlockingClass,
-            bytes: usize,
-            work: Box<dyn FnOnce() + Send>,
-        ) -> rt::BoxFuture<'static, std::io::Result<()>> {
-            self.0.spawn_blocking(class, bytes, work)
-        }
-        fn spawn_flush(
-            &self,
-            work: Box<dyn FnOnce() + Send>,
-        ) -> rt::BoxFuture<'static, std::io::Result<()>> {
-            self.0.spawn_flush(work)
-        }
-        fn reactor(&self) -> rt::Reactor {
-            self.0.reactor()
-        }
-        fn sleep(&self, duration: Duration) -> rt::BoxFuture<'static, ()> {
-            super::lock(&self.1).push(duration);
-            Box::pin(std::future::pending())
-        }
-        fn now(&self) -> Instant {
-            self.2
-        }
-    }
 
     let (root, home) = home("supervise");
     let config = Config {
         idle: Duration::from_secs(3600),
         ..echo()
     };
-    let runtime = Arc::new(Timers(
-        rt::Threads::default(),
-        Mutex::new(Vec::new()),
-        Instant::now(),
-    ));
+    let runtime = Arc::new(SupervisorRuntime {
+        runtime: rt::Threads::default(),
+        deadlines: Mutex::new(Vec::new()),
+        now: Instant::now(),
+        machine: Mutex::new(None),
+        blocking: AtomicUsize::new(0),
+    });
     let daemon = Daemon::load_on(&home, &config, &runtime, Vec::new()).unwrap();
     let listener = home.bind().unwrap();
     let exit = Exit {
@@ -1022,7 +994,7 @@ fn the_supervisor_sleeps_until_a_deadline_and_never_polls() {
         daemon.jobs.notify();
         assert!(supervisor.as_mut().poll(&mut cx).is_pending());
         assert_eq!(EVENTS.count("wake") - before, 4);
-        assert_eq!(*super::lock(&runtime.1), [config.idle; 4]);
+        assert_eq!(*super::lock(&runtime.deadlines), [config.idle; 4]);
     }
     {
         // Neither a daemon the OS starts at login nor one still asking
@@ -1035,17 +1007,75 @@ fn the_supervisor_sleeps_until_a_deadline_and_never_polls() {
             listener: sys::handover::Endpoint::of(&listener),
         };
         drop(listener);
-        super::lock(&runtime.1).clear();
+        super::lock(&runtime.deadlines).clear();
         let idling = super::Idling::new(super::Idling::ASKING);
         let mut supervisor = std::pin::pin!(daemon.supervise(&life, &config, exit, &idling, None));
         let mut cx = Context::from_waker(Waker::noop());
         assert!(supervisor.as_mut().poll(&mut cx).is_pending());
         idling.answer(true);
         assert!(supervisor.as_mut().poll(&mut cx).is_pending());
-        assert!(super::lock(&runtime.1).is_empty());
+        assert!(super::lock(&runtime.deadlines).is_empty());
     }
+    {
+        let blocking = runtime.blocking.load(Relaxed);
+        let mut shutdown = std::pin::pin!(daemon.shutdown());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(shutdown.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(
+            runtime.blocking.load(Relaxed),
+            blocking,
+            "shutdown must await initialization before cleaning the catalog"
+        );
+        assert!(daemon.machine.id.get().is_none());
+        assert!(!home.machine_key_file().exists());
+        rt::block_on(super::lock(&runtime.machine).take().unwrap());
+        rt::block_on(shutdown);
+    }
+    assert!(home.machine_key_file().exists());
     drop(daemon);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+struct SupervisorRuntime {
+    runtime: rt::Threads,
+    deadlines: std::sync::Mutex<Vec<Duration>>,
+    now: Instant,
+    machine: std::sync::Mutex<Option<rt::BoxFuture<'static, ()>>>,
+    blocking: std::sync::atomic::AtomicUsize,
+}
+impl rt::Runtime for SupervisorRuntime {
+    fn spawn(&self, task: rt::BoxFuture<'static, ()>) {
+        // Keep initialization queued until shutdown has started.
+        let mut held = super::lock(&self.machine);
+        assert!(held.is_none(), "only machine initialization is spawned");
+        *held = Some(task);
+    }
+    fn spawn_blocking(
+        &self,
+        class: rt::BlockingClass,
+        bytes: usize,
+        work: Box<dyn FnOnce() + Send>,
+    ) -> rt::BoxFuture<'static, std::io::Result<()>> {
+        self.blocking
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.runtime.spawn_blocking(class, bytes, work)
+    }
+    fn spawn_flush(
+        &self,
+        work: Box<dyn FnOnce() + Send>,
+    ) -> rt::BoxFuture<'static, std::io::Result<()>> {
+        self.runtime.spawn_flush(work)
+    }
+    fn reactor(&self) -> rt::Reactor {
+        self.runtime.reactor()
+    }
+    fn sleep(&self, duration: Duration) -> rt::BoxFuture<'static, ()> {
+        super::lock(&self.deadlines).push(duration);
+        Box::pin(std::future::pending())
+    }
+    fn now(&self) -> Instant {
+        self.now
+    }
 }
 
 #[test]

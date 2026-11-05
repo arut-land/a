@@ -1143,6 +1143,8 @@ impl Daemon {
                         if let Some(lifetimes) = self.queried.get::<ext::Lifetimes>() {
                             lifetimes.ended().await;
                         }
+                        // Initialization can still be publishing this home's key.
+                        self.machine.known.wait().await;
                         true
                     },
                     async {

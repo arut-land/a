@@ -180,11 +180,11 @@ impl WorkingClock {
         }
     }
 
-    fn elapsed(&self) -> std::time::Duration {
+    fn elapsed(&self, now: std::time::Instant) -> std::time::Duration {
         self.elapsed
-            + self
-                .since
-                .map_or(std::time::Duration::ZERO, |t| t.elapsed())
+            + self.since.map_or(std::time::Duration::ZERO, |t| {
+                now.saturating_duration_since(t)
+            })
     }
 }
 

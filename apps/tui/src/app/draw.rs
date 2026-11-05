@@ -21,10 +21,32 @@ const SPINNER: [&str; 8] = ["✢", "✳", "✶", "✻", "✽", "✻", "✶", "�
 /// The slash menu shows at most this many commands.
 const MENU_ROWS: usize = 6;
 
+#[derive(Clone, Copy)]
+pub(super) struct FrameTime {
+    pub(super) instant: std::time::Instant,
+    pub(super) unix_ms: u64,
+}
+
+impl FrameTime {
+    pub(super) fn now() -> Self {
+        Self {
+            instant: std::time::Instant::now(),
+            unix_ms: u64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX),
+        }
+    }
+}
+
 /// The rows under the transcript and over it, composed once per frame:
 /// inline, `height` composes them to size the viewport and `draw` then
 /// draws the same ones.
 pub struct Composed {
+    pub(super) time: FrameTime,
     width: usize,
     bottom: Vec<Line>,
     caret: Option<(u16, u16)>,
@@ -94,21 +116,22 @@ impl App {
 
     /// What a `width`-wide frame shows besides the transcript, composed
     /// now unless this frame composed it already.
-    fn composed(&mut self, width: usize) -> Composed {
+    fn composed(&mut self, width: usize, time: FrameTime) -> Composed {
         match self.composed.take() {
             Some(composed) if composed.width == width => composed,
-            _ => self.compose(width),
+            _ => self.compose(width, time),
         }
     }
 
-    fn compose(&mut self, width: usize) -> Composed {
-        let (bottom, caret) = self.bottom(width);
+    fn compose(&mut self, width: usize, time: FrameTime) -> Composed {
+        let (bottom, caret) = self.bottom(width, time);
         // An overlay is boxed on the full screen, bare inline.
         let overlay = match self.viewport {
             Viewport::Full => self.overlay_lines(width.saturating_sub(4)),
             Viewport::Inline => self.overlay_lines(width),
         };
         Composed {
+            time,
             width,
             bottom,
             caret,
@@ -118,10 +141,10 @@ impl App {
 
     /// The rows under the transcript (the recap, the oldest approval, a
     /// notice, the input, the status line) and the caret's (x, row).
-    fn bottom(&mut self, width: usize) -> (Vec<Line>, Option<(u16, u16)>) {
+    fn bottom(&mut self, width: usize, time: FrameTime) -> (Vec<Line>, Option<(u16, u16)>) {
         let summary = self.summary();
         let rule = self.rule(width);
-        let working = self.working_row(width);
+        let working = self.working_row(width, time.instant);
         let mut out = Vec::new();
         if let Some(recap) = self.client.view().recap.as_ref().filter(|_| {
             !self.recap_hidden
@@ -175,7 +198,7 @@ impl App {
         let skip = usize::from(cy).saturating_sub(INPUT_ROWS - 1);
         let caret_row = out.len() + usize::from(cy) - skip;
         out.extend(rows.into_iter().skip(skip).take(INPUT_ROWS));
-        out.extend(self.conversation_rows(width));
+        out.extend(self.conversation_rows(width, time.unix_ms));
         out.push(rule);
         let hint = if asked {
             "↑/↓ choose · enter confirms · 1/y yes · 2/n/esc no"
@@ -196,18 +219,11 @@ impl App {
         (out, caret)
     }
 
-    fn conversation_rows(&self, width: usize) -> Vec<Line> {
+    fn conversation_rows(&self, width: usize, now: u64) -> Vec<Line> {
         if self.conversations.is_empty() {
             return Vec::new();
         }
         let mut out = Vec::new();
-        let now = u64::try_from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis(),
-        )
-        .unwrap_or(u64::MAX);
         let selected = self.conversation_at.unwrap_or_else(|| {
             self.conversations
                 .iter()
@@ -250,12 +266,12 @@ impl App {
 
     /// `✢ Working… (3s · ↓ 120 tokens · esc to interrupt)`, while a turn
     /// works; its glyph turns with the clock.
-    fn working_row(&mut self, width: usize) -> Option<Line> {
+    fn working_row(&mut self, width: usize, now: std::time::Instant) -> Option<Line> {
         if !self.working() {
             return None;
         }
         let spent = self.tokens.output.saturating_sub(self.clock.before);
-        let elapsed = self.clock.elapsed();
+        let elapsed = self.clock.elapsed(now);
         let secs = elapsed.as_secs();
         let glyph =
             SPINNER[usize::try_from(elapsed.as_millis() / 125).unwrap_or(0) % SPINNER.len()];
@@ -519,7 +535,7 @@ impl App {
             return h;
         }
         let width = usize::from(w);
-        let composed = self.composed(width);
+        let composed = self.composed(width, FrameTime::now());
         let cap = usize::from(h / 2).max(3);
         let live = match &composed.overlay {
             Some(lines) => lines.len(),
@@ -536,10 +552,18 @@ impl App {
     /// drawn as before and notes where buttons are; returns where the
     /// caret goes, if it shows.
     pub fn draw(&mut self, w: u16, h: u16) -> Option<(u16, u16)> {
+        let time = self
+            .composed
+            .as_ref()
+            .map_or_else(FrameTime::now, |frame| frame.time);
+        self.draw_at(w, h, time)
+    }
+
+    pub(super) fn draw_at(&mut self, w: u16, h: u16, time: FrameTime) -> Option<(u16, u16)> {
         self.redraw = false;
         let mut canvas = std::mem::take(&mut self.canvas);
         canvas.begin(w, h);
-        let caret = self.frame(&mut canvas);
+        let caret = self.frame(&mut canvas, time);
         canvas.finish();
         self.canvas = canvas;
         caret
@@ -550,7 +574,7 @@ impl App {
         &self.canvas
     }
 
-    fn frame(&mut self, canvas: &mut Canvas) -> Option<(u16, u16)> {
+    fn frame(&mut self, canvas: &mut Canvas, time: FrameTime) -> Option<(u16, u16)> {
         let (w, h) = canvas.size();
         let width = usize::from(w);
         let Composed {
@@ -558,7 +582,7 @@ impl App {
             caret,
             overlay,
             ..
-        } = self.composed(width);
+        } = self.composed(width, time);
         let body = h.saturating_sub(u16::try_from(bottom.len()).unwrap_or(u16::MAX));
         (self.width, self.body) = (width, body);
         match (self.viewport, overlay) {

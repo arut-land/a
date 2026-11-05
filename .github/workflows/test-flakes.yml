@@ -1,0 +1,63 @@
+name: Test flake diagnostics
+on:
+  push:
+    branches: [test-flakes]
+permissions:
+  contents: read
+jobs:
+  repeat:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            package: tui
+            test: agent_switching_and_stopping_work_in_both_terminal_buffers
+          - os: macos-latest
+            package: engine
+            test: the_supervisor_sleeps_until_a_deadline_and_never_polls
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_CODEGEN_BACKEND: llvm
+      MISE_AUTO_INSTALL: false
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v5
+        with:
+          install: false
+      - name: Native Rust and nextest
+        run: |
+          channel=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
+          rustup toolchain install "$channel" --profile minimal --component rust-src,rustfmt,clippy
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            curl --fail --location --output "$RUNNER_TEMP/nextest.zip" https://get.nexte.st/0.9.148/windows
+            powershell -NoProfile -Command 'Expand-Archive -Path "$env:RUNNER_TEMP/nextest.zip" -DestinationPath "$env:USERPROFILE/.cargo/bin" -Force'
+          else
+            curl --fail --location https://get.nexte.st/0.9.148/mac | tar xz -C "$HOME/.cargo/bin"
+          fi
+      - name: 200 consecutive runs
+        env:
+          TEST_PACKAGE: ${{ matrix.package }}
+          TEST_NAME: ${{ matrix.test }}
+        run: |
+          python3 - <<'PYTHON'
+          import os, re, subprocess
+          env = {k:v for k,v in os.environ.items() if not re.search(r"OPENAI|ANTHROPIC|GEMINI|GOOGLE_API|AZURE|AWS_|BEDROCK|MISTRAL|COHERE|GROQ|TOGETHER|DEEPSEEK|PROXY|API_KEY|ACCESS_TOKEN|A_HOME", k, re.I)}
+          env.update(MISE_IGNORED_CONFIG_PATHS=os.environ["GITHUB_WORKSPACE"],
+                     A_HOME=os.path.join(os.environ["RUNNER_TEMP"], "test-flakes-home"),
+                     CARGO_TARGET_DIR=os.path.join(os.environ["RUNNER_TEMP"], "tgt-test-flakes"),
+                     OPENAI_API_KEY="dummy-loopback", OPENAI_BASE_URL="http://127.0.0.1:9/v1",
+                     ANTHROPIC_API_KEY="dummy-loopback", ANTHROPIC_BASE_URL="http://127.0.0.1:9")
+          if env["RUNNER_OS"] == "Windows":
+              subprocess.run(["mise", "exec", "--", "cargo", "clippy", "--workspace", "--exclude", "ext-lua",
+                              "--all-targets", "--target", "x86_64-pc-windows-msvc", "--", "-D", "warnings"], env=env, check=True)
+          subprocess.run(["mise", "exec", "--", "cargo", "nextest", "run", "-p", env["TEST_PACKAGE"],
+                          "-E", "test(" + env["TEST_NAME"] + ")", "--stress-count", "200",
+                          "--test-threads", "1", "--no-tests=fail"], env=env, check=True)
+          PYTHON
