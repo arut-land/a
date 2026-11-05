@@ -49,6 +49,7 @@ pub struct ViewState {
     calls: Keyed<CallId, ViewCall>,
     queued: VecDeque<Queued>,
     turn: u64,
+    resumption: Option<Seq>,
     /// Transcript replacement must not erase logged input ownership.
     pub taken: Vec<crate::Author>,
 }
@@ -158,8 +159,12 @@ impl ViewState {
                 mode,
                 taken,
                 origin,
+                resume,
                 ..
             } => {
+                if resume.is_some() {
+                    self.resumption = Some(e.seq);
+                }
                 if *taken {
                     self.remember_taken(*origin);
                     self.turn = e.seq.get();
@@ -181,6 +186,18 @@ impl ViewState {
                 source: envelope.source(),
                 origin: None,
             }),
+            Body::Interrupt { .. } if self.resumption.is_some() => self.queued.clear(),
+            Body::Ack {
+                envelope_id,
+                refusal,
+                ..
+            } if envelope_id.purpose == crate::EnvelopeId::RESUMED
+                && *refusal != Some(crate::InboxRefusal::Full) =>
+            {
+                if self.resumption == Some(envelope_id.call.0) {
+                    self.resumption = None;
+                }
+            }
             Body::Withdraw { input, .. } => self.queued.retain(|q| q.seq != *input),
             Body::Take { input, into } => {
                 if let Some(at) = self.queued.iter().position(|q| q.seq == *input)

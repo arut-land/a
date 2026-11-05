@@ -1003,8 +1003,17 @@ impl Live {
         Ok(())
     }
 
-    pub(crate) fn settled(&self, child: SessionId, outcome: protocol::ToolOutcome) {
-        self.send(Msg::Step(Event::ChildSettled { child, outcome }));
+    pub(crate) fn settled(
+        &self,
+        child: SessionId,
+        run: protocol::RunId,
+        outcome: protocol::ToolOutcome,
+    ) {
+        self.send(Msg::Step(Event::ChildSettled {
+            run,
+            child,
+            outcome,
+        }));
     }
 
     pub(crate) fn cancel_owned(&self) {
@@ -2782,20 +2791,20 @@ impl Actor {
         }
     }
 
-    fn report(&self, outcome: protocol::ToolOutcome) {
+    fn report(&self, run: protocol::RunId, outcome: protocol::ToolOutcome) {
         if let (Some(parent), Some(daemon)) =
             (self.live.parent, self.live.session.shared.daemon.upgrade())
         {
             let child = self.live.id;
             self.live.session.spawn_work(
-                WorkId::Report(child),
+                WorkId::Report(child, run),
                 Admission {
                     through: self.journal.durable.seq(),
                     requirement: Requirement::Durable,
                 },
                 |cancel| {
                     Box::pin(async move {
-                        unless(&cancel, daemon.report(parent.session, child, outcome)).await;
+                        unless(&cancel, daemon.report(parent.session, child, run, outcome)).await;
                     })
                 },
             );
@@ -2883,7 +2892,7 @@ impl Actor {
                     daemon.interrupt(child);
                 }
             }
-            Effect::Report { outcome } => self.report(outcome),
+            Effect::Report { run, outcome } => self.report(run, outcome),
             Effect::EndStream { stream, cut } => self.end_stream(stream, cut),
             Effect::DiscardStream { stream } => {
                 let store = Arc::clone(&shared.blobs);
@@ -3008,6 +3017,7 @@ impl Actor {
                         .report(
                             parent,
                             child,
+                            protocol::RunId::Initial,
                             Outcome::Failed {
                                 error: error.to_string(),
                             },

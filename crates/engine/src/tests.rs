@@ -2165,6 +2165,7 @@ fn interrupt_cancels_detached_descendants_after_the_spawning_call_completes() {
     rt::block_on(daemon.report(
         id,
         child,
+        protocol::RunId::Initial,
         Outcome::Done {
             output: Json::encode("late").unwrap().into(),
         },
@@ -2956,6 +2957,7 @@ fn resumed_children_notify_their_direct_parent_once_across_every_delivery_crash_
         drop(attached);
         drop(parent);
         drop(daemon);
+        replay_delayed_outcomes(&headers, &logs, child, direct_parent);
         for child_cut in [input + 1, outbox + 1] {
             for parent_cut in [notice, notice + 1] {
                 let (case_root, case_home) = self::home("resume-cut");
@@ -2991,6 +2993,70 @@ fn resumed_children_notify_their_direct_parent_once_across_every_delivery_crash_
         }
         std::fs::remove_dir_all(root).unwrap();
     }
+}
+
+fn replay_delayed_outcomes(
+    headers: &[Header],
+    logs: &std::collections::BTreeMap<SessionId, Vec<Entry>>,
+    child: &Header,
+    direct_parent: SessionId,
+) {
+    let parent_log = &logs[&direct_parent];
+    let notice = parent_log.iter().position(|entry| matches!(&entry.body, Body::Enqueue { envelope } if envelope.payload() == &protocol::Carried::Resumed)).unwrap();
+    let outbox = logs[&child.id]
+        .iter()
+        .position(|entry| {
+            matches!(
+                &entry.body,
+                Body::Outbox {
+                    payload: protocol::Carried::Resumed,
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    let (case_root, case_home) = home("resume-delayed-report");
+    let mut delayed = logs.clone();
+    let initial_watch = parent_log
+        .iter()
+        .position(
+            |entry| matches!(entry.body, Body::Watch { child: watched } if watched == child.id),
+        )
+        .unwrap();
+    let mut parent_prefix = parent_log[..=initial_watch].to_vec();
+    parent_prefix.push(Entry::new(
+        Seq::new(parent_prefix.len() as u64 + 1).unwrap(),
+        parent_log[notice].epoch,
+        parent_log[notice].body.clone(),
+    ));
+    delayed.insert(direct_parent, parent_prefix);
+    let cuts = [(child.id, outbox + 1)];
+    import_cuts(&case_home, headers, &delayed, &cuts);
+    let restarted = Daemon::load(&case_home, &echo()).unwrap();
+    settle(&restarted);
+    let received = restarted.shared.store.entries(direct_parent).unwrap();
+    let outcomes: Vec<_> = received
+        .iter()
+        .filter_map(|entry| match &entry.body {
+            Body::Fired { outcome, .. } => Some(outcome.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(outcomes.len(), 2);
+    assert_ne!(
+        outcomes[0], outcomes[1],
+        "a delayed original report must not consume the resumed watch"
+    );
+    assert!(outcomes.iter().any(|outcome| matches!(outcome, Outcome::Done { output: protocol::Payload::Inline(value) } if value == &Json::encode("resumed work").unwrap())));
+    drop(restarted);
+    let replayed = Daemon::load(&case_home, &echo()).unwrap();
+    settle(&replayed);
+    assert_eq!(
+        replayed.shared.store.entries(direct_parent).unwrap(),
+        received
+    );
+    drop(replayed);
+    std::fs::remove_dir_all(case_root).unwrap();
 }
 
 fn child_deliveries<'a>(bodies: impl Iterator<Item = &'a Body>) -> (usize, usize) {

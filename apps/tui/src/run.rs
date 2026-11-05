@@ -56,7 +56,7 @@ pub fn run(daemon: &Daemon, target: Target, viewport: Viewport) -> io::Result<()
                     | client::EventKind::Failed(_)
                     | client::EventKind::Wedged(_)
             );
-            let effects = app.client.step(event);
+            let effects = app.step(event);
             driver.pump(&mut app, effects);
             if ready {
                 break;
@@ -259,7 +259,7 @@ impl Client {
                         }
                     }
                     Event::Client(event) => {
-                        let stepped = self.app.client.step(event);
+                        let stepped = self.app.step(event);
                         self.driver.pump(&mut self.app, stepped);
                     }
                 }

@@ -129,6 +129,12 @@ and compose model; web rows use roving tabindex and accessible options; macOS
 uses an NSTableView. The native sidebar omits children of the displayed family,
 which already has its own conversation list.
 
+Queue editing is a confirmed withdrawal. `edit_queued` sends the normal
+withdrawal mutation; `take_queue_edit` releases its text only after the daemon
+confirms it. Refusal leaves the current composer draft intact. The web request
+and native async method wait for this shared SDK result.
+
+
 The FFI exposes `ConversationWatch` snapshots through `ConversationStore`.
 Conversation and session list streams buffer one complete snapshot, since older
 full lists are superseded by the latest list. Opening a conversation still uses

@@ -423,6 +423,7 @@ fn an_interrupt_never_starts_work() {
                     Some(Call::Side { .. }) | None => continue,
                 },
                 Work::Interrupt { child } => Event::ChildSettled {
+                    run: protocol::RunId::Initial,
                     child,
                     outcome: INTERRUPTED.into(),
                 },
@@ -485,6 +486,7 @@ fn the_same_events_give_the_same_log() {
             wait: true,
         });
         s.step(Event::ChildSettled {
+            run: protocol::RunId::Initial,
             child: child(),
             outcome: done(json!("ok")).into(),
         });
@@ -751,6 +753,7 @@ fn a_watch_fires_once() {
     });
     for _ in 0..3 {
         s.step(Event::ChildSettled {
+            run: protocol::RunId::Initial,
             child: child(),
             outcome: done(json!("ok")).into(),
         });

@@ -214,6 +214,7 @@ pub enum Event {
     },
     /// Child session `child` settled with `outcome`.
     ChildSettled {
+        run: protocol::RunId,
         child: SessionId,
         outcome: protocol::ToolOutcome,
     },
@@ -445,6 +446,7 @@ pub enum Work {
     },
     /// Hand this child session's result to its owner.
     Report {
+        run: protocol::RunId,
         outcome: protocol::ToolOutcome,
     },
     /// Copy stream `stream`, which a restart cut off, nothing owning what

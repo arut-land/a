@@ -2553,7 +2553,52 @@ fn a_child_uses_the_shared_composer_queue_and_edit_path_in_both_buffers() {
             matches!(press(&mut app, Key::Alt('e')), Some(Effect::EditQueued(input)) if input.get() == 1)
         );
         let effects = app.edit_queued(Seq::new(1).unwrap());
+        assert_eq!(app.editor.text(), "");
+        let seq = effects
+            .iter()
+            .find_map(|effect| match effect {
+                client::Effect::Io(Io::Send(ClientMsg::Withdraw { client_seq, .. })) => *client_seq,
+                _ => None,
+            })
+            .unwrap();
+        app.fold(&DaemonMsg::Ack { client_seq: seq });
         assert_eq!(app.editor.text(), "queued child message");
         assert!(effects.iter().any(|effect| matches!(effect, client::Effect::Io(Io::Send(ClientMsg::Withdraw { input, .. })) if input.get() == 1)));
+    }
+}
+
+#[test]
+fn refused_queue_edits_preserve_the_current_draft_in_both_buffers() {
+    for viewport in [Viewport::Full, Viewport::Inline] {
+        let (mut app, _) = app(
+            viewport,
+            &[entry(
+                1,
+                Body::Input {
+                    segments: "original".into(),
+                    mode: protocol::Mode::Queue,
+                    taken: false,
+                    origin: None,
+                    force: false,
+                    resume: None,
+                },
+            )],
+        );
+        app.editor.recalled("current draft");
+        let effects = app.edit_queued(Seq::new(1).unwrap());
+        assert_eq!(app.editor.text(), "current draft");
+        let seq = effects
+            .iter()
+            .find_map(|effect| match effect {
+                client::Effect::Io(Io::Send(ClientMsg::Withdraw { client_seq, .. })) => *client_seq,
+                _ => None,
+            })
+            .unwrap();
+        app.fold(&DaemonMsg::Rejected {
+            client_seq: seq,
+            reason: protocol::Rejection::NotWaiting,
+            message: "already taken".into(),
+        });
+        assert_eq!(app.editor.text(), "current draft");
     }
 }

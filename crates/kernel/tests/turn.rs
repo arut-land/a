@@ -1084,6 +1084,7 @@ fn a_call_waits_on_the_child_it_links_and_resumes_with_its_result() {
         (spawn(true), waits),
         (
             Event::ChildSettled {
+                run: protocol::RunId::Initial,
                 child: child(),
                 outcome: ok.clone().into(),
             },
@@ -1100,6 +1101,7 @@ fn a_call_waits_on_the_child_it_links_and_resumes_with_its_result() {
         // A child reports again after a restart: its watch fired already.
         (
             Event::ChildSettled {
+                run: protocol::RunId::Initial,
                 child: child(),
                 outcome: ok.clone().into(),
             },
@@ -1131,6 +1133,7 @@ fn an_interrupt_stops_the_child_first() {
         ),
         (
             Event::ChildSettled {
+                run: protocol::RunId::Initial,
                 child: child(),
                 outcome: INTERRUPTED.into(),
             },
@@ -1161,6 +1164,7 @@ fn a_background_childs_result_starts_a_turn_of_its_own() {
         // The turn runs: the result is queued, and waits for it to end.
         (
             Event::ChildSettled {
+                run: protocol::RunId::Initial,
                 child: child(),
                 outcome: ok.clone().into(),
             },
@@ -1191,6 +1195,7 @@ fn a_child_reports_each_time_it_settles() {
     };
     let (mut s, fx) = Session::resume(Reg::echo().arc(), log([input("hi")]), &load);
     let report = |text: &str| Work::Report {
+        run: protocol::RunId::Initial,
         outcome: Outcome::Done {
             output: Json::encode(&text).unwrap().into(),
         },
@@ -1536,12 +1541,14 @@ fn cancel_wins_once_over_a_detached_result_even_after_reload() {
     assert!(work(&fx).any(|e| matches!(e, Work::Interrupt { child: c } if *c == child())));
     assert!(s.core.at_rest());
     s.step(Event::ChildSettled {
+        run: protocol::RunId::Initial,
         child: child(),
         outcome: done(json!("late")).into(),
     });
     let (mut restored, fx) = Session::resume(Reg::echo().arc(), s.log, &Load::default());
     assert!(!work(&fx).any(|e| matches!(e, Work::StartChild { .. })));
     restored.step(Event::ChildSettled {
+        run: protocol::RunId::Initial,
         child: child(),
         outcome: done(json!("later")).into(),
     });
@@ -1599,6 +1606,7 @@ fn detached_results_and_messages_enter_before_the_next_provider_step() {
         wait: false,
     });
     s.step(Event::ChildSettled {
+        run: protocol::RunId::Initial,
         child: child(),
         outcome: done(json!("result")).into(),
     });
@@ -1727,6 +1735,7 @@ fn a_childs_own_interrupted_result_is_delivered_live_and_after_a_crash() {
         &Load::default(),
     );
     let plan = session.step(Event::ChildSettled {
+        run: protocol::RunId::Initial,
         child: child(),
         outcome: INTERRUPTED.into(),
     });

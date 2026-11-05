@@ -366,7 +366,7 @@ func terminal_children_expire_from_the_picker_while_the_viewed_child_stays_reach
     await transcript.send("queued child message")
     try await eventually("the shared child composer queue") { transcript.queuedInputs.contains { $0.text == "queued child message" } }
     let queued = try #require(transcript.queuedInputs.first { $0.text == "queued child message" })
-    #expect(try transcript.editQueued(queued.seq) == "queued child message")
+    #expect(try await transcript.editQueued(queued.seq) == "queued child message")
     try await eventually("the child queue edit withdraws the original") { transcript.queuedInputs.isEmpty }
     conversations.interrupt(child.id)
     #expect(conversations.problem == nil)

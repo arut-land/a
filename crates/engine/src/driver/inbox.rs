@@ -50,9 +50,23 @@ impl Actor {
                 Box::pin(async move {
                     let (id, recipient) = (envelope.id().clone(), envelope.destination);
                     let result = match daemon {
-                        Some(daemon) => super::unless(&cancel, daemon.deliver(envelope))
-                            .await
-                            .unwrap_or(Err(InboxRefusal::Interrupted)),
+                        Some(daemon) => super::unless(&cancel, async {
+                            loop {
+                                let result = daemon.deliver(envelope.clone()).await;
+                                if result != Err(InboxRefusal::Full)
+                                    || envelope.payload() != &protocol::Carried::Resumed
+                                {
+                                    break result;
+                                }
+                                session
+                                    .shared
+                                    .rt
+                                    .sleep(std::time::Duration::from_millis(100))
+                                    .await;
+                            }
+                        })
+                        .await
+                        .unwrap_or(Err(InboxRefusal::Interrupted)),
                         None => Err(InboxRefusal::Unavailable),
                     };
                     let message = if result == Err(InboxRefusal::Interrupted) {

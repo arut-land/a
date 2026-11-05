@@ -85,6 +85,210 @@ fn a_replayed_user_input_cannot_reactivate_cancelled_child_ownership() {
     )));
 }
 
+#[test]
+fn delayed_previous_outcomes_cannot_settle_a_resumed_runs_watch() {
+    let child = SessionId::new();
+    let notice = protocol::Envelope::new(
+        protocol::EnvelopeId {
+            sender: child,
+            call: CallId::new(9).unwrap(),
+            purpose: protocol::EnvelopeId::RESUMED.into(),
+        },
+        SessionId::new(),
+        protocol::Carried::Resumed,
+        Vec::new(),
+    )
+    .unwrap();
+    let (mut s, _) = resume(
+        Reg::echo(),
+        [Body::Watch { child }, Body::Enqueue { envelope: notice }],
+        &Load::default(),
+    );
+    for text in ["previous", "resumed"] {
+        s.step(kernel::Event::ChildSettled {
+            run: if text == "previous" {
+                protocol::RunId::Initial
+            } else {
+                protocol::RunId::Resumed(Seq::new(9).unwrap())
+            },
+            child,
+            outcome: Outcome::Done {
+                output: Json::encode(&text).unwrap(),
+            }
+            .into(),
+        });
+    }
+    let outcomes: Vec<_> = s
+        .log
+        .iter()
+        .filter_map(|entry| match &entry.body {
+            Body::Fired { outcome, .. } => Some(outcome.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        outcomes,
+        [
+            Outcome::Done {
+                output: Json::encode(&"previous").unwrap()
+            }
+            .into(),
+            Outcome::Done {
+                output: Json::encode(&"resumed").unwrap()
+            }
+            .into()
+        ]
+    );
+}
+
+fn pending_resume() -> (Session, protocol::Envelope) {
+    let child = SessionId::new();
+    let parent = SessionId::new();
+    let (mut s, _) = resume(
+        Reg::echo(),
+        [
+            input("original"),
+            Body::Assistant {
+                text: "original".into(),
+            },
+        ],
+        &Load {
+            session: Some(child),
+            parent: Some(parent),
+            owner: Owner::Present,
+            ..Load::default()
+        },
+    );
+    let fx = s.step(user("resumed"));
+    let envelope = work(&fx)
+        .find_map(|work| match work {
+            Work::Deliver { envelope, .. } => Some(envelope.clone()),
+            _ => None,
+        })
+        .unwrap();
+    (s, envelope)
+}
+
+#[test]
+fn a_full_parent_inbox_never_releases_a_pending_resume() {
+    let (mut s, envelope) = pending_resume();
+    let refused = s.step(kernel::Event::Delivered {
+        id: envelope.id().clone(),
+        recipient: envelope.destination,
+        result: Err(protocol::InboxRefusal::Full),
+        ticket: None,
+    });
+    assert!(
+        s.log
+            .iter()
+            .all(|entry| !matches!(&entry.body, Body::Assistant { text } if text == "resumed"))
+    );
+    assert!(s.core.ledger().resumption().is_some());
+    assert!(work(&refused).any(
+        |work| matches!(work, Work::Deliver { envelope: retry, .. } if retry.id() == envelope.id())
+    ));
+    assert!(s.core.ledger().acknowledged(envelope.id()).is_none());
+    let load = Load {
+        session: Some(envelope.id().sender),
+        parent: Some(envelope.destination),
+        owner: Owner::Present,
+        ..Load::default()
+    };
+    let (mut restarted, retry) = Session::resume(Reg::echo().arc(), s.log, &load);
+    assert!(work(&retry).any(
+        |work| matches!(work, Work::Deliver { envelope: retry, .. } if retry.id() == envelope.id())
+    ));
+    restarted.step(kernel::Event::Delivered {
+        id: envelope.id().clone(),
+        recipient: envelope.destination,
+        result: Ok(()),
+        ticket: None,
+    });
+    assert_eq!(
+        restarted
+            .log
+            .iter()
+            .filter(|entry| matches!(&entry.body, Body::Assistant { text } if text == "resumed"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn stopping_a_pending_resume_prevents_execution_after_acknowledgement_and_replay() {
+    let (mut s, envelope) = pending_resume();
+    s.step(user("also queued"));
+    s.step(interrupt());
+    let pending = s.log.clone();
+    let load = Load {
+        session: Some(envelope.id().sender),
+        parent: Some(envelope.destination),
+        owner: Owner::Present,
+        ..Load::default()
+    };
+    let (restarted, _) = Session::resume(Reg::echo().arc(), pending, &load);
+    s = restarted;
+    let mut view = protocol::view::SessionView::default();
+    for entry in &s.log {
+        view.fold(&protocol::DaemonMsg::from(entry.clone()));
+    }
+    assert_eq!(view.state.queued().count(), 0);
+    s.step(kernel::Event::Delivered {
+        id: envelope.id().clone(),
+        recipient: envelope.destination,
+        result: Ok(()),
+        ticket: None,
+    });
+    assert!(
+        s.log
+            .iter()
+            .all(|entry| !matches!(&entry.body, Body::Assistant { text } if text == "resumed"))
+    );
+    let (replayed, _) = Session::resume(Reg::echo().arc(), s.log, &Load::default());
+    assert_eq!(replayed.core.ledger().untaken(), []);
+}
+
+#[test]
+fn an_unavailable_parent_settles_the_resume_without_running_queued_work() {
+    let (mut s, envelope) = pending_resume();
+    let before = s.log.len();
+    let fx = s.step(kernel::Event::Delivered {
+        id: envelope.id().clone(),
+        recipient: envelope.destination,
+        result: Err(protocol::InboxRefusal::Unavailable),
+        ticket: None,
+    });
+    assert_eq!(s.core.ledger().untaken(), []);
+    assert!(s.core.ledger().resumption().is_none());
+    assert!(matches!(
+        s.core.ledger().result(),
+        Some(Outcome::Interrupted { .. })
+    ));
+    assert!(work(&fx).all(|work| !matches!(work, Work::RunTool { .. } | Work::Send { .. })));
+    for cut in before..=s.log.len() {
+        let load = Load {
+            session: Some(envelope.id().sender),
+            parent: Some(envelope.destination),
+            owner: Owner::Present,
+            ..Load::default()
+        };
+        let (mut replayed, _) = Session::resume(Reg::echo().arc(), s.log[..cut].to_vec(), &load);
+        replayed.step(kernel::Event::Delivered {
+            id: envelope.id().clone(),
+            recipient: envelope.destination,
+            result: Err(protocol::InboxRefusal::Unavailable),
+            ticket: None,
+        });
+        assert_eq!(replayed.core.ledger().untaken(), []);
+        assert!(
+            replayed
+                .log
+                .iter()
+                .all(|entry| !matches!(&entry.body, Body::Assistant { text } if text == "resumed"))
+        );
+    }
+}
+
 fn resume(
     reg: Reg,
     bodies: impl IntoIterator<Item = Body>,

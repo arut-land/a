@@ -956,7 +956,13 @@ impl Daemon {
     /// unloaded: a session with a watch armed has work, so it is loaded
     /// (at startup, marked busy in the catalog), and one with none has heard from
     /// every child it watched.
-    async fn report(&self, parent: SessionId, child: SessionId, outcome: protocol::ToolOutcome) {
+    async fn report(
+        &self,
+        parent: SessionId,
+        child: SessionId,
+        run: protocol::RunId,
+        outcome: protocol::ToolOutcome,
+    ) {
         let Some(slot) = self.slot(parent) else {
             return;
         };
@@ -968,7 +974,7 @@ impl Daemon {
             return;
         }
         match self.live(&slot).await {
-            Ok(live) => live.settled(child, outcome),
+            Ok(live) => live.settled(child, run, outcome),
             Err(e) => eprintln!("reporting to {}: {e}", parent.short()),
         }
     }

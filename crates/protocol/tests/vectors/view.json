@@ -16,7 +16,7 @@
       "{\"call\":2,\"epoch\":0,\"kind\":\"tool_result\",\"outcome\":{\"output\":\"redundant tool result\",\"status\":\"done\"},\"seq\":12,\"t\":\"entry\"}",
       "{\"seq\":12,\"t\":\"synced\"}"
     ],
-    "hash": "3dab3de8c4cc14a4",
+    "hash": "c374d3b050314659",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -171,6 +171,7 @@
       "state": {
         "calls": [],
         "queued": [],
+        "resumption": null,
         "taken": [],
         "turn": 0
       },
@@ -317,7 +318,7 @@
       "{\"epoch\":0,\"kind\":\"fired\",\"outcome\":{\"output\":\"completed child result\",\"status\":\"done\"},\"seq\":10,\"t\":\"entry\",\"watch\":8}",
       "{\"seq\":10,\"t\":\"synced\"}"
     ],
-    "hash": "8df768ad542678d2",
+    "hash": "bfb459c138060931",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -454,6 +455,7 @@
       "state": {
         "calls": [],
         "queued": [],
+        "resumption": null,
         "taken": [],
         "turn": 0
       },
@@ -596,7 +598,7 @@
       "{\"epoch\":0,\"kind\":\"fired\",\"outcome\":{\"output\":\"resumed result\",\"status\":\"done\"},\"seq\":6,\"t\":\"entry\",\"watch\":4}",
       "{\"seq\":6,\"t\":\"synced\"}"
     ],
-    "hash": "8b3014849fc763bc",
+    "hash": "0f695a2159a4befb",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -694,6 +696,7 @@
       "state": {
         "calls": [],
         "queued": [],
+        "resumption": null,
         "taken": [],
         "turn": 5
       },
@@ -804,7 +807,7 @@
       "{\"attempt\":2,\"call\":1,\"t\":\"delta\",\"text\":\"€same\"}",
       "{\"attempt\":3,\"call\":1,\"t\":\"delta\",\"text\":\"€\"}"
     ],
-    "hash": "5bac8284f832926e",
+    "hash": "4d1af044a7b8cdc7",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -875,6 +878,7 @@
           ]
         ],
         "queued": [],
+        "resumption": null,
         "taken": [],
         "turn": 0
       },
@@ -1479,7 +1483,7 @@
       "{\"activity\":\"idle\",\"seq\":1,\"t\":\"activity\"}",
       "{\"activity\":\"idle\",\"seq\":1,\"t\":\"activity\"}"
     ],
-    "hash": "79b9bacff4a757c1",
+    "hash": "da1c68c291dab46e",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -4113,6 +4117,7 @@
       "state": {
         "calls": [],
         "queued": [],
+        "resumption": null,
         "taken": [],
         "turn": 1
       },
@@ -7790,7 +7795,7 @@
       "{\"epoch\":0,\"kind\":\"model_call\",\"model\":\"m\",\"purpose\":\"title\",\"seq\":1,\"t\":\"entry\"}",
       "{\"call\":1,\"epoch\":0,\"kind\":\"model_result\",\"outcome\":{\"output\":{\"message\":{\"content\":[{\"text\":\"Fix the parser\",\"type\":\"text\"}]}},\"status\":\"done\"},\"seq\":2,\"t\":\"entry\"}"
     ],
-    "hash": "6469ad9fbf16598a",
+    "hash": "d83f520a0f778979",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -7846,6 +7851,7 @@
       "state": {
         "calls": [],
         "queued": [],
+        "resumption": null,
         "taken": [],
         "turn": 0
       },
@@ -7907,7 +7913,7 @@
       "{\"epoch\":0,\"input\":2,\"kind\":\"take\",\"seq\":8,\"t\":\"entry\"}",
       "{\"seq\":8,\"t\":\"synced\"}"
     ],
-    "hash": "4bedb790b0a6cee6",
+    "hash": "f60391a10a0f1ffb",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -8029,6 +8035,7 @@
             "text": "edited"
           }
         ],
+        "resumption": null,
         "taken": [],
         "turn": 8
       },
@@ -8083,12 +8090,12 @@
   {
     "frames": [
       "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
-      "{\"items\":[],\"seq\":1,\"session\":null,\"state\":{\"calls\":[],\"queued\":[{\"origin\":{\"client\":\"00000000-0000-0000-0000-00000000000c\",\"seq\":7},\"seq\":1,\"source\":\"user\",\"steer\":false,\"text\":\"same\"}],\"taken\":[],\"turn\":0},\"t\":\"snapshot\",\"workspace\":\"\"}",
+      "{\"items\":[],\"seq\":1,\"session\":null,\"state\":{\"calls\":[],\"queued\":[{\"origin\":{\"client\":\"00000000-0000-0000-0000-00000000000c\",\"seq\":7},\"seq\":1,\"source\":\"user\",\"steer\":false,\"text\":\"same\"}],\"resumption\":null,\"taken\":[],\"turn\":0},\"t\":\"snapshot\",\"workspace\":\"\"}",
       "{\"epoch\":0,\"input\":1,\"kind\":\"take\",\"seq\":2,\"t\":\"entry\"}",
       "{\"activity\":\"idle\",\"seq\":2,\"t\":\"activity\"}",
       "{\"seq\":2,\"t\":\"synced\"}"
     ],
-    "hash": "0433f3ba22223f52",
+    "hash": "41c44212ea2232d3",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -8113,6 +8120,7 @@
               "text": "same"
             }
           ],
+          "resumption": null,
           "taken": [],
           "turn": 0
         },
@@ -8150,6 +8158,7 @@
       "state": {
         "calls": [],
         "queued": [],
+        "resumption": null,
         "taken": [
           {
             "client": "00000000-0000-0000-0000-00000000000c",
@@ -8210,11 +8219,11 @@
   {
     "frames": [
       "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
-      "{\"items\":[],\"seq\":2,\"session\":\"00000000-0000-0000-0000-00000000000a\",\"state\":{\"calls\":[],\"queued\":[],\"taken\":[],\"turn\":0},\"t\":\"snapshot\",\"workspace\":\"/w\"}",
+      "{\"items\":[],\"seq\":2,\"session\":\"00000000-0000-0000-0000-00000000000a\",\"state\":{\"calls\":[],\"queued\":[],\"resumption\":null,\"taken\":[],\"turn\":0},\"t\":\"snapshot\",\"workspace\":\"/w\"}",
       "{\"epoch\":0,\"kind\":\"context\",\"publication\":{\"key\":\"later-publication\",\"namespace\":\"mcp-schemas\"},\"seq\":3,\"t\":\"entry\",\"text\":\"later schema\"}",
       "{\"seq\":3,\"t\":\"synced\"}"
     ],
-    "hash": "aa1afdfec8eebfe2",
+    "hash": "e838911e12a69e93",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -8228,6 +8237,7 @@
         "state": {
           "calls": [],
           "queued": [],
+          "resumption": null,
           "taken": [],
           "turn": 0
         },
@@ -8258,6 +8268,7 @@
       "state": {
         "calls": [],
         "queued": [],
+        "resumption": null,
         "taken": [],
         "turn": 0
       },
@@ -8294,11 +8305,11 @@
     "frames": [
       "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
       "{\"epoch\":0,\"intent\":[\"Agent\",\"execution authority\",{\"presentation\":null,\"publications\":{\"1\":[{\"key\":\"loaded-publication\",\"namespace\":\"skills\"}],\"2\":[{\"key\":\"loaded-publication\",\"namespace\":\"mcp-schemas\"}]},\"runner\":\"Agent\",\"source\":null}],\"kind\":\"spawned\",\"seq\":1,\"t\":\"entry\"}",
-      "{\"items\":[],\"seq\":1,\"session\":\"00000000-0000-0000-0000-00000000000a\",\"state\":{\"calls\":[],\"queued\":[],\"taken\":[],\"turn\":0},\"t\":\"snapshot\",\"workspace\":\"/w\"}",
+      "{\"items\":[],\"seq\":1,\"session\":\"00000000-0000-0000-0000-00000000000a\",\"state\":{\"calls\":[],\"queued\":[],\"resumption\":null,\"taken\":[],\"turn\":0},\"t\":\"snapshot\",\"workspace\":\"/w\"}",
       "{\"epoch\":0,\"kind\":\"context\",\"publication\":{\"key\":\"later-publication\",\"namespace\":\"mcp-schemas\"},\"seq\":2,\"t\":\"entry\",\"text\":\"later schema\"}",
       "{\"seq\":2,\"t\":\"synced\"}"
     ],
-    "hash": "5c34356c4803ce1f",
+    "hash": "a69f7bee3970b24a",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -8341,6 +8352,7 @@
         "state": {
           "calls": [],
           "queued": [],
+          "resumption": null,
           "taken": [],
           "turn": 0
         },
@@ -8371,6 +8383,7 @@
       "state": {
         "calls": [],
         "queued": [],
+        "resumption": null,
         "taken": [],
         "turn": 0
       },
@@ -8412,7 +8425,7 @@
       "{\"call\":3,\"epoch\":0,\"kind\":\"tool_result\",\"outcome\":{\"output\":{\"exit\":0,\"output\":\"hi\\n\"},\"status\":\"done\"},\"seq\":4,\"t\":\"entry\"}",
       "{\"call\":2,\"epoch\":0,\"kind\":\"tool_result\",\"outcome\":{\"output\":{\"exit\":0,\"output\":\"hi\\n\"},\"status\":\"done\"},\"seq\":5,\"t\":\"entry\"}"
     ],
-    "hash": "a48e3388153238d7",
+    "hash": "61462a988ef1d7ec",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -8530,6 +8543,7 @@
       "state": {
         "calls": [],
         "queued": [],
+        "resumption": null,
         "taken": [],
         "turn": 1
       },
@@ -8639,7 +8653,7 @@
       "{\"epoch\":0,\"fact\":{\"annotation\":{\"card\":{\"body\":\"Only lists files.\",\"title\":\"\"},\"lifetime\":\"question\",\"target\":1}},\"kind\":\"fact\",\"seq\":6,\"t\":\"entry\"}",
       "{\"seq\":6,\"t\":\"synced\"}"
     ],
-    "hash": "5c5603a30e36171a",
+    "hash": "2b3b1097662031df",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -8819,6 +8833,7 @@
           ]
         ],
         "queued": [],
+        "resumption": null,
         "taken": [],
         "turn": 0
       },
@@ -8969,7 +8984,7 @@
       "{\"epoch\":0,\"fact\":{\"annotation\":{\"card\":{\"body\":\"Only lists files.\",\"title\":\"\"},\"lifetime\":\"question\",\"target\":1}},\"kind\":\"fact\",\"seq\":6,\"t\":\"entry\"}",
       "{\"seq\":6,\"t\":\"synced\"}"
     ],
-    "hash": "ee2b10a9226b4297",
+    "hash": "d9f5d5fd093f025a",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -9171,6 +9186,7 @@
           ]
         ],
         "queued": [],
+        "resumption": null,
         "taken": [],
         "turn": 0
       },
@@ -9320,7 +9336,7 @@
       "{\"epoch\":0,\"fact\":{\"annotation\":{\"card\":{\"body\":\"Lists files in the current directory.\",\"title\":\"\"},\"lifetime\":\"question\",\"target\":1}},\"kind\":\"fact\",\"seq\":5,\"t\":\"entry\"}",
       "{\"seq\":5,\"t\":\"synced\"}"
     ],
-    "hash": "237a148936eecb7d",
+    "hash": "fc28df63c2ffbdf8",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -9470,6 +9486,7 @@
           ]
         ],
         "queued": [],
+        "resumption": null,
         "taken": [],
         "turn": 0
       },
@@ -9588,7 +9605,7 @@
       "{\"activity\":\"idle\",\"seq\":2,\"t\":\"activity\"}",
       "{\"seq\":2,\"t\":\"synced\"}"
     ],
-    "hash": "298734c4d01cff34",
+    "hash": "654eaeba01966051",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -9658,6 +9675,7 @@
       "state": {
         "calls": [],
         "queued": [],
+        "resumption": null,
         "taken": [],
         "turn": 1
       },
@@ -9739,7 +9757,7 @@
       "{\"call\":1,\"card\":{\"body\":\"hi\\n\",\"note\":\"exit 0\",\"title\":\"$ echo hi\"},\"epoch\":0,\"kind\":\"tool_result\",\"outcome\":{\"output\":{\"exit\":0,\"output\":\"hi\\n\"},\"status\":\"done\"},\"seq\":4,\"t\":\"entry\"}",
       "{\"seq\":4,\"t\":\"synced\"}"
     ],
-    "hash": "6ee03e459f5208c7",
+    "hash": "92a276a5774be9be",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -9828,6 +9846,7 @@
       "state": {
         "calls": [],
         "queued": [],
+        "resumption": null,
         "taken": [],
         "turn": 0
       },
@@ -9917,7 +9936,7 @@
       "{\"call\":2,\"t\":\"delta\",\"text\":\"partial\"}",
       "{\"call\":2,\"epoch\":0,\"kind\":\"model_result\",\"outcome\":{\"output\":\"durable partial\",\"status\":\"interrupted\"},\"seq\":3,\"t\":\"entry\"}"
     ],
-    "hash": "7685eb3adf346ea7",
+    "hash": "ca87d733913cccac",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -9988,6 +10007,7 @@
       "state": {
         "calls": [],
         "queued": [],
+        "resumption": null,
         "taken": [],
         "turn": 1
       },
@@ -10074,7 +10094,7 @@
       "{\"call\":2,\"t\":\"delta\",\"text\":\"lo\"}",
       "{\"call\":2,\"epoch\":0,\"kind\":\"model_result\",\"outcome\":{\"output\":{\"message\":{\"content\":[{\"text\":\"hello\",\"type\":\"text\"}]},\"usage\":{\"input\":4,\"output\":2}},\"status\":\"done\"},\"seq\":3,\"t\":\"entry\"}"
     ],
-    "hash": "38da752b9dbfad2b",
+    "hash": "e6e950bf0b118f66",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -10166,6 +10186,7 @@
       "state": {
         "calls": [],
         "queued": [],
+        "resumption": null,
         "taken": [],
         "turn": 1
       },
@@ -10260,7 +10281,7 @@
       "{\"call\":1,\"epoch\":0,\"kind\":\"answer\",\"seq\":3,\"t\":\"entry\",\"value\":{\"question\":3,\"responses\":{\"confirm\":{\"accept\":{}}}}}",
       "{\"call\":1,\"card\":{\"body\":\"hi\\n\",\"note\":\"exit 0\",\"title\":\"$ echo hi\"},\"epoch\":0,\"kind\":\"tool_result\",\"outcome\":{\"output\":{\"exit\":0,\"output\":\"hi\\n\"},\"status\":\"done\"},\"seq\":4,\"t\":\"entry\"}"
     ],
-    "hash": "6764b2dcffae203e",
+    "hash": "7f1fac9dc419d461",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -10369,6 +10390,7 @@
       "state": {
         "calls": [],
         "queued": [],
+        "resumption": null,
         "taken": [],
         "turn": 0
       },
@@ -10459,7 +10481,7 @@
       "{\"epoch\":0,\"input\":2,\"kind\":\"take\",\"seq\":4,\"t\":\"entry\"}",
       "{\"seq\":4,\"t\":\"synced\"}"
     ],
-    "hash": "9ed8170bdc1f3589",
+    "hash": "0ce415796f2c303a",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -10539,6 +10561,7 @@
       "state": {
         "calls": [],
         "queued": [],
+        "resumption": null,
         "taken": [],
         "turn": 1
       },
@@ -10613,7 +10636,7 @@
       "{\"epoch\":0,\"kind\":\"fired\",\"outcome\":{\"output\":{\"slept\":1},\"status\":\"done\"},\"seq\":3,\"t\":\"entry\",\"watch\":2}",
       "{\"seq\":3,\"t\":\"synced\"}"
     ],
-    "hash": "eefd7cb7dd9b2aef",
+    "hash": "ea61b3a0bfbbce28",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -10677,6 +10700,7 @@
       "state": {
         "calls": [],
         "queued": [],
+        "resumption": null,
         "taken": [],
         "turn": 0
       },
@@ -10752,7 +10776,7 @@
       "{\"epoch\":0,\"kind\":\"input\",\"segments\":[{\"text\":\"two\"}],\"seq\":3,\"t\":\"entry\",\"taken\":true}",
       "{\"seq\":3,\"t\":\"synced\"}"
     ],
-    "hash": "64ada3363c907849",
+    "hash": "c0abeb0fa3ee859a",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -10838,6 +10862,7 @@
       "state": {
         "calls": [],
         "queued": [],
+        "resumption": null,
         "taken": [],
         "turn": 3
       },
@@ -10934,7 +10959,7 @@
       "{\"cwd\":\"/w\",\"epoch\":0,\"kind\":\"environment\",\"seq\":2,\"t\":\"entry\",\"tty\":false,\"vars\":{}}",
       "{\"seq\":2,\"t\":\"synced\"}"
     ],
-    "hash": "6bb4056fb3c1bd69",
+    "hash": "c8c0960cbbf5b6ee",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -10980,6 +11005,7 @@
       "state": {
         "calls": [],
         "queued": [],
+        "resumption": null,
         "taken": [],
         "turn": 0
       },
@@ -11029,7 +11055,7 @@
       "{\"call\":5,\"epoch\":0,\"kind\":\"tool_result\",\"outcome\":{\"output\":\"no jobs\",\"status\":\"done\"},\"seq\":6,\"t\":\"entry\"}",
       "{\"seq\":6,\"t\":\"synced\"}"
     ],
-    "hash": "47f123402c83d60d",
+    "hash": "40a34c0658db01f6",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -11166,6 +11192,7 @@
       "state": {
         "calls": [],
         "queued": [],
+        "resumption": null,
         "taken": [],
         "turn": 4
       },
@@ -11270,11 +11297,11 @@
       "{\"seq\":2,\"t\":\"synced\"}",
       "{\"call\":2,\"t\":\"delta\",\"text\":\"thinking\"}",
       "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
-      "{\"items\":[{\"seq\":1,\"text\":\"one\",\"type\":\"user\"},{\"call\":2,\"model\":\"m\",\"status\":{\"status\":\"running\"},\"text\":\"\",\"type\":\"reply\",\"usage\":null},{\"call\":3,\"input\":{\"command\":\"echo hi\"},\"outcome\":null,\"phase\":{\"waiting\":{\"on\":\"approval\"}},\"reason\":{\"mode\":{\"mode\":\"ask\"}},\"tool\":\"bash\",\"type\":\"tool\"}],\"seq\":4,\"session\":\"00000000-0000-0000-0000-00000000000a\",\"state\":{\"calls\":[[2,{\"independent\":false,\"phase\":\"running\",\"progress\":null,\"question_seq\":null}],[3,{\"independent\":false,\"phase\":{\"waiting\":{\"on\":\"approval\"}},\"progress\":null,\"question_seq\":4}]],\"queued\":[],\"taken\":[],\"turn\":1},\"t\":\"snapshot\",\"workspace\":\"/w\"}",
+      "{\"items\":[{\"seq\":1,\"text\":\"one\",\"type\":\"user\"},{\"call\":2,\"model\":\"m\",\"status\":{\"status\":\"running\"},\"text\":\"\",\"type\":\"reply\",\"usage\":null},{\"call\":3,\"input\":{\"command\":\"echo hi\"},\"outcome\":null,\"phase\":{\"waiting\":{\"on\":\"approval\"}},\"reason\":{\"mode\":{\"mode\":\"ask\"}},\"tool\":\"bash\",\"type\":\"tool\"}],\"seq\":4,\"session\":\"00000000-0000-0000-0000-00000000000a\",\"state\":{\"calls\":[[2,{\"independent\":false,\"phase\":\"running\",\"progress\":null,\"question_seq\":null}],[3,{\"independent\":false,\"phase\":{\"waiting\":{\"on\":\"approval\"}},\"progress\":null,\"question_seq\":4}]],\"queued\":[],\"resumption\":null,\"taken\":[],\"turn\":1},\"t\":\"snapshot\",\"workspace\":\"/w\"}",
       "{\"seq\":4,\"t\":\"synced\"}",
       "{\"epoch\":0,\"kind\":\"assistant\",\"seq\":5,\"t\":\"entry\",\"text\":\"done\"}"
     ],
-    "hash": "ff1ac2681746e0fc",
+    "hash": "15c5e46b72aef387",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -11379,6 +11406,7 @@
             ]
           ],
           "queued": [],
+          "resumption": null,
           "taken": [],
           "turn": 1
         },
@@ -11468,6 +11496,7 @@
           ]
         ],
         "queued": [],
+        "resumption": null,
         "taken": [],
         "turn": 1
       },
@@ -11577,7 +11606,7 @@
       "{\"call\":1,\"epoch\":0,\"kind\":\"tool_result\",\"outcome\":{\"blob\":{\"id\":\"5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a\",\"media_type\":\"text/plain\",\"origin\":{\"tool_output\":1},\"size\":11000},\"status\":\"done\"},\"seq\":2,\"t\":\"entry\"}",
       "{\"seq\":2,\"t\":\"synced\"}"
     ],
-    "hash": "fd2828388e886e10",
+    "hash": "c4bb6db74846502d",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -11648,6 +11677,7 @@
       "state": {
         "calls": [],
         "queued": [],
+        "resumption": null,
         "taken": [],
         "turn": 0
       },
@@ -11761,7 +11791,7 @@
       "{\"epoch\":0,\"kind\":\"assistant\",\"seq\":29,\"t\":\"entry\",\"text\":\"a38\"}",
       "{\"cwd\":\"/w1\",\"epoch\":0,\"kind\":\"environment\",\"seq\":30,\"t\":\"entry\",\"tty\":false,\"vars\":{}}"
     ],
-    "hash": "8bf19c97576ef845",
+    "hash": "f938fbdb677d4d9e",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -12363,6 +12393,7 @@
           ]
         ],
         "queued": [],
+        "resumption": null,
         "taken": [],
         "turn": 22
       },
@@ -12937,7 +12968,7 @@
       "{\"message\":\"e\",\"t\":\"error\"}",
       "{\"epoch\":0,\"kind\":\"assistant\",\"seq\":8,\"t\":\"entry\",\"text\":\"a11\"}"
     ],
-    "hash": "335b0670b4b6c7a3",
+    "hash": "1c78fa665d2d07a2",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -13074,6 +13105,7 @@
       "state": {
         "calls": [],
         "queued": [],
+        "resumption": null,
         "taken": [],
         "turn": 0
       },
@@ -13229,7 +13261,7 @@
       "{\"epoch\":0,\"fact\":{\"annotation\":{\"card\":{\"body\":\"Only lists files.\",\"title\":\"\"},\"lifetime\":\"question\",\"target\":1}},\"kind\":\"fact\",\"seq\":6,\"t\":\"entry\"}",
       "{\"seq\":6,\"t\":\"synced\"}"
     ],
-    "hash": "a666249a1cebeaea",
+    "hash": "369f180627b14739",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -13408,6 +13440,7 @@
           ]
         ],
         "queued": [],
+        "resumption": null,
         "taken": [],
         "turn": 0
       },
@@ -13556,7 +13589,7 @@
       "{\"epoch\":0,\"fact\":{\"annotation\":{\"card\":{\"body\":\"Only lists files.\",\"title\":\"\"},\"lifetime\":\"question\",\"target\":1}},\"kind\":\"fact\",\"seq\":6,\"t\":\"entry\"}",
       "{\"seq\":6,\"t\":\"synced\"}"
     ],
-    "hash": "01eb6f44d3d52269",
+    "hash": "1c9738f114945caa",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -13757,6 +13790,7 @@
           ]
         ],
         "queued": [],
+        "resumption": null,
         "taken": [],
         "turn": 0
       },
@@ -13901,7 +13935,7 @@
       "{\"seq\":2,\"t\":\"synced\"}",
       "{\"call\":1,\"epoch\":0,\"kind\":\"answer\",\"seq\":3,\"t\":\"entry\",\"value\":{\"question\":2,\"responses\":{\"settings\":{\"submit\":{\"enabled\":false}}}}}"
     ],
-    "hash": "af6dcf892d8d7b63",
+    "hash": "1db69292a49c03ea",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -13995,6 +14029,7 @@
           ]
         ],
         "queued": [],
+        "resumption": null,
         "taken": [],
         "turn": 0
       },
@@ -14070,7 +14105,7 @@
       "{\"seq\":2,\"t\":\"synced\"}",
       "{\"call\":1,\"epoch\":0,\"kind\":\"answer\",\"seq\":3,\"t\":\"entry\",\"value\":{\"question\":2,\"responses\":{\"settings\":\"decline\"}}}"
     ],
-    "hash": "af6dcf892d8d7b63",
+    "hash": "1db69292a49c03ea",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -14160,6 +14195,7 @@
           ]
         ],
         "queued": [],
+        "resumption": null,
         "taken": [],
         "turn": 0
       },
@@ -14235,7 +14271,7 @@
       "{\"seq\":2,\"t\":\"synced\"}",
       "{\"call\":1,\"epoch\":0,\"kind\":\"answer\",\"seq\":3,\"t\":\"entry\",\"value\":{\"question\":2,\"responses\":{\"settings\":\"cancel\"}}}"
     ],
-    "hash": "af6dcf892d8d7b63",
+    "hash": "1db69292a49c03ea",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -14325,6 +14361,7 @@
           ]
         ],
         "queued": [],
+        "resumption": null,
         "taken": [],
         "turn": 0
       },
@@ -14400,7 +14437,7 @@
       "{\"seq\":2,\"t\":\"synced\"}",
       "{\"call\":1,\"epoch\":0,\"kind\":\"answer\",\"seq\":3,\"t\":\"entry\",\"value\":{\"question\":1,\"responses\":{\"url\":{\"accept\":{}}}}}"
     ],
-    "hash": "6856fcb1efe2f0c1",
+    "hash": "a76fca9270b812b6",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -14475,6 +14512,7 @@
       "state": {
         "calls": [],
         "queued": [],
+        "resumption": null,
         "taken": [],
         "turn": 0
       },
@@ -14555,7 +14593,7 @@
       "{\"seq\":1,\"t\":\"synced\"}",
       "{\"call\":1,\"epoch\":0,\"kind\":\"answer\",\"seq\":2,\"t\":\"entry\",\"value\":{\"question\":1,\"responses\":{\"browser\":{\"accept\":{}},\"credentials\":{\"submit\":{\"password\":\"fixture-secret-never-shown\"}}}}}"
     ],
-    "hash": "3767ccb73a323876",
+    "hash": "c85b7d875fb6a6f1",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -14651,6 +14689,7 @@
       "state": {
         "calls": [],
         "queued": [],
+        "resumption": null,
         "taken": [],
         "turn": 0
       },
@@ -14752,7 +14791,7 @@
       "{\"epoch\":0,\"kind\":\"question\",\"question\":{\"prompts\":{\"permissions\":{\"form\":{\"fields\":[{\"default\":null,\"description\":null,\"kind\":{\"choice\":{\"options\":[{\"title\":\"Read access\",\"value\":\"opaque-read\"},{\"title\":\"Write access\",\"value\":\"opaque-write\"}],\"selection\":\"one\"}},\"name\":\"permissions0\",\"required\":true,\"sensitive\":true,\"title\":\"API key permissions\"},{\"default\":null,\"description\":null,\"kind\":{\"choice\":{\"options\":[{\"title\":\"Read access\",\"value\":\"opaque-read\"},{\"title\":\"Write access\",\"value\":\"opaque-write\"}],\"selection\":{\"many\":{\"max\":null,\"min\":1}}}},\"name\":\"permissions1\",\"required\":true,\"sensitive\":true,\"title\":\"API key permissions\"}],\"message\":\"Choose API key permissions\"}}},\"source\":\"credential fixture\"},\"seq\":1,\"t\":\"entry\"}",
       "{\"seq\":1,\"t\":\"synced\"}"
     ],
-    "hash": "d60dd63635cbf55b",
+    "hash": "a6b40ecee3d38666",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -14995,6 +15034,7 @@
           ]
         ],
         "queued": [],
+        "resumption": null,
         "taken": [],
         "turn": 0
       },

@@ -76,6 +76,7 @@ macro_rules! json_bytes {
 
 pub(crate) struct Feed {
     pub client: SessionClient,
+    pub edit_reply: Option<rt::oneshot::Sender<Result<String, ClientError>>>,
     rev: u64,
     bytes: usize,
     // Raw transcript items and the display payload Swift retains are distinct.
@@ -99,6 +100,7 @@ impl Feed {
             recent: VecDeque::with_capacity(BUDGET.requests),
             producer: StreamProducer::new(BUFFER),
             client,
+            edit_reply: None,
         }
     }
 
@@ -108,6 +110,7 @@ impl Feed {
             EventKind::Msg(DaemonMsg::Snapshot(_) | DaemonMsg::Attached { .. })
         );
         let effects = self.client.step(event);
+        self.finish_edit();
         let view = self.client.view();
         if self.state_seq != view.seq || reset {
             self.state_bytes = json_bytes!(&view.state);
@@ -242,7 +245,16 @@ impl Feed {
         }
     }
 
+    fn finish_edit(&mut self) {
+        if let Some(result) = self.client.take_queue_edit()
+            && let Some(reply) = self.edit_reply.take()
+        {
+            reply.send(result.map_err(ClientError::from));
+        }
+    }
+
     fn render(&mut self, show: Show) -> Option<ChangeBatch> {
+        self.finish_edit();
         let changes = match show {
             Show::View(update) => ViewChange::of(&update.change, self.client.view()),
             Show::Link => vec![ViewChange::Link {

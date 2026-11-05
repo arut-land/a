@@ -10,7 +10,7 @@ pub(super) enum WorkId {
     Child(SessionId),
     Reaction(u64),
     Delivery,
-    Report(SessionId),
+    Report(SessionId, protocol::RunId),
     // Retained control identity, so recycling a leader pid cannot replace live work.
     Job(usize),
     Sync,
@@ -123,7 +123,7 @@ mod tests {
             WorkId::Child(SessionId::new()),
             WorkId::Reaction(2),
             WorkId::Delivery,
-            WorkId::Report(SessionId::new()),
+            WorkId::Report(SessionId::new(), protocol::RunId::Initial),
             WorkId::Job(3),
             WorkId::Sync,
         ];

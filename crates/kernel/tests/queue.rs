@@ -233,6 +233,7 @@ fn a_childs_result_never_jumps_ahead_of_the_users_queued_input() {
         wait: false,
     });
     s.step(Event::ChildSettled {
+        run: protocol::RunId::Initial,
         child: child(),
         outcome: done(json!("ok")).into(),
     });
@@ -730,6 +731,7 @@ fn a_child_no_call_waits_on_is_queued_by_its_watch_once() {
         wait: false,
     });
     let settled = || Event::ChildSettled {
+        run: protocol::RunId::Initial,
         child: child(),
         outcome: done(json!("ok")).into(),
     };

@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     Activity, Audience, Author, Body, CallId, Carried, ClientId, ClientSeq, Entry, EnvelopeId,
-    Environment, InboxRefusal, Installed, Json, Mode, Outcome, Payload, Permission, Seq, SessionId,
-    Source, ToolChoice, ToolOutcome, Verdict, WaitOn,
+    Environment, InboxRefusal, Installed, Json, Mode, Outcome, Payload, Permission, RunId, Seq,
+    SessionId, Source, ToolChoice, ToolOutcome, Verdict, WaitOn,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -18,6 +18,8 @@ pub struct Ledger {
     identities: BTreeMap<String, BTreeSet<(u128, u64)>>,
     outbox: Vec<Sending>,
     resumption: Option<(Seq, SessionId)>,
+    run: RunId,
+    prior_runs: Vec<(RunId, ToolOutcome)>,
     acknowledgements: Vec<(EnvelopeId, Option<InboxRefusal>)>,
     /// Model and tool calls with an intent and no outcome.
     open: Keyed<CallId, Open>,
@@ -28,7 +30,7 @@ pub struct Ledger {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     detached: Vec<Detached>,
     /// Watches that have not fired.
-    armed: Keyed<Seq, SessionId>,
+    armed: Keyed<Seq, (SessionId, RunId)>,
     /// Every child linked, in order, and the children ever watched.
     links: Vec<Link>,
     watched: Vec<u128>,
@@ -342,7 +344,14 @@ impl Ledger {
                 refusal,
             } => {
                 if envelope_id.purpose == EnvelopeId::RESUMED {
-                    self.resumption = None;
+                    if *refusal == Some(InboxRefusal::Full) {
+                        return;
+                    }
+                    if self.resumption.is_some_and(|(input, parent)| {
+                        envelope_id.call.0 == input && *recipient == parent
+                    }) {
+                        self.resumption = None;
+                    }
                 }
                 // Settled once every recipient has answered, with the first
                 // refusal any gave.
@@ -374,7 +383,10 @@ impl Ledger {
                     .insert((envelope.id().sender.0.as_u128(), envelope.id().call.0.get()))
                 {
                     if envelope.payload() == &Carried::Resumed {
-                        self.armed.insert(seq, envelope.id().sender);
+                        self.armed.insert(
+                            seq,
+                            (envelope.id().sender, RunId::Resumed(envelope.id().call.0)),
+                        );
                     }
                     let item = Item::from(envelope);
                     if let Item::Detached(call, _) = item {
@@ -398,6 +410,10 @@ impl Ledger {
                 ..
             } => {
                 if let Some(parent) = resume {
+                    if let Some(outcome) = &self.result {
+                        self.prior_runs.push((self.run, outcome.clone()));
+                    }
+                    self.run = RunId::Resumed(seq);
                     self.resumption = Some((seq, *parent));
                 }
                 if *taken {
@@ -456,6 +472,11 @@ impl Ledger {
             | Body::Unwatch { .. } => self.track(CallId(seq), body),
             // What runs in the background ends with the interrupt.
             Body::Interrupt { .. } => {
+                // A pending resume has no running turn; its interrupt cancels
+                // the queued work atomically before notification can release it.
+                if self.resumption.is_some() {
+                    self.untaken.clear();
+                }
                 self.detached.clear();
                 self.result = Some(ToolOutcome::Interrupted { output: None });
             }
@@ -571,7 +592,7 @@ impl Ledger {
                 }
             }
             Body::Watch { child } => {
-                self.armed.insert(here.0, *child);
+                self.armed.insert(here.0, (*child, RunId::Initial));
                 if let Err(at) = self.watched.binary_search(&child.0.as_u128()) {
                     self.watched.insert(at, child.0.as_u128());
                 }
@@ -709,7 +730,22 @@ impl Ledger {
 
     /// The watches that have not fired, as `(seq, child)`, by seq.
     pub fn armed(&self) -> impl Iterator<Item = (Seq, SessionId)> + '_ {
-        self.armed.iter().map(|(seq, &child)| (seq, child))
+        self.armed.iter().map(|(seq, &(child, _))| (seq, child))
+    }
+
+    pub fn armed_runs(&self) -> impl Iterator<Item = (Seq, SessionId, RunId)> + '_ {
+        self.armed
+            .iter()
+            .map(|(seq, &(child, run))| (seq, child, run))
+    }
+
+    pub const fn run(&self) -> RunId {
+        self.run
+    }
+
+    /// Past executions remain reportable after a later input or a daemon restart.
+    pub fn prior_runs(&self) -> impl Iterator<Item = (RunId, &ToolOutcome)> {
+        self.prior_runs.iter().map(|(run, outcome)| (*run, outcome))
     }
 
     pub fn enqueued(&self, seq: Seq) -> bool {

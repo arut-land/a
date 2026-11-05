@@ -26,7 +26,9 @@ public struct SessionComposer: View {
                     Text("Queued: \(queued.text)").lineLimit(2)
                     Spacer()
                     Button("Edit") {
-                        if let text = try? store.editQueued(queued.seq) { input = text; managing = false; composing = true }
+                        Task {
+                            if let text = try? await store.editQueued(queued.seq) { input = text; managing = false; composing = true }
+                        }
                     }
                 }.font(.caption).padding(.horizontal, 10)
             }

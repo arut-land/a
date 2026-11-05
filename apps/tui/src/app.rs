@@ -331,7 +331,7 @@ impl App {
     #[cfg(test)]
     pub fn fold(&mut self, msg: &protocol::DaemonMsg) -> Vec<client::Io> {
         let conn = self.client.connection();
-        let effects = self.client.step(client::Event {
+        let effects = self.step(client::Event {
             conn,
             kind: client::EventKind::Msg(msg.clone()),
         });
@@ -478,21 +478,31 @@ impl App {
         self.redraw = true;
     }
 
-    pub fn edit_queued(&mut self, input: protocol::Seq) -> Vec<client::Effect> {
-        match self.client.edit_queued(input) {
-            Ok((text, effects)) => {
+    pub fn step(&mut self, event: client::Event) -> Vec<client::Effect> {
+        let effects = self.client.step(event);
+        self.finish_edit();
+        effects
+    }
+
+    fn finish_edit(&mut self) {
+        match self.client.take_queue_edit() {
+            Some(Ok(text)) => {
                 self.editor.recalled(&text);
                 self.conversation_at = None;
                 self.recall = None;
                 self.redraw = true;
                 self.composed = None;
-                effects
             }
-            Err(notice) => {
-                self.notice(notice.to_string(), true);
-                Vec::new()
-            }
+            Some(Err(notice)) => self.notice(notice.to_string(), true),
+            None => {}
         }
+    }
+
+    pub fn edit_queued(&mut self, input: protocol::Seq) -> Vec<client::Effect> {
+        self.client.edit_queued(input).unwrap_or_else(|notice| {
+            self.notice(notice.to_string(), true);
+            Vec::new()
+        })
     }
 
     pub fn contains_conversation(&self, id: protocol::SessionId) -> bool {
@@ -1206,6 +1216,7 @@ impl App {
 impl Renderer for App {
     fn show(&mut self, shown: Vec<Show>) -> Vec<client::Effect> {
         let mut asked = Vec::new();
+        self.finish_edit();
         for show in shown {
             match show {
                 Show::View(update) => {

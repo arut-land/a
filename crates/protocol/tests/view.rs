@@ -1770,7 +1770,7 @@ fn view_snapshots_contain_no_execution_authority() {
         let state = snapshot["state"].as_object().unwrap();
         assert_eq!(
             state.keys().map(String::as_str).collect::<Vec<_>>(),
-            ["calls", "queued", "taken", "turn"]
+            ["calls", "queued", "resumption", "taken", "turn"]
         );
         for call in state["calls"].as_array().unwrap() {
             assert_eq!(

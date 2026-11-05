@@ -103,6 +103,19 @@ wakes an idle parent like another inbox message. The next outcome follows the
 same watch/result lane as the original run; nested children notify their direct
 parent. Clients render the notice as one compact transcript item.
 
+Resume watches and reports identify the execution as well as the child: the
+original run or the sequence of its accepted resume input. A delayed original
+report cannot fire a resumed watch. Previous outcomes remain derivable from
+the child log and are reported again after restart; fired watches deduplicate
+them independently.
+
+A full parent inbox keeps the resume gated and retries notification after a
+short delay. A terminal refusal cancels the queued resume and records the
+interrupt before settling the refusal. Stop during notification atomically
+discards its queued work in the interrupt fact. Notification can still settle,
+but acknowledgement or replay cannot execute the cancelled input.
+
+
 A task's `Spawn` contains a prompt, context, runner selection, typed budget
 and placement. Context is `Fresh` or `Owner`; an owner prefix runs through
 the owning call's sequence, which must be committed. Runner selection

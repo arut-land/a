@@ -341,6 +341,7 @@ pub struct Live {
     driver: client::ClientHandle,
     page: Page,
     conversations: client::ConversationWatch,
+    edit_reply: Option<rt::oneshot::Sender<Option<String>>>,
 }
 
 impl Live {
@@ -380,6 +381,7 @@ impl Live {
             driver,
             page,
             conversations,
+            edit_reply: None,
         };
         live.driver.pump(&mut live.page, open);
         live
@@ -413,8 +415,8 @@ impl Live {
                         (effects, None)
                     }
                     TabIn::EditQueued(input, reply) => {
-                        if let Ok((text, effects)) = self.page.client.edit_queued(input) {
-                            reply.send(Some(text));
+                        if let Ok(effects) = self.page.client.edit_queued(input) {
+                            self.edit_reply = Some(reply);
                             (effects, None)
                         } else {
                             reply.send(None);
@@ -431,6 +433,11 @@ impl Live {
                         values,
                     } => (self.page.question(call, question, &action, values), None),
                 };
+                if let Some(result) = self.page.client.take_queue_edit()
+                    && let Some(reply) = self.edit_reply.take()
+                {
+                    reply.send(result.ok());
+                }
                 self.driver.pump(&mut self.page, effects);
                 if let Some(reply) = admission {
                     reply.send(self.page.admitted());

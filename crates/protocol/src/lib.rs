@@ -173,6 +173,15 @@ pub use framing::FrameReader;
 pub use json::Json;
 pub use peer::{MachineId, Role};
 
+/// A child's original execution or the input that durably resumed it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunId {
+    #[default]
+    Initial,
+    Resumed(Seq),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SessionId(pub Uuid);

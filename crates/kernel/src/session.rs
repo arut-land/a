@@ -6,7 +6,7 @@ use std::sync::Arc;
 use protocol::ledger::{Call, Ledger, OutcomeKind, Phase, Queued};
 use protocol::{
     Audience, Author, Body, CallId, Carried, Entry, Envelope, EnvelopeId, Held, Json, Mode,
-    Outcome, OutputStream, Seq, SessionId, ToolChoice, ToolOutcome, Verdict, WaitOn,
+    Outcome, OutputStream, RunId, Seq, SessionId, ToolChoice, ToolOutcome, Verdict, WaitOn,
 };
 use smallvec::SmallVec;
 
@@ -63,6 +63,7 @@ pub struct Core {
     busy: bool,
     /// The last entry when the session last reported.
     reported: u64,
+    reported_runs: std::collections::BTreeSet<RunId>,
     /// Why the model call being recovered failed, while a handler decides.
     failed: Option<String>,
     /// Detached calls an interrupt cancelled before its entry, which ends
@@ -123,6 +124,7 @@ impl Core {
             owned_cancelled: false,
             busy: false,
             reported: 0,
+            reported_runs: std::collections::BTreeSet::new(),
             failed: None,
             dropped: SmallVec::new(),
             ending: SmallVec::new(),
@@ -309,7 +311,11 @@ impl Core {
                 result,
                 ticket,
             } => self.delivered(&id, recipient, result, ticket, &mut fx),
-            Event::ChildSettled { child, outcome } => self.child_settled(child, &outcome, &mut fx),
+            Event::ChildSettled {
+                child,
+                run,
+                outcome,
+            } => self.child_settled(child, run, &outcome, &mut fx),
             Event::Registry(registry) => {
                 if self.at_rest() {
                     self.resolve(registry, &mut fx);
@@ -523,6 +529,26 @@ impl Core {
         let pending = (self.fold.ledger.outbox().iter())
             .any(|e| e.id == *id && e.pending.contains(&recipient));
         if pending {
+            if id.purpose == EnvelopeId::RESUMED {
+                if result == Err(protocol::InboxRefusal::Full) {
+                    if let Some(sending) = self
+                        .fold
+                        .ledger
+                        .outbox()
+                        .iter()
+                        .find(|sending| sending.id == *id)
+                    {
+                        fx.immediate.push(Work::Deliver {
+                            envelope: sending.to(recipient).expect("reserved resume envelope"),
+                            ticket: None,
+                        });
+                    }
+                    return;
+                }
+                if result.is_err() && self.fold.ledger.resumption().is_some() {
+                    self.interrupted_entry(None, fx);
+                }
+            }
             self.append(
                 fx,
                 Body::Ack {
@@ -720,6 +746,10 @@ impl Core {
     /// in any state: what waits settles at once, what runs is cancelled and
     /// settles as it reports.
     fn interrupt(&mut self, origin: Option<Author>, fx: &mut StepPlan) {
+        if self.fold.ledger.resumption().is_some() {
+            self.interrupted_entry(origin, fx);
+            return;
+        }
         let background = self.drop_detached(fx);
         let detached: Vec<_> = self
             .fold
@@ -1424,13 +1454,19 @@ impl Core {
     /// Fires the watches on `child`. A call waiting on it goes on with its
     /// result; otherwise the result is queued, as the session's own
     /// envelope under the watch, for the agent to take up.
-    fn child_settled(&mut self, child: SessionId, outcome: &ToolOutcome, fx: &mut StepPlan) {
+    fn child_settled(
+        &mut self,
+        child: SessionId,
+        run: RunId,
+        outcome: &ToolOutcome,
+        fx: &mut StepPlan,
+    ) {
         let Some(call) = self.fold.owner(child) else {
-            self.fire(child, outcome, fx);
+            self.fire(child, run, outcome, fx);
             self.queue_children(fx);
             return;
         };
-        if self.fire(child, outcome, fx).is_empty() {
+        if self.fire(child, run, outcome, fx).is_empty() {
             return;
         }
         match (&self.turn, self.step_of(call)) {
@@ -1459,11 +1495,14 @@ impl Core {
     fn fire(
         &mut self,
         child: SessionId,
+        run: RunId,
         outcome: &ToolOutcome,
         fx: &mut StepPlan,
     ) -> SmallVec<[Seq; 1]> {
-        let watches: SmallVec<[Seq; 1]> = (self.fold.ledger.armed())
-            .filter_map(|(watch, watched)| (watched == child).then_some(watch))
+        let watches: SmallVec<[Seq; 1]> = (self.fold.ledger.armed_runs())
+            .filter_map(|(watch, watched, watched_run)| {
+                (watched == child && watched_run == run).then_some(watch)
+            })
             .collect();
         for &watch in &watches {
             let outcome = outcome.clone();
@@ -1926,12 +1965,26 @@ impl Core {
         // input yet has not run).
         let settled = self.turn == Turn::Idle && !queued && !armed && !outgoing && !background;
         let ran = ledger.turn_start().is_some();
+        if self.child {
+            for (run, outcome) in ledger.prior_runs() {
+                if self.reported_runs.insert(run) {
+                    fx.immediate.push(Work::Report {
+                        run,
+                        outcome: outcome.clone(),
+                    });
+                }
+            }
+        }
         if settled && self.child && ran && ledger.seq() > self.reported {
             self.reported = ledger.seq();
+            self.reported_runs.insert(ledger.run());
             let outcome = ledger.result().cloned().unwrap_or_else(|| Outcome::Failed {
                 error: "the child settled without a result".to_owned(),
             });
-            fx.immediate.push(Work::Report { outcome });
+            fx.immediate.push(Work::Report {
+                run: ledger.run(),
+                outcome,
+            });
         }
     }
 

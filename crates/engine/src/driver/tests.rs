@@ -1003,7 +1003,7 @@ fn a_fired_watch_wakes_the_model_with_the_childs_result() {
     let found = Outcome::Done {
         output: Json::encode("found it").unwrap(),
     };
-    session.settled(child, found.clone().into());
+    session.settled(child, protocol::RunId::Initial, found.clone().into());
     settle(&session);
     let log = log_of(&session);
     session.halt();
@@ -3281,6 +3281,7 @@ fn child_snapshot_resume_equals_full_log_resume() {
                 .any(|w| matches!(
                     w,
                     kernel::Work::Report {
+                        run: protocol::RunId::Initial,
                         outcome: Outcome::Done { .. }
                     }
                 ))

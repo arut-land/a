@@ -301,6 +301,8 @@ pub struct SessionClient {
     /// was draining is sent again, once, after the reattach.
     unanswered: VecDeque<ClientMsg>,
     submission: Option<crate::Submission>,
+    editing: Option<(u64, protocol::Seq, String)>,
+    edit_result: Option<Result<String, Notice>>,
 }
 
 impl SessionClient {
@@ -324,6 +326,8 @@ impl SessionClient {
             queued: Vec::new(),
             unanswered: VecDeque::new(),
             submission: None,
+            editing: None,
+            edit_result: None,
         }
     }
 
@@ -452,7 +456,10 @@ impl SessionClient {
     }
 
     /// Withdraws a queued input for editing through the same path in every view.
-    pub fn edit_queued(&mut self, input: protocol::Seq) -> Result<(String, Vec<Effect>), Notice> {
+    pub fn edit_queued(&mut self, input: protocol::Seq) -> Result<Vec<Effect>, Notice> {
+        if self.editing.is_some() || self.edit_result.is_some() {
+            return Err(Notice::Backpressure);
+        }
         let text = self
             .queued_inputs()
             .find(|queued| queued.seq == input)
@@ -460,7 +467,28 @@ impl SessionClient {
             .text
             .clone();
         let effects = self.offer()?.withdraw(input)?;
-        Ok((text, effects))
+        self.editing = Some((self.seq, input, text));
+        Ok(effects)
+    }
+
+    /// Takes the result of the pending queue edit after stepping a daemon event.
+    pub fn take_queue_edit(&mut self) -> Option<Result<String, Notice>> {
+        self.edit_result.take()
+    }
+
+    fn edited(&mut self, client_seq: u64, accepted: bool) {
+        if self
+            .editing
+            .as_ref()
+            .is_some_and(|(seq, _, _)| *seq == client_seq)
+        {
+            let (_, input, text) = self.editing.take().expect("matching edit request");
+            self.edit_result = Some(if accepted {
+                Ok(text)
+            } else {
+                Err(Notice::NotQueued(input))
+            });
+        }
     }
 
     /// recalled from the session view instead, including its visible queue.
@@ -552,6 +580,9 @@ impl SessionClient {
             self.view_current = false;
             self.conversation = None;
             self.submission = None;
+            if let Some((seq, _, _)) = self.editing.as_ref() {
+                self.edited(*seq, false);
+            }
         }
         let mut attach = attach;
         attach.decl.sides = self.sides.keys().cloned().collect();
@@ -853,6 +884,9 @@ impl SessionClient {
                 if let Some(author) = entry.body.origin()
                     && author.client == self.opened.client
                 {
+                    if matches!(entry.body, protocol::Body::Withdraw { .. }) {
+                        self.edited(author.seq.get(), true);
+                    }
                     self.unanswered
                         .retain(|m| m.client_seq().is_none_or(|s| s > author.seq.get()));
                 }
@@ -863,6 +897,7 @@ impl SessionClient {
                 return;
             }
             DaemonMsg::Ack { client_seq } => {
+                self.edited(*client_seq, true);
                 self.unanswered
                     .retain(|m| m.client_seq() != Some(*client_seq));
                 return;
@@ -879,6 +914,7 @@ impl SessionClient {
                     self.queued.push(again);
                     return;
                 }
+                self.edited(*client_seq, false);
             }
             _ => {}
         }
@@ -1039,6 +1075,9 @@ impl SessionClient {
     }
 
     fn end(&mut self, end: End, out: &mut Vec<Effect>) {
+        if let Some((seq, _, _)) = self.editing.as_ref() {
+            self.edited(*seq, false);
+        }
         self.queued.clear();
         self.go(Link::Ended(end), out);
     }
@@ -1317,6 +1356,79 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn queued_text_is_not_released_before_withdrawal_is_confirmed() {
+        let (mut client, _) = attached(Env::Keep);
+        let input = Seq::new(2).unwrap();
+        client.step(msg(
+            1,
+            DaemonMsg::from(Entry::new(
+                input,
+                Epoch(1),
+                Body::Input {
+                    segments: "queued text".into(),
+                    mode: Mode::Queue,
+                    taken: false,
+                    origin: None,
+                    resume: None,
+                    force: false,
+                },
+            )),
+        ));
+        let effects = client.edit_queued(input).unwrap();
+        assert!(client.take_queue_edit().is_none());
+        let seq = sends(&effects)[0].client_seq().unwrap();
+        client.step(msg(1, DaemonMsg::Ack { client_seq: seq }));
+        assert_eq!(client.take_queue_edit(), Some(Ok("queued text".into())));
+        client.step(msg(1, DaemonMsg::Ack { client_seq: seq }));
+        assert!(client.take_queue_edit().is_none());
+    }
+
+    #[test]
+    fn a_taken_queue_entry_never_releases_editable_text_after_withdrawal_refusal() {
+        let (mut client, _) = attached(Env::Keep);
+        let input = Seq::new(2).unwrap();
+        client.step(msg(
+            1,
+            DaemonMsg::from(Entry::new(
+                input,
+                Epoch(1),
+                Body::Input {
+                    segments: "original".into(),
+                    mode: Mode::Queue,
+                    taken: false,
+                    origin: None,
+                    resume: None,
+                    force: false,
+                },
+            )),
+        ));
+        let effects = client.edit_queued(input).unwrap();
+        let seq = sends(&effects)[0].client_seq().unwrap();
+        client.step(msg(
+            1,
+            DaemonMsg::from(Entry::new(
+                Seq::new(3).unwrap(),
+                Epoch(1),
+                Body::Take { input, into: None },
+            )),
+        ));
+        client.step(msg(
+            1,
+            DaemonMsg::Rejected {
+                client_seq: seq,
+                reason: Rejection::NotWaiting,
+                message: "already taken".into(),
+            },
+        ));
+        assert_eq!(
+            client.take_queue_edit(),
+            Some(Err(Notice::NotQueued(input)))
+        );
+        client.step(msg(1, DaemonMsg::Ack { client_seq: seq }));
+        assert!(client.take_queue_edit().is_none());
     }
 
     #[test]

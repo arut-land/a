@@ -306,9 +306,9 @@ public final class SessionStore {
         }
     }
 
-    public func editQueued(_ seq: UInt64) throws -> String {
+    public func editQueued(_ seq: UInt64) async throws -> String {
         guard let session else { throw ClientError.notOpen }
-        return try session.editQueued(input: seq)
+        return try await session.editQueued(input: seq)
     }
 
     private func adopt(_ s: SessionSnapshot) {

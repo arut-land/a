@@ -791,14 +791,19 @@ impl Session {
     }
 
     /// Withdraws the queued original and returns its text to the shared composer.
-    pub fn edit_queued(&self, input: u64) -> Result<String, ClientError> {
+    pub async fn edit_queued(&self, input: u64) -> Result<String, ClientError> {
         let input = protocol::Seq::new(input).ok_or(ClientError::InvalidArgument {
             message: "invalid queued input".into(),
         })?;
-        let mut feed = lock(&self.feed);
-        let (text, effects) = feed.client.edit_queued(input)?;
-        self.driver.pump(&mut *feed, effects);
-        Ok(text)
+        let receive = {
+            let mut feed = lock(&self.feed);
+            let effects = feed.client.edit_queued(input)?;
+            let (reply, receive) = rt::oneshot::channel();
+            feed.edit_reply = Some(reply);
+            self.driver.pump(&mut *feed, effects);
+            receive
+        };
+        receive.await.ok_or(ClientError::NotOpen)?
     }
 
     /// Sends the user's input as it is.
