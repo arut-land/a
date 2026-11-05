@@ -1,8 +1,19 @@
-# Admission deduplication: phase-1 gate
+# Admission deduplication
+
+## Decision
+
+Stage 4 is measured and closed. The child keeps its frozen authority copy,
+so child start, reload and restart stay a local read with no parent lookup.
+The parent's admission record stays the durable fact written first, and
+stage 3's retention rule is unchanged.
+
+The measured ceiling is under 0.43% of retained bytes on the stage-3 workload,
+so no hybrid can pay for a lookup there. Reopen only if measured real sessions
+show copied authority above about 2% of retained bytes: the many-children,
+short-output shape measured at 2.2% on echo.
 
 2026-11-03. Branch `admit-dedup`; fetched main and measured baseline
-`624e76a58abb85ff05135e67ad7aabc4cb42c918`. Phase 1 stops at the gate:
-**recommend keeping the child authority copy. No product implementation.**
+`624e76a58abb85ff05135e67ad7aabc4cb42c918`.
 
 The complete stage-3 construction workload would save only **0.385–0.392%**
 of retained logical bytes. Even deleting every entire `Spawned` row and its
@@ -10,12 +21,6 @@ index position, charging nothing for a reference, projects less than 0.426%.
 The echo-only matrix is a counterexample to calling every saving negligible:
 it projects **2.17–2.19%**, roughly 203 KiB per root at 32 turns. That is near
 the brief's example threshold, rather than well under it.
-
-The recommendation weighs that modest echo saving against the representative
-stage-3 result and the measured lookup cost. Reference recovery adds work;
-live resolved-authority heap is identical. This judgment gives priority to
-the stage-3 workload; it does not apply a strict “under 2%” rule to every case.
-The coordinator can reopen it for sessions with many children and short outputs.
 
 ## Verified finding
 
@@ -42,7 +47,9 @@ context, payload, watch, budget, cache, protocol or log code was changed.
 
 ## Method and evidence
 
-Raw evidence, stopped homes, baseline binary, scripts and temporary test sources:
+The raw evidence was scratch-only and has since been deleted; the tables here
+are the record. Raw evidence, stopped homes, baseline binary, scripts and
+temporary test sources were stored at:
 
 ```text
 /private/tmp/claude-502/-Users-rajaniraiyn-work-a/57b9c5f0-cf3a-47ba-ba38-f417726d005b/scratchpad/r/admit-dedup
@@ -50,7 +57,7 @@ Raw evidence, stopped homes, baseline binary, scripts and temporary test sources
 
 Call this directory `E`. `build.json`, `gate_matrix.py`, `matrix_support.py`,
 `extend_echo.py`, `lookup-helper.rs`, `memory-helper.rs`, `memory.py`,
-`audit.py`, `summarize.py` and their JSON/log outputs preserve the method.
+`audit.py`, `summarize.py` and their JSON/log outputs recorded the method.
 The original stage-3 helper was reused for its loopback SSE fixture.
 
 Host: native macOS 27.2 arm64, Mac15,13, 16 GiB. The fixture binary was built
@@ -235,7 +242,7 @@ not daemon heap/charged-memory acceptance. Serialized frame storage could differ
 in a future implementation. Avoided child encoding/writes were not benchmarked;
 no whole-admission, late-turn CPU or whole-daemon memory speedup is claimed.
 
-## Verification, exclusions and phase-1 disposition
+## Verification and exclusions
 
 - Native release fixture probes: both complete matrices; every child authority
   matches its canonical source with the existing model-only transformation.
@@ -250,15 +257,16 @@ no whole-admission, late-turn CPU or whole-daemon memory speedup is claimed.
   and `settings_roles_and_frozen_child_sets_survive_reload_without_widening` pass.
 - Two release lookup diagnostic invocations and the native heap/CPU diagnostic
   pass. The reference prototype exercises real store files and the production
-  cut reader and authority codec. Temporary tests are preserved in `E` and
-  removed from the committed diff.
+  cut reader and authority codec. Temporary tests were stored in scratch-only `E`
+  and removed from the committed diff; those scratch files have since been deleted.
 - `mise run check:windows`, through the isolated mise configuration and assigned
   target: passed. The initial diagnostic helper triggered precision-loss lints;
   integer aggregation fixed those. Final lint runs after helper removal too.
 - `cargo fmt --all -- --check` and `git diff --check`: passed after removal.
 - Initial echo completion detection incorrectly required an assistant reply
   from a tool-only nested child; that smoke run is excluded. A slow inventory
-  re-read parent logs repeatedly; its stopped files are retained separately.
+  re-read parent logs repeatedly; its stopped files were retained separately
+  in the deleted scratch evidence.
   Interrupting it raced its advance into the first 64-turn case, overlapping
   the replacement. That home is excluded, both scripts ended, and a fresh
   directory rerun passed. The harness now refuses unfinished existing case
@@ -273,14 +281,7 @@ or view vector was edited.
 Only this report is committed: **0 product Rust lines added or deleted**.
 PROTO stays 46 and JSONL stays 2. No candidate binary-size delta is asserted,
 and the implementation-only daemon acceptance matrix is not claimed. No full
-CI workflow was dispatched. Target and raw evidence remain for phase 2.
+CI workflow was dispatched. The raw evidence was scratch-only and has since
+been deleted; the tables here are the record.
 
-Owner-pending: the recommendation is to stop rather than add a canonical lookup
-for this measured tradeoff. If the coordinator prioritizes the roughly 2.2%
-echo cases, reopen implementation explicitly. It would also need ownership of
-`crates/engine/src/lib.rs` (the child `Spawned` import/start boundary) and
-`crates/engine/src/driver/side.rs` (model-only child construction and its cleared
-context seed), neither listed in this brief's non-test ownership. Without the
-approved recursive source pins, deleting a parent would certainly strand a
-reference; the measured lookup and retention cost, plus crash-ordering tests,
-is the cost of avoiding that failure. No speculative hardening was added.
+No speculative hardening was added.

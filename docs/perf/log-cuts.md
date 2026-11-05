@@ -3,7 +3,7 @@
 Branch `log-cuts`; baseline `ad00daad96bb79f6d11daf80adc895b958719dd5`
 (app-ux merged). Native macOS arm64, 2026-10-31–2026-11-01 local. Phases 1 and 2
 are complete. This implements owner-approved child-storage stage 3. Admission
-record deduplication (stage 4) is not part of this change.
+record deduplication (stage 4) was [measured and closed](admit-dedup.md).
 
 Status: phase 2 is complete. Audited clean-source n=10 data cover all four
 hosts, including the owner-approved native Windows publication fix; the deep
@@ -66,7 +66,7 @@ Kept: result/image/paste/job blobs and content addressing; projection-based
 payload access checks; admission barriers; watches, inboxes and budgets;
 provider-prefix compiler caches. Prefix cache identities use `LogCut` rather
 than a context blob hash. Publication snapshots remain in admission authority;
-removing duplicated admission authority is stage 4.
+admission deduplication (stage 4) was [measured and closed](admit-dedup.md).
 
 PROTO changes **45 → 46** and JSONL format **1 → 2**, without compatibility or
 migration. Version literals were bumped by the external `versions.py` script;

@@ -391,3 +391,6 @@ Owner decisions before a storage rewrite:
 No speculative hardening was added. No additional non-test source files are
 needed for this research deliverable. Await coordinator review and phase-2
 instructions after the report commit is pushed.
+
+Closing note: stages 1–3 landed; stage 4 was
+[measured and closed](admit-dedup.md); stage 5 was done within each stage.
