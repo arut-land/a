@@ -343,9 +343,15 @@ struct NativeTranscriptTests {
         try await eventually("picker has keyboard focus") { window.firstResponder is NSTableView }
         let field = try #require(nativeLabels(host).first { $0.isEditable })
         let point = field.convert(NSPoint(x: field.bounds.midX, y: field.bounds.midY), to: nil)
-        for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
-            window.sendEvent(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: 0,
-                windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!)
+        let click = try [NSEvent.EventType.leftMouseDown, .leftMouseUp].map { type in
+            try #require(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: 0,
+                windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 1))
+        }
+        // Text selection tracks inside mouseDown; mouseUp must already be queued.
+        for event in click.reversed() { NSApplication.shared.postEvent(event, atStart: true) }
+        while let event = NSApplication.shared.nextEvent(matching: [.leftMouseDown, .leftMouseUp],
+            until: .distantPast, inMode: .default, dequeue: true) {
+            window.sendEvent(event)
         }
         try await eventually("composer releases picker focus") { !selection.managing && window.firstResponder is NSTextView }
         window.sendEvent(NSEvent.keyEvent(with: .keyDown, location: point, modifierFlags: [], timestamp: 0,
