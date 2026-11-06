@@ -1,4 +1,5 @@
 name: Diagnostic apple stall
+# Temporary paired investigation; keep full CI out of diagnostic-only pushes.
 on:
   workflow_dispatch:
   push:
