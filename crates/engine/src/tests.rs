@@ -289,6 +289,89 @@ fn busy_sessions_recover_at_startup() {
     assert!(!still_busy);
 }
 
+#[test]
+fn read_only_inboxes_refuse_delivery_without_requesting_recovery() {
+    for damaged in [false, true] {
+        let (root, home) = home("read-only-inbox");
+        let store = Jsonl::open(home.sessions_dir()).unwrap();
+        let id = SessionId::new();
+        let mut created = store
+            .create(&Header {
+                id,
+                workspace: "/w".into(),
+                parent: None,
+            })
+            .unwrap();
+        let entries = [
+            Body::Extensions {
+                installed: vec![protocol::Installed {
+                    name: "unavailable".into(),
+                    version: 1,
+                    image: Some(Json::encode(&"unavailable generation").unwrap()),
+                }],
+            },
+            Body::Assistant {
+                text: "retained".into(),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(n, body)| {
+            Entry::new(
+                Seq::new(n as u64 + 1).unwrap(),
+                Epoch(created.writer.epoch()),
+                body,
+            )
+        })
+        .collect::<Vec<_>>();
+        created.writer.append_raw(&entries).unwrap();
+        drop(created);
+        let path = home.sessions_dir().join(format!("{id}/log.jsonl"));
+        if damaged {
+            let mut bytes = std::fs::read(&path).unwrap();
+            let entry = memchr::memchr(b'\n', &bytes).unwrap() + 10;
+            bytes[entry] ^= 1;
+            std::fs::write(&path, bytes).unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+        let daemon = Daemon::load(&home, &echo()).unwrap();
+        let attached = daemon.attach_to(&Target::Id(id), PathBuf::new).unwrap();
+        settle(&daemon);
+        assert_eq!(
+            attached.session().summary().read_only,
+            Some(if damaged {
+                protocol::ReadOnly::Damaged { seq: 1 }
+            } else {
+                protocol::ReadOnly::Extensions
+            })
+        );
+        let envelope = protocol::Envelope::new(
+            protocol::EnvelopeId {
+                sender: SessionId::new(),
+                call: CallId::new(1).unwrap(),
+                purpose: protocol::EnvelopeId::RESUMED.into(),
+            },
+            id,
+            protocol::Carried::Resumed,
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            rt::block_on(attached.session().enqueue(envelope.clone())),
+            Err(protocol::InboxRefusal::Unavailable),
+            "read-only refusal must not request recovery"
+        );
+        assert_eq!(
+            rt::block_on(daemon.deliver(envelope)),
+            Err(protocol::InboxRefusal::Unavailable)
+        );
+        drop(attached);
+        drop(daemon);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 /// A busy session whose log is damaged before its tail is listed as kept
 /// as it is, shown, and never resumed or written: its open call does not
 /// run again, and input is refused.

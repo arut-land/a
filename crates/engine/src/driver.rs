@@ -2122,6 +2122,7 @@ impl Actor {
                 lock(&self.live.session.pending_env).take();
             }
             Msg::Request { reply, .. } => reply.send(Err(why.to_string())),
+            Msg::Enqueue { reply, .. } => reply.send(Err(protocol::InboxRefusal::Unavailable)),
             #[cfg(test)]
             Msg::Barrier(_) => drop(self.take(msg).await),
             Msg::Attach(..) | Msg::Stop | Msg::Reclaim => drop(self.take(msg).await),
