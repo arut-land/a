@@ -5,7 +5,6 @@
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::unix::process::ExitStatusExt;
-use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -28,7 +27,6 @@ struct Output {
     deaf_after: Option<usize>,
     /// Nothing more is read, as of a hung emulator.
     deaf: bool,
-    reader_end: Option<String>,
 }
 
 /// What the child wrote, and a wake for every read of it.
@@ -54,8 +52,6 @@ pub struct Pty {
     reaped: bool,
     cols: u16,
     rows: u16,
-    home: Option<PathBuf>,
-    sent: Vec<(Duration, Vec<u8>)>,
 }
 
 impl Env {
@@ -90,12 +86,6 @@ impl Env {
         )
         .unwrap();
         let stdio = || Stdio::from(slave.try_clone().unwrap());
-        let home = cmd.get_envs().find_map(|(key, value)| {
-            (key == "A_HOME")
-                .then_some(value)
-                .flatten()
-                .map(PathBuf::from)
-        });
         let started = Instant::now();
         let child = cmd
             .env("TERM", "xterm-256color")
@@ -115,12 +105,7 @@ impl Env {
         std::thread::spawn(move || {
             let mut buf = [0; 8192];
             // EIO once the child and every copy of the slave are gone.
-            let ended = loop {
-                let n = match reader.read(&mut buf) {
-                    Ok(0) => break "eof".to_owned(),
-                    Ok(n) => n,
-                    Err(error) => break format!("read error: {error:?}"),
-                };
+            while let Ok(n @ 1..) = reader.read(&mut buf) {
                 let mut out = written.lock();
                 out.bytes.extend_from_slice(&buf[..n]);
                 if out.first_frame.is_none() && contains(&out.bytes, b"\x1b[?2026l") {
@@ -133,10 +118,9 @@ impl Env {
                 drop(out);
                 written.wrote.notify_all();
                 if deaf {
-                    break "deliberately deaf".to_owned();
+                    break;
                 }
-            };
-            written.lock().reader_end = Some(ended);
+            }
             let _ = finished.send(());
         });
         Pty {
@@ -148,8 +132,6 @@ impl Env {
             reaped: false,
             cols,
             rows,
-            home,
-            sent: Vec::new(),
         }
     }
 }
@@ -183,11 +165,11 @@ impl Pty {
                 return screen;
             }
             let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                drop(out);
-                self.capture_timeout();
-                panic!("timed out waiting for {what:?} on\n{}", screen.text());
-            }
+            assert!(
+                left > Duration::ZERO,
+                "timed out waiting for {what:?} on\n{}",
+                screen.text()
+            );
             out = self
                 .sink
                 .wrote
@@ -220,12 +202,6 @@ impl Pty {
     }
 
     pub fn send(&mut self, bytes: &[u8]) {
-        if std::env::var_os("A_PTY_TIMEOUT_CAPTURE").is_some() {
-            self.sent.push((
-                self.started.elapsed(),
-                bytes[bytes.len().saturating_sub(8192)..].to_vec(),
-            ));
-        }
         self.master.write_all(bytes).unwrap();
     }
 
@@ -254,65 +230,6 @@ impl Pty {
             .contains(LocalModes::ECHO | LocalModes::ICANON)
     }
 
-    fn capture_timeout(&self) {
-        let (Some(helper), Some(root)) = (
-            std::env::var_os("A_PTY_TIMEOUT_CAPTURE"),
-            std::env::var_os("A_PTY_EVIDENCE"),
-        ) else {
-            return;
-        };
-        let dir = PathBuf::from(root).join(format!(
-            "timeout-{}-{}",
-            std::process::id(),
-            self.child.id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        if let Ok(out) = self.sink.output.try_lock() {
-            std::fs::write(dir.join("pty.bin"), &out.bytes).unwrap();
-            std::fs::write(
-                dir.join("pty-tail.bin"),
-                &out.bytes[out.bytes.len().saturating_sub(65536)..],
-            )
-            .unwrap();
-            std::fs::write(
-                dir.join("reader-state.txt"),
-                format!(
-                    "reader_end={:?}\nbytes={}\ndeaf={}\nfirst_frame={:?}\n",
-                    out.reader_end,
-                    out.bytes.len(),
-                    out.deaf,
-                    out.first_frame
-                ),
-            )
-            .unwrap();
-        } else {
-            std::fs::write(
-                dir.join("reader-state.txt"),
-                "sink mutex unavailable at timeout\n",
-            )
-            .unwrap();
-        }
-        std::fs::write(dir.join("sent.txt"), format!("{:?}\n", self.sent)).unwrap();
-        let daemon = self
-            .home
-            .as_ref()
-            .and_then(|home| client::diagnose(&sys::Home::from(home.clone())).pid);
-        let output = Command::new("python3")
-            .arg(helper)
-            .arg("capture")
-            .arg(&dir)
-            .arg(self.child.id().to_string())
-            .arg(daemon.map_or_else(|| "none".into(), |pid| pid.to_string()))
-            .arg(std::process::id().to_string())
-            .output()
-            .unwrap();
-        std::fs::write(
-            dir.join("capture-helper.txt"),
-            [output.stdout, output.stderr].concat(),
-        )
-        .unwrap();
-    }
-
     /// The child's exit status, waited for (on a helper thread, as a wait
     /// has no timeout) rather than polled; a child that is still running
     /// after 10 s fails the test.
@@ -325,7 +242,6 @@ impl Pty {
         let (_, status) = rx
             .recv_timeout(Duration::from_secs(10))
             .unwrap_or_else(|_| {
-                self.capture_timeout();
                 let screen = Screen::parse(&self.bytes(), self.cols, self.rows);
                 panic!("a did not exit, showing\n{}", screen.text())
             })
@@ -335,10 +251,7 @@ impl Pty {
         // Reaping the child does not mean the reader captured its last write.
         self.read_done
             .recv_timeout(Duration::from_secs(10))
-            .unwrap_or_else(|_| {
-                self.capture_timeout();
-                panic!("PTY output did not close after the child exited");
-            });
+            .expect("PTY output did not close after the child exited");
         ExitStatus::from_raw(status.as_raw())
     }
 }
