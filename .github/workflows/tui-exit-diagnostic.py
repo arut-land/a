@@ -39,8 +39,8 @@ def run():
     evidence.mkdir(parents=True, exist_ok=True)
     source = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip()
     changed = subprocess.check_output(['git', 'diff', '--name-only'], cwd=root, text=True).splitlines()
-    assert changed == ['apps/cli/tests/blackbox/common/pty.rs']
-    observer = hashlib.sha256((root / changed[0]).read_bytes()).hexdigest()
+    assert changed == []
+    observer = hashlib.sha256((root / 'apps/cli/tests/blackbox/common/pty.rs').read_bytes()).hexdigest()
     manifest = {'label': label, 'source_sha': source, 'observer_sha256': observer, 'changed_files': changed, 'iterations_requested': iterations, 'parallel_test_threads': threads, 'started': time.time()}
     (evidence / 'manifest.json').write_text(json.dumps(manifest, indent=2))
     assert os.environ['OPENAI_API_KEY'] == 'loopback-dummy'
