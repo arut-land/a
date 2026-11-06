@@ -1,0 +1,78 @@
+name: Diagnostic apple stall
+on:
+  workflow_dispatch:
+  push:
+    branches: [agent-flow]
+    paths: [.github/workflows/diagnostic-apple.yml]
+permissions:
+  contents: read
+env:
+  CARGO_BUILD_JOBS: 2
+  CARGO_TERM_COLOR: always
+  MISE_AUTO_INSTALL: false
+  OPENAI_API_KEY: loopback-dummy
+  OPENAI_BASE_URL: http://127.0.0.1:1/v1
+  NO_PROXY: 127.0.0.1,localhost
+jobs:
+  paired:
+    runs-on: macos-latest
+    timeout-minutes: 80
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        source: [branch, main]
+        shard: [0, 1, 2, 3, 4, 5]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Select source and retain observer
+        shell: bash
+        run: |
+          cp .github/workflows/diagnostic-apple.py "$RUNNER_TEMP/diagnostic-apple.py"
+          if [[ '${{ matrix.source }}' == main ]]; then git checkout --detach origin/main; fi
+          git rev-parse HEAD
+          echo "MBX_CACHE_DIR=$RUNNER_TEMP/mbx" >> "$GITHUB_ENV"
+          echo "A_DIAGNOSTIC=$RUNNER_TEMP/evidence" >> "$GITHUB_ENV"
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ${{ runner.temp }}/mbx/actions
+          key: apple-diagnostic-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '.cargo/*.toml') }}-${{ github.sha }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-apple-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '.cargo/*.toml') }}-
+            cargo-${{ runner.os }}-${{ runner.arch }}-apple-
+      - uses: jdx/mise-action@v5
+        with:
+          install_args: rust mr-boxington github:boltffi/boltffi xcodegen
+      - name: Observe apple check and four further isolated test runs
+        shell: bash
+        run: |
+          unset ANTHROPIC_API_KEY ANTHROPIC_BASE_URL GEMINI_API_KEY GOOGLE_API_KEY OPENAI_ORG_ID OPENAI_PROJECT_ID
+          unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          p = Path('mise.toml')
+          text = p.read_text()
+          assert text.count('swift test --package-path apps/apple/AKit') == 1
+          p.write_text(text.replace('swift test --package-path apps/apple/AKit', 'python3 "' + os.environ['RUNNER_TEMP'] + '/diagnostic-apple.py"'))
+          PY
+          mkdir -p "$A_DIAGNOSTIC"
+          git rev-parse HEAD > "$A_DIAGNOSTIC/revision"
+          for iteration in 1 2 3 4 5; do
+            export A_DIAGNOSTIC_ITERATION=$iteration
+            task=apple:test
+            if [[ $iteration == 1 ]]; then task=apple:check; fi
+            mise run --jobs 1 "$task" 2>&1 | tee "$A_DIAGNOSTIC/task-$iteration.log"
+          done
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: apple-${{ matrix.source }}-${{ matrix.shard }}
+          path: ${{ runner.temp }}/evidence
+          retention-days: 14
