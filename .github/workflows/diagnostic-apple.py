@@ -47,7 +47,7 @@ def snapshot(pid):
         capture(f'{target}-sockets.txt', ['lsof', '-nP', '-a', '-p', str(target), '-i'])
         capture(f'{target}-threads.txt', ['lldb', '-b', '-p', str(target), '-o', 'thread backtrace all', '-o', 'detach', '-o', 'quit'])
     capture('home-listing.txt', ['find', str(home), '-ls'])
-    shutil.copytree(home, out / 'home', ignore=shutil.ignore_patterns('*.sock'), dirs_exist_ok=True)
+    shutil.copytree(home, out / 'home', symlinks=True, ignore=shutil.ignore_patterns('*.sock'), dirs_exist_ok=True)
     return owned
 
 
