@@ -291,7 +291,11 @@ nonisolated private final class DelayedRecovery: RecoveringViewSource, Sendable 
     func updates() -> AsyncStream<ChangeBatch> { reducer.updates() }
 
     func recover(from: UInt64) async -> Resync? {
-        await Task.detached { self.resync(from: from) }.value
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global().async {
+                continuation.resume(returning: self.resync(from: from))
+            }
+        }
     }
 
     func resync(from: UInt64) -> Resync {

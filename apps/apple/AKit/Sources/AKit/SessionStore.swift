@@ -495,5 +495,9 @@ public nonisolated func startClient(helper: String) async throws -> Client {
 nonisolated func stageClient<T: Sendable>(
     _ stage: @escaping @Sendable () throws -> T
 ) async throws -> T {
-    try await Task.detached(operation: stage).value
+    try await withCheckedThrowingContinuation { continuation in
+        DispatchQueue.global(qos: .userInitiated).async {
+            continuation.resume(with: Result(catching: stage))
+        }
+    }
 }
