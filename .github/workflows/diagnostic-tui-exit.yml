@@ -31,6 +31,7 @@ jobs:
         run: |
           set -euo pipefail
           source_root=$PWD
+          cp .github/workflows/tui-exit-diagnostic.py "$RUNNER_TEMP/tui-exit-diagnostic.py"
           channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
           cargo_real=$(rustup which --toolchain "$channel" cargo)
           rustc_real=$(rustup which --toolchain "$channel" rustc)
