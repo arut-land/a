@@ -343,16 +343,7 @@ struct NativeTranscriptTests {
         try await eventually("picker has keyboard focus") { window.firstResponder is NSTableView }
         let field = try #require(nativeLabels(host).first { $0.isEditable })
         let point = field.convert(NSPoint(x: field.bounds.midX, y: field.bounds.midY), to: nil)
-        let click = try [NSEvent.EventType.leftMouseDown, .leftMouseUp].map { type in
-            try #require(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: 0,
-                windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 1))
-        }
-        // Text selection tracks inside mouseDown; mouseUp must already be queued.
-        for event in click.reversed() { NSApplication.shared.postEvent(event, atStart: true) }
-        while let event = NSApplication.shared.nextEvent(matching: [.leftMouseDown, .leftMouseUp],
-            until: .distantPast, inMode: .default, dequeue: true) {
-            window.sendEvent(event)
-        }
+        try click(at: point, in: window)
         try await eventually("composer releases picker focus") { !selection.managing && window.firstResponder is NSTextView }
         window.sendEvent(NSEvent.keyEvent(with: .keyDown, location: point, modifierFlags: [], timestamp: 0,
             windowNumber: window.windowNumber, context: nil, characters: "typed in child composer", charactersIgnoringModifiers: "typed in child composer",
@@ -362,6 +353,30 @@ struct NativeTranscriptTests {
         family.interrupt(child.id)
         await transcript.detach()
         await parent.detach()
+    }
+}
+
+private func click(at point: NSPoint, in window: NSWindow) throws {
+    let mouseDown = try #require(NSEvent.mouseEvent(with: .leftMouseDown, location: point, modifierFlags: [], timestamp: 0,
+        windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 1))
+    let mouseUp = try #require(NSEvent.mouseEvent(with: .leftMouseUp, location: point, modifierFlags: [], timestamp: 0,
+        windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 0))
+    let application = NSApplication.shared
+    // NSTextView tracks synchronously. Post inside that loop so AppKit's wakeup
+    // cannot stop Swift's outer async-main run loop and exit before tests finish.
+    var released = false
+    let releaseMouse: @MainActor @Sendable () -> Void = {
+        guard !released else { return }
+        released = true
+        application.postEvent(mouseUp, atStart: true)
+    }
+    RunLoop.main.perform(inModes: [.eventTracking]) {
+        MainActor.assumeIsolated { releaseMouse() }
+    }
+    window.sendEvent(mouseDown)
+    if !released {
+        released = true
+        window.sendEvent(mouseUp)
     }
 }
 

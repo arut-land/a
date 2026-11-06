@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import pty
+import re
 import selectors
 import shutil
 import signal
@@ -85,5 +86,9 @@ with (out / 'swift.log').open('wb', buffering=0) as log:
             log.write(data)
             os.write(1, data)
 code = process.wait()
-(out / 'result.json').write_text(json.dumps(dict(code=code, hang=hung, seconds=time.monotonic() - started)))
+completed = re.search(r'Test run with \d+ tests?[^\r\n]*passed', (out / 'swift.log').read_text()) is not None
+if code == 0 and not completed:
+    print('Swift exited without a completed test-run summary', flush=True)
+    code = 125
+(out / 'result.json').write_text(json.dumps(dict(code=code, hang=hung, completed=completed, seconds=time.monotonic() - started)))
 raise SystemExit(124 if hung else code)
