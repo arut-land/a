@@ -16,10 +16,17 @@ use crate::Signal;
 #[derive(Clone)]
 pub struct Child(Arc<OwnedChild>);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lifetime {
+    Contained,
+    Detached,
+}
+
 struct OwnedChild {
     pid: u32,
     watch: Option<OwnedFd>,
     group: bool,
+    lifetime: Lifetime,
     /// Handed to the next build: this process's image no longer signals or
     /// reaps it, the one it execs into does.
     released: AtomicBool,
@@ -97,6 +104,7 @@ impl Child {
             pid,
             watch: None,
             group: true,
+            lifetime: Lifetime::Contained,
             released: AtomicBool::new(false),
         }));
         match super::imp::exit_watch(pid) {
@@ -245,16 +253,19 @@ impl Drop for OwnedChild {
         }
         #[cfg(target_os = "linux")]
         if let Some(watch) = &self.watch
-            && reap_pidfd(watch, !self.group)
+            && reap_pidfd(watch, self.lifetime)
         {
             return;
         }
         if !owned {
             return;
         }
-        // Uncontained children may outlive their owner (notably daemons).
+        // Detached children may outlive their owner (notably daemons).
         // Cancellation of their async reaper must never wait for their exit.
-        let flags = if self.group { 0 } else { libc::WNOHANG };
+        let flags = match self.lifetime {
+            Lifetime::Contained => 0,
+            Lifetime::Detached => libc::WNOHANG,
+        };
         // SAFETY: the child is still waitable and this is its sole reaper.
         while unsafe { libc::waitpid(self.pid.cast_signed(), std::ptr::null_mut(), flags) } < 0 {
             if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
@@ -265,22 +276,21 @@ impl Drop for OwnedChild {
 }
 
 #[cfg(target_os = "linux")]
-fn reap_pidfd(watch: &OwnedFd, nonblocking: bool) -> bool {
+fn reap_pidfd(watch: &OwnedFd, lifetime: Lifetime) -> bool {
     use rustix::io::Errno;
     use rustix::process::{WaitId, WaitIdOptions, waitid};
     use std::os::fd::AsFd;
     let options = WaitIdOptions::EXITED
-        | if nonblocking {
-            WaitIdOptions::NOHANG
-        } else {
-            WaitIdOptions::empty()
+        | match lifetime {
+            Lifetime::Contained => WaitIdOptions::empty(),
+            Lifetime::Detached => WaitIdOptions::NOHANG,
         };
     loop {
         match waitid(WaitId::PidFd(watch.as_fd()), options) {
             // Linux 5.3 has pidfds but cannot yet wait through one.
             Err(Errno::INVAL) => return false,
             Err(Errno::INTR) => {}
-            Err(Errno::AGAIN) if nonblocking => return true,
+            Err(Errno::AGAIN) if lifetime == Lifetime::Detached => return true,
             Err(Errno::AGAIN) => {
                 if wait_pidfd(watch).is_err() {
                     return true;
@@ -314,6 +324,7 @@ pub(crate) struct SpawnPlan<'a> {
     inherited: &'a [Passed],
     group: bool,
     session: bool,
+    lifetime: Lifetime,
     environment: SpawnEnvironment,
 }
 
@@ -325,6 +336,7 @@ impl<'a> SpawnPlan<'a> {
             inherited: &[],
             group: true,
             session: true,
+            lifetime: Lifetime::Contained,
             environment: SpawnEnvironment::Exact,
         }
     }
@@ -341,9 +353,10 @@ impl<'a> SpawnPlan<'a> {
         self.environment = SpawnEnvironment::InheritSnapshot;
         self
     }
-    pub(crate) fn uncontained(mut self) -> Self {
+    pub(crate) fn detached(mut self) -> Self {
         self.group = false;
         self.session = false;
+        self.lifetime = Lifetime::Detached;
         self
     }
 
@@ -430,6 +443,7 @@ impl<'a> SpawnPlan<'a> {
             pid: pid.cast_unsigned(),
             watch: None,
             group: self.group,
+            lifetime: self.lifetime,
             released: AtomicBool::new(false),
         }));
         match super::imp::exit_watch(child.id()) {
@@ -717,6 +731,50 @@ mod tests {
         let mut bytes = Vec::new();
         io::Read::read_to_end(&mut reader, &mut bytes).unwrap();
         assert_eq!(bytes, [] as [u8; 0]);
+    }
+
+    #[test]
+    fn contained_terminal_children_are_reaped_before_the_last_owner_returns() {
+        use std::io::Read;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (input, writer) = io::pipe().unwrap();
+        let (mut output, child_output) = io::pipe().unwrap();
+        let input = File::from(OwnedFd::from(input));
+        let child_output = File::from(OwnedFd::from(child_output));
+        let null = null();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf r; read -r gate"]);
+        let child = SpawnPlan::new(&command, [&input, &child_output, &null])
+            .terminal()
+            .spawn()
+            .unwrap();
+        drop(input);
+        drop(child_output);
+        output.read_exact(&mut [0]).unwrap();
+        let pid = child.id();
+        assert!(!child.grouped());
+        let (started, starting) = mpsc::channel();
+        let (done, finished) = mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            drop(child);
+            done.send(()).unwrap();
+        });
+        starting.recv().unwrap();
+        let premature = finished.recv_timeout(Duration::from_millis(100));
+        drop(writer);
+        owner.join().unwrap();
+        // SAFETY: the test created this child; collect any status abandoned by a failing drop.
+        let reaped = unsafe { libc::waitpid(pid.cast_signed(), std::ptr::null_mut(), 0) };
+        let error = io::Error::last_os_error();
+        assert!(
+            premature.is_err(),
+            "a contained terminal child outlived its last owner"
+        );
+        assert_eq!(reaped, -1, "the last owner abandoned its child's status");
+        assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
     }
 
     #[test]

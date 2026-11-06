@@ -25,7 +25,7 @@ pub fn open_browser(link: &str) -> io::Result<crate::Child> {
             .open("/dev/null")?;
         crate::proc::unix::SpawnPlan::new(&command, [&null, &null, &null])
             .inherit_snapshot()
-            .uncontained()
+            .detached()
             .spawn()
     }
     #[cfg(windows)]

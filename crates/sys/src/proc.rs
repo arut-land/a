@@ -461,7 +461,7 @@ mod imp {
             .open("/dev/null")?;
         let child = super::unix::SpawnPlan::new(cmd, [&null, &null, &null])
             .inherited(&handles)
-            .uncontained()
+            .detached()
             .spawn();
         drop((listener, lock));
         child
