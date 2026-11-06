@@ -1,0 +1,69 @@
+name: Diagnostic TUI exit
+on:
+  push:
+    branches: [agent-flow]
+    paths: [.github/workflows/diagnostic-tui-exit.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  branch:
+    name: ${{ matrix.order }}-${{ matrix.source }}-${{ matrix.shard }}
+    runs-on: macos-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          - {order: '00', source: branch, shard: 0}
+          - {order: '01', source: branch, shard: 1}
+          - {order: '02', source: branch, shard: 2}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: jdx/mise-action@v5
+        with:
+          install_args: rust mr-boxington cargo:cargo-nextest
+      - name: Stress title exits at full-suite parallelism
+        shell: bash
+        env:
+          DIAGNOSTIC_LABEL: ${{ matrix.source }}-${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+          source_root=$PWD
+          git show d6a92d83:.github/workflows/tui-exit-diagnostic.py > "$RUNNER_TEMP/tui-exit-diagnostic.py"
+          git show d6a92d83:apps/cli/tests/blackbox/common/pty.rs > apps/cli/tests/blackbox/common/pty.rs
+          python3 -c 'from pathlib import Path; import sys; p=Path(sys.argv[1]); p.write_text(p.read_text().replace("assert changed == []", "assert changed == ['"'"'apps/cli/tests/blackbox/common/pty.rs'"'"']"))' "$RUNNER_TEMP/tui-exit-diagnostic.py"
+          channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+          cargo_real=$(rustup which --toolchain "$channel" cargo)
+          rustc_real=$(rustup which --toolchain "$channel" rustc)
+          rustdoc_real=$(rustup which --toolchain "$channel" rustdoc)
+          nextest_real=$(mise which cargo-nextest)
+          mise_real=$(command -v mise)
+          tool_cargo_home=${CARGO_HOME:-$HOME/.cargo}
+          tool_rustup_home=${RUSTUP_HOME:-$HOME/.rustup}
+          mkdir -p "$RUNNER_TEMP/native-bin" "$RUNNER_TEMP/isolated-home"
+          ln -s "$cargo_real" "$RUNNER_TEMP/native-bin/cargo"
+          ln -s "$rustc_real" "$RUNNER_TEMP/native-bin/rustc"
+          ln -s "$rustdoc_real" "$RUNNER_TEMP/native-bin/rustdoc"
+          ln -s "$nextest_real" "$RUNNER_TEMP/native-bin/cargo-nextest"
+          cd "$RUNNER_TEMP"
+          "$mise_real" exec -- /usr/bin/env -i \
+            PATH="$RUNNER_TEMP/native-bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+            HOME="$RUNNER_TEMP/isolated-home" A_HOME="$RUNNER_TEMP/isolated-a-home" \
+            CARGO_HOME="$tool_cargo_home" RUSTUP_HOME="$tool_rustup_home" RUSTUP_TOOLCHAIN="$channel" \
+            CARGO_TARGET_DIR="$RUNNER_TEMP/tgt-agent-flow" CARGO_BUILD_JOBS=2 \
+            RUSTC="$rustc_real" RUSTDOC="$rustdoc_real" RUSTC_WRAPPER= RUSTC_WORKSPACE_WRAPPER= \
+            OPENAI_API_KEY=loopback-dummy OPENAI_BASE_URL=http://127.0.0.1:1/v1 \
+            NO_PROXY=127.0.0.1,localhost PYTHONDONTWRITEBYTECODE=1 CARGO_TERM_COLOR=never \
+            /usr/bin/python3 "$RUNNER_TEMP/tui-exit-diagnostic.py" run \
+            "$source_root" "$RUNNER_TEMP/tgt-agent-flow" "$RUNNER_TEMP/evidence" \
+            "$DIAGNOSTIC_LABEL" 100 "$(sysctl -n hw.ncpu)"
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: tui-exit-${{ matrix.source }}-${{ matrix.shard }}
+          path: ${{ runner.temp }}/evidence
+          retention-days: 7
