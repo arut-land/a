@@ -5,6 +5,43 @@ use crate::store::{Faulty, SyncFailure};
 use super::*;
 
 #[test]
+fn recipient_recovery_reacquires_the_slot_without_losing_a_resume_delivery() {
+    for failure in [SyncFailure::Discard, SyncFailure::Retain] {
+        let mut harness = ManualSession::new();
+        let envelope = protocol::Envelope::new(
+            protocol::EnvelopeId {
+                sender: SessionId::new(),
+                call: id(1),
+                purpose: protocol::EnvelopeId::RESUMED.into(),
+            },
+            harness.session.id,
+            protocol::Carried::Resumed,
+            Vec::new(),
+        )
+        .unwrap();
+        let daemon = Arc::clone(&harness.session.daemon);
+        let source = Arc::clone(&harness.session.live);
+        let mut delivery = Box::pin(inbox::resume_delivery(&daemon, &source, &envelope));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(delivery.as_mut().poll(&mut cx).is_pending());
+        harness.faulty.fail_next_sync(failure);
+        harness.poll();
+        assert!(
+            delivery.as_mut().poll(&mut cx).is_pending(),
+            "recipient recovery must retry instead of abandoning the delivery"
+        );
+        harness.poll();
+        assert_eq!(
+            delivery.as_mut().poll(&mut cx),
+            Poll::Ready((Ok(()), false))
+        );
+        drop(delivery);
+        let kept = harness.finish();
+        assert_eq!(kept.iter().filter(|entry| matches!(&entry.body, Body::Enqueue { envelope: accepted } if accepted.id() == envelope.id())).count(), 1);
+    }
+}
+
+#[test]
 fn shutdown_consumes_a_prefetched_flush_completion() {
     let mut h = ManualSession::new();
     h.complete();

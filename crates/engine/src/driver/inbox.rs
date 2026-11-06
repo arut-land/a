@@ -132,7 +132,7 @@ impl CallPorts {
     }
 }
 
-async fn resume_delivery(
+pub(super) async fn resume_delivery(
     daemon: &super::super::Daemon,
     source: &Arc<Live>,
     envelope: &Envelope,
@@ -146,9 +146,10 @@ async fn resume_delivery(
             return (Err(InboxRefusal::Unavailable), false);
         };
         let mut space = recipient.session.inbox_space.count();
-        let result = recipient.enqueue(envelope.clone()).await;
-        if result != Err(InboxRefusal::Full) {
-            return (result, false);
+        match recipient.enqueue(envelope.clone()).await {
+            Err(InboxRefusal::Interrupted) => continue,
+            Err(InboxRefusal::Full) => {}
+            result => return (result, false),
         }
         loop {
             let frames = Arc::clone(&source.frames);
