@@ -233,6 +233,8 @@ impl Outbox {
 struct Handle {
     daemon: Daemon,
     tx: Arc<Outbox>,
+    // Cancellation wakes tasks; keep their executor owned until it is sent.
+    _runtime: Rt,
 }
 
 impl Drop for Handle {
@@ -287,6 +289,7 @@ impl Driver {
         let handle = ClientHandle(Arc::new(Handle {
             daemon: daemon.clone(),
             tx: rx.clone(),
+            _runtime: rt.clone(),
         }));
         let weak = Arc::downgrade(&handle.0);
         let runtime = rt;

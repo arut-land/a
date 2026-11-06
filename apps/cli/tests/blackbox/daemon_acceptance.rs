@@ -9,6 +9,91 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 #[test]
+fn a_client_that_started_its_daemon_exits_while_the_daemon_stays_up() {
+    const HELPER: &str = "A_TEST_REAPER_EXIT_HOME";
+    if let Some(root) = std::env::var_os(HELPER) {
+        let home = sys::Home::from(std::path::PathBuf::from(root));
+        let staged = home
+            .runtime()
+            .stage(std::path::Path::new(env!("CARGO_BIN_EXE_a")))
+            .unwrap();
+        let runtime = std::sync::Arc::new(CapturedReaper::default());
+        let rt: rt::Rt = runtime.clone();
+        let daemon = client::Daemon::local(home, staged);
+        drop(rt::block_on(daemon.connect_async(&rt, &|| {})).unwrap());
+        let handle = client::Driver::new(|_, _| {}).start(rt.clone(), daemon);
+        // Cancel the real reaper on the client thread, as executor teardown does.
+        drop(std::mem::take(&mut *runtime.tasks.lock().unwrap()));
+        let retained = std::sync::Arc::downgrade(&runtime);
+        drop(rt);
+        drop(runtime);
+        assert!(
+            retained.upgrade().is_some(),
+            "the handle must own its runtime through cancellation"
+        );
+        drop(handle);
+        assert!(
+            retained.upgrade().is_none(),
+            "the cancelled handle must release its runtime"
+        );
+        return;
+    }
+    let env = Isolated::new("reaper-exit");
+    let mut helper = Command::new(std::env::current_exe().unwrap());
+    helper
+        .args([
+            "--exact",
+            "daemon_acceptance::a_client_that_started_its_daemon_exits_while_the_daemon_stays_up",
+            "--nocapture",
+        ])
+        .env("A_HOME", env.home.root())
+        .env(HELPER, env.home.root());
+    let result = TestProcess::spawn(&mut helper).collect(deadline()).unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        client::status(&env.home).unwrap().is_some(),
+        "client exit stopped its daemon"
+    );
+    env.run(&["daemon", "stop"]);
+}
+
+#[derive(Default)]
+struct CapturedReaper {
+    tasks: std::sync::Mutex<Vec<rt::BoxFuture<'static, ()>>>,
+    background: rt::Threads,
+}
+
+impl rt::Runtime for CapturedReaper {
+    fn spawn(&self, task: rt::BoxFuture<'static, ()>) {
+        self.tasks.lock().unwrap().push(task);
+    }
+
+    fn spawn_blocking(
+        &self,
+        class: rt::BlockingClass,
+        bytes: usize,
+        work: Box<dyn FnOnce() + Send>,
+    ) -> rt::BoxFuture<'static, io::Result<()>> {
+        self.background.spawn_blocking(class, bytes, work)
+    }
+
+    fn spawn_flush(
+        &self,
+        work: Box<dyn FnOnce() + Send>,
+    ) -> rt::BoxFuture<'static, io::Result<()>> {
+        self.background.spawn_flush(work)
+    }
+
+    fn reactor(&self) -> rt::Reactor {
+        self.background.reactor()
+    }
+}
+
+#[test]
 fn diagnosing_stopping_and_reading_logs_never_install_an_executable() {
     let env = Isolated::new("administration");
     for action in ["status", "log", "stop"] {

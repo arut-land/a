@@ -257,6 +257,7 @@ where
 
 /// Reaps `child` once it exits, on a task waiting on its exit watch: a
 /// child nothing else waits for leaves no zombie, and no thread waits for it.
+/// Cancelling the task releases an uncontained child without waiting for it.
 pub fn reap(rt: &dyn Runtime, mut child: sys::Child) {
     let Ok(watch) = (child.exit_watch()).and_then(|watch| Async::for_reading(&rt.reactor(), watch))
     else {

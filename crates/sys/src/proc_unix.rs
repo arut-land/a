@@ -245,15 +245,18 @@ impl Drop for OwnedChild {
         }
         #[cfg(target_os = "linux")]
         if let Some(watch) = &self.watch
-            && reap_pidfd(watch)
+            && reap_pidfd(watch, !self.group)
         {
             return;
         }
         if !owned {
             return;
         }
+        // Uncontained children may outlive their owner (notably daemons).
+        // Cancellation of their async reaper must never wait for their exit.
+        let flags = if self.group { 0 } else { libc::WNOHANG };
         // SAFETY: the child is still waitable and this is its sole reaper.
-        while unsafe { libc::waitpid(self.pid.cast_signed(), std::ptr::null_mut(), 0) } < 0 {
+        while unsafe { libc::waitpid(self.pid.cast_signed(), std::ptr::null_mut(), flags) } < 0 {
             if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
                 break;
             }
@@ -262,15 +265,22 @@ impl Drop for OwnedChild {
 }
 
 #[cfg(target_os = "linux")]
-fn reap_pidfd(watch: &OwnedFd) -> bool {
+fn reap_pidfd(watch: &OwnedFd, nonblocking: bool) -> bool {
     use rustix::io::Errno;
     use rustix::process::{WaitId, WaitIdOptions, waitid};
     use std::os::fd::AsFd;
+    let options = WaitIdOptions::EXITED
+        | if nonblocking {
+            WaitIdOptions::NOHANG
+        } else {
+            WaitIdOptions::empty()
+        };
     loop {
-        match waitid(WaitId::PidFd(watch.as_fd()), WaitIdOptions::EXITED) {
+        match waitid(WaitId::PidFd(watch.as_fd()), options) {
             // Linux 5.3 has pidfds but cannot yet wait through one.
             Err(Errno::INVAL) => return false,
             Err(Errno::INTR) => {}
+            Err(Errno::AGAIN) if nonblocking => return true,
             Err(Errno::AGAIN) => {
                 if wait_pidfd(watch).is_err() {
                     return true;
