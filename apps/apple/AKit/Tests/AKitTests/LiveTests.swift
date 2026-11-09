@@ -163,23 +163,43 @@ func fork_rekeys_the_cached_store() async throws {
 
 @Test
 func apple_startup_leaves_the_main_actor_and_cooperative_executor_runnable() async throws {
+    // The cooperative pool can use every logical CPU, even when some are idle.
+    let count = ProcessInfo.processInfo.processorCount
     let started = DispatchSemaphore(value: 0)
     let release = DispatchSemaphore(value: 0)
-    let startup = Task {
-        try await stageClient {
-            started.signal()
-            release.wait()
-            return 42
+    let startups = (0..<count).map { _ in
+        Task {
+            try await stageClient {
+                started.signal()
+                release.wait()
+                return 42
+            }
         }
     }
-    try await stageClient { started.wait() }
-    // Both executors must progress while staging is still blocked.
-    let heartbeat = Task { @MainActor in
-        await Task.detached { await Task.yield() }.value
-        release.signal()
+    let result = await withCheckedContinuation { continuation in
+        // Neither staging nor a cooperative task can enforce a deadline if the
+        // executor under test is blocked. This thread also owns every release.
+        Thread.detachNewThread {
+            let deadline = DispatchTime.now() + .seconds(5)
+            let allStarted = (0..<count).allSatisfy { _ in
+                started.wait(timeout: deadline) == .success
+            }
+            let heartbeat = DispatchSemaphore(value: 0)
+            if allStarted {
+                Task { @MainActor in
+                    await Task.detached { heartbeat.signal() }.value
+                }
+            }
+            let runnable = allStarted && heartbeat.wait(timeout: .now() + .seconds(5)) == .success
+            for _ in 0..<count { release.signal() }
+            continuation.resume(returning: (allStarted, runnable))
+        }
     }
-    await heartbeat.value
-    #expect(try await startup.value == 42)
+    #expect(result.0, "all \(count) stages must enter their blocking wait")
+    #expect(result.1, "main actor and cooperative heartbeat must run while all \(count) stages are blocked")
+    for startup in startups {
+        #expect(try await startup.value == 42)
+    }
 }
 
 
