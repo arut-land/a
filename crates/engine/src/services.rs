@@ -104,6 +104,16 @@ impl View for Viewed {
         Some(self.session.cx(origin, &self.registry))
     }
 
+    fn delegation(&self) -> Option<ext::Delegation> {
+        Some(ext::Delegation {
+            prompt: lock(&self.session.spawn)
+                .as_ref()
+                .filter(|spawn| spawn.request.runner.agent().is_some())
+                .map(|spawn| spawn.request.prompt.clone()),
+            allowance: *lock(&self.session.allowance),
+        })
+    }
+
     fn services(&self) -> Option<&ext::host::SessionServices> {
         Some(&self.session.services)
     }

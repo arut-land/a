@@ -441,6 +441,7 @@ pub enum Open {
 struct Session {
     services: Arc<SessionServices>,
     spawn: Mutex<Option<spawn::SpawnIntent>>,
+    allowance: Mutex<ext::SpawnAllowance>,
     context_head: Mutex<crate::context::Cursor>,
     child_owners: Mutex<ChildOwners>,
     incoming_prefix: Mutex<Option<prefix::Seed>>,
@@ -1021,6 +1022,7 @@ impl Live {
         self.send(Msg::Step(Event::OwnerCancelled));
     }
 
+    #[cfg(test)]
     pub(crate) fn interrupt(&self) {
         let interrupt = Event::Interrupt {
             origin: None,
@@ -3276,11 +3278,8 @@ impl Actor {
             .await
             .map_err(|e| e.to_string())?
             .with_scope(scope);
-        let mut request = model.request(messages, self.registry.specs().clone());
-        if let Some(spawn) = lock(&self.live.session.spawn).as_ref() {
-            request.generation.max_output_tokens = Some(spawn.request.budget.max_tokens);
-        }
-        Ok(request)
+        *lock(&self.live.session.allowance) = self.spawn_allowance();
+        Ok(model.request(messages, self.registry.specs().clone()))
     }
 
     fn continue_tool(
@@ -3526,6 +3525,7 @@ impl Session {
                 }
             }),
             spawn: Mutex::default(),
+            allowance: Mutex::default(),
             context_head: Mutex::default(),
             child_owners: Mutex::default(),
             input_registries: Mutex::default(),

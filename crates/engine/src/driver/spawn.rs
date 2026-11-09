@@ -1,7 +1,7 @@
 //! Admission freezes authority before any child is created.
 use super::{
     Actor, Arc, Body, BoxFuture, CallId, CallPorts, Child, ContextRequest, Cx, Event, InFlight,
-    Json, Live, Open, Registry, SessionId, Shared, lock, oneshot, or,
+    Json, Live, Open, Registry, SessionId, Shared, lock, oneshot,
 };
 use crate::store::Header;
 use ext::{DepthBudget, SpawnRefusal};
@@ -124,6 +124,7 @@ struct Admission {
     link: usize,
     owner: String,
     purpose: String,
+    cost: u16,
 }
 
 impl Admissions {
@@ -131,6 +132,11 @@ impl Admissions {
         for (at, link) in links.iter().enumerate().skip(self.through) {
             if let Ok(intent) = SpawnIntent::from_json(&link.intent) {
                 self.calls.entry(intent.call).or_default().push(Admission {
+                    cost: if intent.refusal.is_none() && intent.request.runner.agent().is_some() {
+                        intent.request.allowance.remaining() + 1
+                    } else {
+                        0
+                    },
                     link: at,
                     owner: intent.request.owner().into(),
                     purpose: intent.request.purpose,
@@ -151,6 +157,15 @@ impl Admissions {
             admission.owner == request.owner() && admission.purpose == request.purpose
         })?;
         Some(&links[admission.link])
+    }
+
+    fn spent(&self, since: u64) -> u16 {
+        self.calls
+            .iter()
+            .filter(|(call, _)| call.get() >= since)
+            .flat_map(|(_, admissions)| admissions)
+            .map(|admission| admission.cost)
+            .fold(0, u16::saturating_add)
     }
 
     pub(super) fn last<'a>(
@@ -273,6 +288,26 @@ impl Actor {
             .cloned()
     }
 
+    pub(super) fn spawn_allowance(&mut self) -> ext::SpawnAllowance {
+        let inherited = lock(&self.live.session.spawn)
+            .as_ref()
+            .map(|i| i.request.allowance);
+        let since = if inherited.is_some() {
+            0
+        } else {
+            self.core
+                .ledger()
+                .turn_start()
+                .map_or(0, protocol::Seq::get)
+        };
+        self.projection
+            .admissions
+            .advance(self.core.ledger().links());
+        inherited
+            .unwrap_or_default()
+            .after(self.projection.admissions.spent(since))
+    }
+
     fn child_model(
         &self,
         role: &ext::ModelRole,
@@ -315,9 +350,22 @@ impl Actor {
         let allowance = lock(&self.live.session.spawn)
             .as_ref()
             .map_or(DepthBudget::new(u16::MAX), |i| i.request.depth);
-        let depth = request.depth.intersect(allowance).descend();
+        let depth = if request.runner.agent().is_some() {
+            request.depth.intersect(allowance).descend()
+        } else {
+            // Side responses do not delegate another agent's work.
+            Ok(request.depth.intersect(allowance))
+        };
         let mut refusal = depth.as_ref().err().cloned();
         request.depth = depth.unwrap_or(DepthBudget::new(0));
+        if request.runner.agent().is_some() {
+            match self.spawn_allowance().split() {
+                Ok(allowance) => request.allowance = allowance,
+                Err(error) if refusal.is_none() => refusal = Some(error),
+                Err(_) => {}
+            }
+        }
+
         let agent = request.runner.agent();
         let kind = agent.and_then(|name| registry.kind(name));
         let (inherit, inherit_settings) = kind.unwrap_or_default();
@@ -507,25 +555,6 @@ impl Live {
     pub(crate) fn pending_child(&self, child: SessionId) -> bool {
         self.child_owners()
             .is_ok_and(|owners| owners.pending(child))
-    }
-
-    pub(crate) fn bound(self: Arc<Self>, budget: ext::Budget) {
-        let runtime = Arc::clone(&self.session.shared.rt);
-        let clock = Arc::clone(&runtime);
-        runtime.spawn(Box::pin(async move {
-            let finished = async {
-                self.session.changed.until(|| !self.has_work()).await;
-                true
-            };
-            if !or(finished, async {
-                clock.sleep(budget.timeout).await;
-                false
-            })
-            .await
-            {
-                self.interrupt();
-            }
-        }));
     }
 }
 

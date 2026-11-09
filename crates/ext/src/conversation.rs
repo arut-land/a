@@ -45,6 +45,12 @@ pub use llm::ContextPolicy;
 /// let _ = ext::Conversation::task::<E>("t", "p").key("k");
 /// # }
 /// ```
+/// A task uses the session's normal response limit and has no side-request deadline.
+/// ```compile_fail,E0599
+/// # fn wrong<E: ext::Extension>() {
+/// let _ = ext::Conversation::task::<E>("t", "p").budget(ext::Budget::default());
+/// # }
+/// ```
 /// A turn has no agent kind and no depth.
 /// ```compile_fail,E0599
 /// # fn wrong<E: ext::Extension>() {
@@ -69,7 +75,6 @@ pub struct Conversation<R, S = Persisted> {
     purpose: String,
     role: ModelRole,
     context: Context,
-    budget: Budget,
     placement: Placement,
     runner: R,
     storage: PhantomData<fn() -> S>,
@@ -81,6 +86,7 @@ pub struct Turn {
     key: Option<TurnKey>,
     per_call: bool,
     bounds: ContextPolicy,
+    budget: Budget,
 }
 
 /// A registered agent kind's loop, with the tools its kind inherits.
@@ -132,7 +138,6 @@ impl<R, S> Conversation<R, S> {
             purpose: purpose.into(),
             role: ModelRole::Session,
             context: Context::Fresh,
-            budget: Budget::default(),
             placement: Placement::Here,
             runner,
             storage: PhantomData,
@@ -153,16 +158,6 @@ impl<R, S> Conversation<R, S> {
         self.context = Context::Owner;
         self
     }
-    /// What each response, and the whole conversation's work, may take.
-    pub fn budget(mut self, budget: Budget) -> Self {
-        self.budget = budget;
-        self
-    }
-    /// The output tokens each response may take.
-    pub fn max_tokens(mut self, tokens: std::num::NonZeroU32) -> Self {
-        self.budget.max_tokens = tokens;
-        self
-    }
     pub fn placement(mut self, placement: Placement) -> Self {
         self.placement = placement;
         self
@@ -181,6 +176,7 @@ impl Conversation<Turn> {
                 key: None,
                 per_call: false,
                 bounds: Turn::BOUNDS,
+                budget: Budget::default(),
             },
         )
     }
@@ -192,7 +188,6 @@ impl Conversation<Turn> {
             purpose: self.purpose,
             role: self.role,
             context: self.context,
-            budget: self.budget,
             placement: self.placement,
             runner: self.runner,
             storage: PhantomData,
@@ -208,6 +203,16 @@ impl Turn {
 }
 
 impl<S: Storage> Conversation<Turn, S> {
+    /// What each response, and the whole conversation's work, may take.
+    pub fn budget(mut self, budget: Budget) -> Self {
+        self.runner.budget = budget;
+        self
+    }
+    /// The output tokens each response may take.
+    pub fn max_tokens(mut self, tokens: std::num::NonZeroU32) -> Self {
+        self.runner.budget.max_tokens = tokens;
+        self
+    }
     /// Summarises the complete effective prefix before the owning call.
     /// Each chunk is answered before the next; any failure fails the turn.
     pub fn owner_prefix(mut self) -> Self {
@@ -253,9 +258,9 @@ impl<S: Storage> Conversation<Turn, S> {
             },
             turn: (self.runner.key).unwrap_or_else(|| TurnKey(call.get().to_string())),
             role: self.role,
+            budget: self.runner.budget,
             messages: self.runner.messages,
             context: self.context,
-            budget: self.budget,
             background: false,
             while_waiting: false,
             ephemeral: S::EPHEMERAL,
@@ -343,7 +348,7 @@ impl Conversation<Task> {
                 role: self.role,
             },
             depth: self.runner.depth,
-            budget: self.budget,
+            allowance: SpawnAllowance::default(),
             placement: self.placement,
         }
     }
@@ -495,11 +500,28 @@ impl Recipient {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SpawnRefusal {
     DepthExhausted,
+    SpawnExhausted,
     Unavailable(String),
     Interrupted,
     /// This engine cannot run a conversation there.
     Placement(Placement),
 }
+
+impl std::fmt::Display for SpawnRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DepthExhausted => f.write_str("delegation refused: depth exhausted"),
+            Self::SpawnExhausted => f.write_str("delegation refused: spawn allowance exhausted"),
+            Self::Unavailable(reason) => write!(f, "child unavailable: {reason}"),
+            Self::Interrupted => f.write_str("child interrupted"),
+            Self::Placement(placement) => {
+                write!(f, "conversation placement unavailable: {placement:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SpawnRefusal {}
 
 /// The engine's side of [`Conversation`]: it admits, runs and settles
 /// each kind. Extensions reach it only through the typed requests.
@@ -560,6 +582,45 @@ impl DepthBudget {
     }
 }
 
+/// The current task and its unallocated descendant slots, derived from admission facts.
+#[derive(Clone, Debug)]
+pub struct Delegation {
+    pub prompt: Option<String>,
+    pub allowance: SpawnAllowance,
+}
+
+/// Finite descendant slots, divided rather than copied at each ownership edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[must_use]
+pub struct SpawnAllowance(u16);
+
+impl Default for SpawnAllowance {
+    fn default() -> Self {
+        // Enough for several parallel specialists and a second or third level.
+        Self(32)
+    }
+}
+
+impl SpawnAllowance {
+    /// A model-only conversation has no authority to delegate agent work.
+    pub const NONE: Self = Self(0);
+
+    pub const fn remaining(self) -> u16 {
+        self.0
+    }
+
+    pub fn after(self, spent: u16) -> Self {
+        Self(self.0.saturating_sub(spent))
+    }
+
+    pub fn split(self) -> Result<Self, SpawnRefusal> {
+        self.0
+            .checked_sub(1)
+            .map(|slots| Self(slots / 2))
+            .ok_or(SpawnRefusal::SpawnExhausted)
+    }
+}
+
 /// What runs an admitted conversation, frozen with it.
 #[derive(Clone, Debug)]
 pub enum Runner {
@@ -570,22 +631,35 @@ pub enum Runner {
     ModelOnly {
         role: ModelRole,
         context: ContextPolicy,
+        budget: Budget,
     },
 }
 
 impl Serialize for Runner {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        (self.agent(), self.role(), self.context_policy()).serialize(s)
+        (
+            self.agent(),
+            self.role(),
+            self.context_policy(),
+            self.budget(),
+        )
+            .serialize(s)
     }
 }
 impl<'de> Deserialize<'de> for Runner {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let (agent, role, context): (Option<String>, ModelRole, Option<ContextPolicy>) =
-            Deserialize::deserialize(d)?;
+        let (agent, role, context, budget): (
+            Option<String>,
+            ModelRole,
+            Option<ContextPolicy>,
+            Option<Budget>,
+        ) = Deserialize::deserialize(d)?;
         Ok(match agent {
             Some(agent) => Self::Agent { agent, role },
             None => Self::ModelOnly {
                 role,
+                budget: budget
+                    .ok_or_else(|| serde::de::Error::custom("missing model-only budget"))?,
                 context: context
                     .ok_or_else(|| serde::de::Error::custom("missing model-only context policy"))?,
             },
@@ -606,6 +680,13 @@ impl Runner {
             Self::ModelOnly { .. } => None,
         }
     }
+    pub fn budget(&self) -> Option<Budget> {
+        match self {
+            Self::Agent { .. } => None,
+            Self::ModelOnly { budget, .. } => Some(*budget),
+        }
+    }
+
     pub fn role(&self) -> &ModelRole {
         match self {
             Self::Agent { role, .. } | Self::ModelOnly { role, .. } => role,
@@ -623,7 +704,7 @@ pub struct Spawn {
     pub context: Context,
     pub runner: Runner,
     pub depth: DepthBudget,
-    pub budget: Budget,
+    pub allowance: SpawnAllowance,
     pub placement: Placement,
 }
 
@@ -636,13 +717,14 @@ impl Spawn {
             self.context,
             &self.runner,
             self.depth,
-            self.budget,
+            self.allowance,
             self.placement,
         ))
     }
 
     pub fn from_json(json: &protocol::Json) -> serde_json::Result<Self> {
-        let (owner, purpose, prompt, context, runner, depth, budget, placement) = json.parse()?;
+        let (owner, purpose, prompt, context, runner, depth, allowance, placement) =
+            json.parse()?;
         Ok(Self {
             owner,
             purpose,
@@ -650,7 +732,7 @@ impl Spawn {
             context,
             runner,
             depth,
-            budget,
+            allowance,
             placement,
         })
     }
@@ -670,9 +752,10 @@ impl From<&ModelTurn> for Spawn {
             runner: Runner::ModelOnly {
                 role: turn.role.clone(),
                 context: turn.bounds,
+                budget: turn.budget,
             },
             depth: DepthBudget::new(u16::MAX),
-            budget: turn.budget,
+            allowance: SpawnAllowance::NONE,
             placement: Placement::Here,
         }
     }
@@ -777,7 +860,7 @@ impl ModelTurn {
             role: spawn.runner.role().clone(),
             messages: [llm::Message::user(text)].into_iter().collect(),
             context: Context::Fresh,
-            budget: spawn.budget,
+            budget: spawn.runner.budget()?,
             background: false,
             while_waiting: false,
             ephemeral: false,

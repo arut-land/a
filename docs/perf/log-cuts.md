@@ -259,7 +259,7 @@ paging-only replay below tests the approved fix; it does not reassess deep CPU.
 
 All 40 cases preserve warm/cold page and FFI hashes. The stopped-log audit finds
 **39,800 sessions, 19,760 child links, and no unfinished model or tool calls**.
-All child-page selector matches are actual `fork_task` agent conversations.
+All child-page selector matches are actual `task(fork: true)` agent conversations.
 Every case includes the extra live turn, so 64-turn cases finish 65 turns and
 520 tool calls per root. Runtime request lengths grow equivalently in both arms;
 no history truncation or budget relaxation was added.

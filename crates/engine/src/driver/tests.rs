@@ -1695,15 +1695,7 @@ fn the_model_gets_the_prompt_and_the_logged_context_first() {
         .collect();
     assert_eq!(
         tools,
-        [
-            "bash",
-            "edit",
-            "read",
-            "task",
-            "fork_task",
-            "background_task",
-            "sleep"
-        ]
+        ["bash", "edit", "read", "task", "background_task", "sleep"]
     );
     assert_eq!(
         transcript(&log, u64::MAX, fixture.0.registry.get())[0],

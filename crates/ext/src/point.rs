@@ -582,6 +582,10 @@ pub trait View: Sync {
     fn cx(&self, _call: CallId) -> Option<Cx> {
         None
     }
+    /// Current task authority, when the host runs owned conversations.
+    fn delegation(&self) -> Option<crate::Delegation> {
+        None
+    }
     /// The services the engine gives the session's calls.
     fn services(&self) -> Option<&SessionServices> {
         None
@@ -633,6 +637,10 @@ impl<'a> PointCx<'a> {
     pub fn with_tool(mut self, tool: ToolUse<'a>) -> Self {
         self.tool = Some(tool);
         self
+    }
+
+    pub fn delegation(&self) -> Option<crate::Delegation> {
+        self.view.delegation()
     }
 
     pub fn model(&self) -> String {

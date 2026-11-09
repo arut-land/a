@@ -44,7 +44,7 @@ Paths and line numbers below refer to the researched commit.
 | Child result conversion | `crates/ext-subagent/src/lib.rs:100` reads a blob-backed child outcome and returns result text; `crates/ext/src/lib.rs:117` formats that outcome. Watch results may themselves reference a child's last tool-result blob. |
 | Access boundary | `crates/engine/src/outbox.rs:126` excludes context roots from ordinary attachment references; `crates/engine/src/fetch.rs:38` checks session access before serving bytes. Graph hashes are not public attachments. |
 
-Fresh `task` uses no inherited image. `fork_task` calls `.owner_context()`.
+Fresh `task` uses no inherited image. `task(fork: true)` calls `.owner_context()`.
 `background_task` uses fresh context and `.detach(cx)`, returning a durable
 handle and optionally sending inbox messages (`crates/ext-subagent/src/lib.rs:61`,
 `:85`, `:141`). An ordinary `a fork` is different: it copies a validated
@@ -290,7 +290,7 @@ Host: macOS arm64. Release build, fixtures enabled; current implementation only.
 No proposed implementation exists, so there is **no measured before/after
 performance claim** and no latency, RSS or shipped-binary-size saving claimed.
 
-Five paired rounds alternated `task` then `fork_task` and the reverse, each in
+Five paired rounds alternated `task` then `task(fork: true)` and the reverse, each in
 a newly created root with equivalent 8 KiB parent text and a small child result.
 Each round has a distinct parent marker to avoid cross-round content deduplication.
 The same isolated daemon served the pairs. `E/storage-rounds.json` records raw

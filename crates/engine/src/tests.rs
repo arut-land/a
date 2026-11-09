@@ -1973,6 +1973,329 @@ fn recursive_children_keep_the_admitted_runner_and_decreasing_budget() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+static CHILD_REQUESTS: std::sync::Mutex<Vec<llm::Request>> = std::sync::Mutex::new(Vec::new());
+struct CaptureChild;
+impl ext::Extension for CaptureChild {
+    const NAME: &'static str = "capture_child";
+    const VERSION: u32 = 1;
+    fn contribute(&self, r: &mut ext::Registrar) {
+        r.on::<ext::point::Step>(|_, request| {
+            super::lock(&CHILD_REQUESTS).push(request.clone());
+            ext::Rewrite::Stop(Ok(llm::Response {
+                message: llm::Assistant {
+                    content: vec![llm::AssistantPart::Text(llm::Text::new("reviewed"))],
+                    ..llm::Assistant::default()
+                },
+                finish: llm::Finish::new(llm::Reason::Stop, None),
+                usage: llm::Usage::default(),
+                id: None,
+                model: None,
+                meta: llm::Meta::new(),
+            }))
+        });
+    }
+}
+
+#[test]
+fn fresh_and_forked_children_use_the_selected_kind_and_normal_response_limit() {
+    for fork in [false, true] {
+        let (root, home) = home("child-options");
+        let config = Config {
+            extensions: |c| configured(c)?.with(&CaptureChild),
+            ..echo()
+        };
+        let daemon = Daemon::load(&home, &config).unwrap();
+        let parent = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
+        parent
+            .session()
+            .set_env(Environment {
+                vars: std::collections::BTreeMap::from([
+                    ("OPENAI_API_KEY".into(), "loopback-dummy".into()),
+                    ("OPENAI_BASE_URL".into(), "http://127.0.0.1:1/v1".into()),
+                    ("NO_PROXY".into(), "127.0.0.1,localhost".into()),
+                ]),
+                ..Environment::default()
+            })
+            .unwrap();
+        parent.session().submit("parent reference").unwrap();
+        settle(&daemon);
+        parent
+            .session()
+            .submit(&format!(
+                "call task {}",
+                Json::encode(&json!({
+                    "prompt": "review this change", "fork": fork, "kind": "reviewer"
+                }))
+                .unwrap()
+            ))
+            .unwrap();
+        settle(&daemon);
+        let requests = std::mem::take(&mut *super::lock(&CHILD_REQUESTS));
+        assert_eq!(
+            requests.len(),
+            1,
+            "selected reviewer must execute: {:?}",
+            bodies(&*daemon.shared.store, parent.session().id)
+        );
+        let request = &requests[0];
+        assert_eq!(
+            request.generation.max_output_tokens, None,
+            "children use normal model generation defaults"
+        );
+        let messages = request.messages.canonical().unwrap();
+        let Some(llm::Message::User(reminder)) = messages.last() else {
+            panic!("missing normal user reminder")
+        };
+        let text = reminder
+            .content
+            .iter()
+            .filter_map(|part| match part {
+                llm::UserPart::Text(text) => Some(text.text.as_str()),
+                llm::UserPart::Media(_) => None,
+            })
+            .collect::<String>();
+        assert!(
+            text.contains("You are a subagent")
+                && text.contains("Assigned prompt: review this change"),
+            "{text}"
+        );
+        assert!(text.contains("15 descendant sessions remain"), "{text}");
+        let prior = Json::encode(&*messages).unwrap();
+        assert_eq!(prior.raw().contains("parent reference"), fork);
+        assert!(
+            messages
+                .iter()
+                .filter_map(|m| match m {
+                    llm::Message::System(s) => Some(s.text()),
+                    _ => None,
+                })
+                .all(|s| !s.contains("You are a subagent"))
+        );
+        let child = daemon.children(parent.session().id);
+        assert_eq!(child.len(), 1);
+        let log = bodies(&*daemon.shared.store, child[0].id);
+        let Body::Spawned { intent } = &log[0] else {
+            panic!("missing admission")
+        };
+        let frozen = crate::driver::spawn::SpawnIntent::from_json(intent).unwrap();
+        assert_eq!(frozen.request.runner.agent(), Some("reviewer"));
+        assert_eq!(
+            frozen.request.context,
+            if fork {
+                ext::Context::Owner
+            } else {
+                ext::Context::Fresh
+            }
+        );
+        drop((child, parent, daemon));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn recursive_fanout_cannot_multiply_the_owning_turns_spawn_allowance() {
+    for fork in [false, true] {
+        let (root, home) = home("bounded-fanout");
+        let daemon = Daemon::load(&home, &echo()).unwrap();
+        let parent = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
+        let mut prompt = "done".to_owned();
+        for _ in 0..8 {
+            prompt = format!(
+                "par 4 call task {}",
+                Json::encode(&json!({"prompt": prompt, "fork": fork})).unwrap()
+            );
+        }
+        parent.session().submit(&prompt).unwrap();
+        settle(&daemon);
+        let headers = daemon.shared.store.headers().unwrap();
+        assert!(
+            headers.len() <= 33,
+            "unbounded tree: {} sessions",
+            headers.len()
+        );
+        assert!(
+            headers.len() > 8,
+            "the allowance must permit useful nested work"
+        );
+        let mut refused = 0;
+        let mut deepest = 0;
+        for header in &headers {
+            let log = bodies(&*daemon.shared.store, header.id);
+            assert!(
+                log.iter()
+                    .all(|body| !matches!(body, Body::Interrupt { .. } | Body::ModelCall { .. })),
+                "{log:?}"
+            );
+            for body in &log {
+                if let Body::Link { intent, .. } = body {
+                    let intent = crate::driver::spawn::SpawnIntent::from_json(intent).unwrap();
+                    if intent.refusal == Some(ext::SpawnRefusal::SpawnExhausted) {
+                        refused += 1;
+                    }
+                }
+            }
+            let mut at = header;
+            let mut depth = 0;
+            while let Some(parent) = at.parent {
+                depth += 1;
+                at = headers
+                    .iter()
+                    .find(|header| header.id == parent.session)
+                    .unwrap();
+            }
+            deepest = deepest.max(depth);
+        }
+        assert!(
+            refused > 0,
+            "the recursive script must reach admission refusal"
+        );
+        assert!(deepest >= 3, "useful third-level work must remain possible");
+        assert!(deepest <= 5, "a chain must consume rather than copy slots");
+        // Restart must not replenish a child's authority.
+        let parent_id = parent.session().id;
+        drop((parent, daemon));
+        let again = Daemon::load(&home, &echo()).unwrap();
+        settle(&again);
+        assert_eq!(again.shared.store.headers().unwrap().len(), headers.len());
+        let child = headers
+            .iter()
+            .find(|header| {
+                header
+                    .parent
+                    .is_some_and(|owner| owner.session == parent_id)
+            })
+            .unwrap();
+        let resumed = again
+            .attach_to(&Target::Id(child.id), PathBuf::new)
+            .unwrap();
+        resumed
+            .session()
+            .submit("spawn must remain refused after restart")
+            .unwrap();
+        settle(&again);
+        assert_eq!(
+            again.shared.store.headers().unwrap().len(),
+            headers.len(),
+            "resuming a child must not replenish its allocation"
+        );
+        let log = bodies(&*again.shared.store, child.id);
+        assert!(log.iter().any(|body| matches!(body, Body::ToolResult { outcome: Outcome::Failed { error }, .. } if error.contains("spawn allowance exhausted"))));
+        drop((resumed, again));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+struct ChildClock {
+    runtime: rt::Threads,
+    clock: std::sync::Arc<(std::sync::atomic::AtomicU64, rt::Notify)>,
+    timers: std::sync::Mutex<Vec<Duration>>,
+    began: Instant,
+}
+
+impl rt::Runtime for ChildClock {
+    fn spawn(&self, task: rt::BoxFuture<'static, ()>) {
+        self.runtime.spawn(task);
+    }
+    fn spawn_blocking(
+        &self,
+        class: rt::BlockingClass,
+        bytes: usize,
+        work: Box<dyn FnOnce() + Send>,
+    ) -> rt::BoxFuture<'static, std::io::Result<()>> {
+        self.runtime.spawn_blocking(class, bytes, work)
+    }
+    fn spawn_flush(
+        &self,
+        work: Box<dyn FnOnce() + Send>,
+    ) -> rt::BoxFuture<'static, std::io::Result<()>> {
+        self.runtime.spawn_flush(work)
+    }
+    fn reactor(&self) -> rt::Reactor {
+        self.runtime.reactor()
+    }
+    fn sleep(&self, duration: Duration) -> rt::BoxFuture<'static, ()> {
+        use std::sync::atomic::Ordering::SeqCst;
+        super::lock(&self.timers).push(duration);
+        let clock = std::sync::Arc::clone(&self.clock);
+        let deadline = clock.0.load(SeqCst) + duration.as_secs();
+        clock.1.notify();
+        Box::pin(async move { clock.1.until(|| clock.0.load(SeqCst) >= deadline).await })
+    }
+    fn now(&self) -> Instant {
+        self.began + Duration::from_secs(self.clock.0.load(std::sync::atomic::Ordering::SeqCst))
+    }
+}
+
+#[test]
+fn task_children_keep_running_past_sixty_seconds_and_finish_normally() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+    for fork in [false, true] {
+        let (root, home) = home("child-clock");
+        let runtime = Arc::new(ChildClock {
+            runtime: rt::Threads::default(),
+            clock: Arc::new((AtomicU64::new(0), rt::Notify::new())),
+            timers: std::sync::Mutex::new(Vec::new()),
+            began: Instant::now(),
+        });
+        let daemon = Daemon::load_on(&home, &echo(), &runtime, Vec::new()).unwrap();
+        let parent = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
+        parent
+            .session()
+            .submit(&format!(
+                "call task {}",
+                Json::encode(&json!({"prompt": "sleep 120", "fork": fork})).unwrap()
+            ))
+            .unwrap();
+        assert!(
+            rt::block_on(rt::or(
+                async {
+                    runtime
+                        .clock
+                        .1
+                        .until(|| super::lock(&runtime.timers).contains(&Duration::from_secs(120)))
+                        .await;
+                    true
+                },
+                async {
+                    rt::Runtime::sleep(&runtime.runtime, PATIENCE).await;
+                    false
+                }
+            )),
+            "child did not start its controlled sleep"
+        );
+        runtime.clock.0.store(61, SeqCst);
+        runtime.clock.1.notify();
+        for live in daemon.loaded() {
+            live.barrier();
+        }
+        assert!(
+            !super::lock(&runtime.timers).contains(&Duration::from_secs(60)),
+            "task admission must not register a side-request deadline"
+        );
+        let children = daemon.children(parent.session().id);
+        assert_eq!(children.len(), 1);
+        assert!(children[0].has_work());
+        runtime.clock.0.store(121, SeqCst);
+        runtime.clock.1.notify();
+        settle(&daemon);
+        let log = bodies(&*daemon.shared.store, children[0].id);
+        assert!(
+            log.iter()
+                .all(|body| !matches!(body, Body::Interrupt { .. }))
+        );
+        assert!(log.iter().any(|body| matches!(
+            body,
+            Body::ToolResult {
+                outcome: Outcome::Done { .. },
+                ..
+            }
+        )));
+        drop((children, parent, daemon));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 #[test]
 fn a_prefix_child_is_admitted_inside_its_unfinished_owning_turn() {
     let (root, home) = home("prefix-task");
@@ -1982,7 +2305,7 @@ fn a_prefix_child_is_admitted_inside_its_unfinished_owning_turn() {
     settle(&daemon);
     parent
         .session()
-        .submit("call fork_task {\"prompt\":\"done\"}")
+        .submit("call task {\"prompt\":\"done\",\"fork\":true}")
         .unwrap();
     settle(&daemon);
     let children: Vec<_> = daemon
@@ -2139,6 +2462,90 @@ fn detached_messages_wait_for_a_boundary_and_the_parent_hears_once() {
     assert_eq!(fired(&bodies(&*again.shared.store, id)).len(), 1);
     assert_eq!(again.shared.store.headers().unwrap().len(), 2);
     drop(again);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn side_responses_at_exhausted_agent_depth_are_not_delegation_or_provider_failures() {
+    struct LeafSide;
+    #[derive(serde::Deserialize, ext::Schema)]
+    struct LeafInput {
+        leaf: bool,
+    }
+    impl ext::Extension for LeafSide {
+        const NAME: &'static str = "leaf_side";
+        const VERSION: u32 = 1;
+        fn contribute(&self, r: &mut ext::Registrar) {
+            r.tool(Self);
+        }
+    }
+    impl ext::Tool for LeafSide {
+        type In = LeafInput;
+        type Out = String;
+        const NAME: &'static str = "leaf_side";
+        const DESCRIPTION: &'static str = "Exercises side responses in a leaf agent.";
+        const REPLAY: ext::Replay = ext::Replay::Safe;
+        const CONCURRENCY: ext::Concurrency = ext::Concurrency::Shared;
+        async fn call(&self, input: &LeafInput, cx: &ext::Cx) -> Result<String, String> {
+            if !input.leaf {
+                let outcome =
+                    ext::Conversation::task::<Self>("leaf", r#"call leaf_side {"leaf":true}"#)
+                        .depth(1)
+                        .ask(cx)
+                        .await
+                        .map_err(|e| format!("{e:?}"))?;
+                return Ok(ext::child_result(&outcome, None));
+            }
+            ext::Conversation::turn::<Self>("persisted", "side reply")
+                .ask(cx)
+                .await
+                .map_err(|e| e.to_string())?;
+            let reply = ext::Conversation::turn::<Self>("ephemeral", "side reply")
+                .ephemeral()
+                .ask(cx)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(reply.message.text())
+        }
+    }
+    let (root, home) = home("leaf-side");
+    let config = Config {
+        extensions: |c| configured(c)?.with(&LeafSide),
+        ..echo()
+    };
+    let daemon = Daemon::load(&home, &config).unwrap();
+    let parent = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
+    parent
+        .session()
+        .submit(r#"call leaf_side {"leaf":false}"#)
+        .unwrap();
+    settle(&daemon);
+    let headers = daemon.shared.store.headers().unwrap();
+    assert_eq!(
+        headers.len(),
+        3,
+        "root, leaf agent and persisted side conversation"
+    );
+    let mut sides = 0;
+    for header in headers {
+        let log = bodies(&*daemon.shared.store, header.id);
+        for body in &log {
+            match body {
+                Body::ModelCall { r#for: Some(_), .. } => sides += 1,
+                Body::ModelResult {
+                    outcome: Outcome::Failed { .. },
+                    ..
+                }
+                | Body::ToolResult {
+                    outcome: Outcome::Failed { .. },
+                    ..
+                } => panic!("side response was refused: {log:?}"),
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(sides, 2);
+    drop((parent, daemon));
     std::fs::remove_dir_all(root).unwrap();
 }
 

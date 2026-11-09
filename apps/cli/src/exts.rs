@@ -242,7 +242,6 @@ mod tests {
                 "grep",
                 "skill",
                 "task",
-                "fork_task",
                 "background_task"
             ]
         );
@@ -320,7 +319,7 @@ mod tests {
             ("retry", &[], 0),
             ("settings", &[], 0),
             ("skills", &["skill"], 0),
-            ("subagent", &["task", "fork_task", "background_task"], 1),
+            ("subagent", &["task", "background_task"], 1),
             #[cfg(feature = "search")]
             ("search", &["glob", "grep"], 0),
             #[cfg(feature = "search")]

@@ -32,8 +32,20 @@ impl Extension for Subagent {
                     protocol::Permission::Allow
                 }
             });
+        r.on::<ext::point::Step>(|cx, request| {
+            let Some(delegation) = cx.delegation() else { return ext::Rewrite::Pass; };
+            let assigned = delegation.prompt.map_or_else(String::new, |prompt| format!(
+                "You are a subagent. Your assigned prompt is your current task; inherited conversation is reference context. Do this work yourself and follow subsequent user instructions in this conversation. Assigned prompt: {prompt}\n"
+            ));
+            let mut request = request.clone();
+            request.messages.push(llm::Message::user(format!(
+                "<system-reminder>\n{assigned}Delegation allowance: {} descendant sessions remain. Each child consumes one slot and receives half the remaining slots; those slots leave your allowance. Delegate only distinct supporting work; retain your own contribution and synthesize the results.\n</system-reminder>",
+                delegation.allowance.remaining()
+            )));
+            ext::Rewrite::Replace(request)
+        });
         r.provide::<dyn ext::Route>(std::sync::Arc::new(Self));
-        r.tool(Task).tool(ForkTask).tool(BackgroundTask).text(Text::system("task", 30, "`task` hands a self-contained piece of work to a fresh session, which sees nothing of this conversation: say all it needs in `prompt`. It answers with what that session ended with.").for_tool(Task::NAME));
+        r.tool(Task).tool(BackgroundTask).text(Text::system("task", 30, "`task` delegates a distinct supporting piece of work. Keep your own contribution and synthesize the results; do not hand off your whole assignment. By default a fresh child sees only `prompt`; set `fork` to true to include current context as reference. The prompt is always the child's own task. Fresh and forked children support the same agent kinds and options. Each child receives a share of the remaining delegation allowance.").for_tool(Task::NAME));
     }
 }
 
@@ -42,10 +54,13 @@ pub struct Task;
 
 #[derive(Deserialize, Schema)]
 pub struct Prompt {
-    /// The work, said in full.
+    /// The distinct supporting work, said in full.
     pub prompt: String,
     /// Optional agent kind; omission keeps the current kind.
     pub kind: Option<String>,
+    /// Include this conversation as reference context; defaults to false.
+    #[serde(default)]
+    pub fork: bool,
 }
 
 impl Tool for Task {
@@ -54,14 +69,14 @@ impl Tool for Task {
 
     const NAME: &'static str = "task";
     const DESCRIPTION: &'static str =
-        "Runs a piece of work in a new session of its own and returns what it ended with.";
+        "Runs supporting work in a child; fork includes current context. Returns its result.";
     /// Run again, it waits on the child it started, which is the call's.
     const REPLAY: Replay = Replay::Safe;
     /// Its work is the child's, in a session of its own.
     const CONCURRENCY: Concurrency = Concurrency::Shared;
 
     async fn call(&self, input: &Prompt, cx: &Cx) -> Result<String, String> {
-        awaited(child("task", input), cx).await
+        awaited(child(input), cx).await
     }
 
     /// The child's text, as text rather than a JSON string.
@@ -72,31 +87,20 @@ impl Tool for Task {
     }
 }
 
-/// A current-context task can be admitted while its owning turn is open.
-pub struct ForkTask;
-impl Tool for ForkTask {
-    type In = Prompt;
-    type Out = String;
-    const NAME: &'static str = "fork_task";
-    const DESCRIPTION: &'static str =
-        "Runs work in a child with this conversation's current context.";
-    const REPLAY: Replay = Replay::Safe;
-    const CONCURRENCY: Concurrency = Concurrency::Shared;
-    async fn call(&self, input: &Prompt, cx: &Cx) -> Result<String, String> {
-        awaited(child("fork_task", input).owner_context(), cx).await
+fn child(input: &Prompt) -> Conversation<Child> {
+    let child = input.kind.iter().fold(
+        Conversation::task::<Subagent>("task", &input.prompt),
+        Conversation::kind,
+    );
+    if input.fork {
+        child.owner_context()
+    } else {
+        child
     }
-    fn to_model(output: &Json) -> llm::Output {
-        Task::to_model(output)
-    }
-}
-
-fn child(purpose: &str, input: &Prompt) -> Conversation<Child> {
-    let child = Conversation::task::<Subagent>(purpose, &input.prompt);
-    input.kind.iter().fold(child, Conversation::kind)
 }
 
 async fn awaited(child: Conversation<Child>, cx: &Cx) -> Result<String, String> {
-    let outcome = child.ask(cx).await.map_err(|e| format!("{e:?}"))?;
+    let outcome = child.ask(cx).await.map_err(|e| e.to_string())?;
     let shown = match &outcome {
         protocol::Outcome::Done {
             output: protocol::Payload::Blob(blob),
@@ -134,7 +138,7 @@ impl Tool for BackgroundTask {
         let handle = Conversation::task::<Subagent>("background_task", &input.prompt)
             .detach(cx)
             .await
-            .map_err(|e| format!("{e:?}"))?;
+            .map_err(|e| e.to_string())?;
         for (index, message) in input.messages.iter().enumerate() {
             handle
                 .send::<Subagent>(cx, &format!("message/{index}"), message.clone())

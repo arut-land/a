@@ -724,6 +724,7 @@ fn model_only_inputs_keep_their_interpretation_across_agent_scopes() {
     let mut intent =
         crate::driver::spawn::SpawnIntent::from_json(&crate::tests::spawn_intent(1, "")).unwrap();
     intent.request.runner = ext::Runner::ModelOnly {
+        budget: ext::Budget::default(),
         role: ext::ModelRole::Session,
         context: ext::ContextPolicy {
             exchanges: 8,

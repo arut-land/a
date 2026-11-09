@@ -9,7 +9,7 @@ execution authority remains private to each session. The initial graph implement
 
 The owner subsequently approved proposals #1 and #2 together. The current
 revision adds forkable prepared encoded prefixes, bounded graph cursors across
-inherited scopes and incremental admission lookup. Its operation-scoped handle follow-up removes idle descriptor retention and the measured launch slope. The latest indexed-supervisor follow-up removes all-session pulse scans and reduces wide user CPU. The owner accepts the CPU gate as met: owner-log scans, descriptor-dependent launch cost and supervisor scans are removed; remaining growth is full-context fork_task transmission plus noise. Independent review approved merging. The final section records the measurements, historical verdict and owner decision. The sections
+inherited scopes and incremental admission lookup. Its operation-scoped handle follow-up removes idle descriptor retention and the measured launch slope. The latest indexed-supervisor follow-up removes all-session pulse scans and reduces wide user CPU. The owner accepts the CPU gate as met: owner-log scans, descriptor-dependent launch cost and supervisor scans are removed; remaining growth is full-context task(fork: true) transmission plus noise. Independent review approved merging. The final section records the measurements, historical verdict and owner decision. The sections
 below preserve the earlier measurements and their unmet gates as historical
 evidence. Client history paging remains stage B; catalog interning was not
 approved.
@@ -198,7 +198,7 @@ retain recorded byte parity; no recorded provider fixtures changed.
 
 Bounded side context spends its requested exchange window across inherited
 scopes, preserves system-only model inputs and follows dependencies only in the
-requested suffix. Full-context fork_task remains full-context. Settled admission
+requested suffix. Full-context task(fork: true) remains full-context. Settled admission
 lookup advances only new links. Production append tests cover both fixes and
 provider replay across edits and incremental model-result boundaries.
 
@@ -474,7 +474,7 @@ native spawn probe remain intact. Phase 1 stopped for independent re-review.
 
 The owner accepts the CPU gate as met. Owner-log scans, descriptor-dependent
 launch cost and supervisor scans have been removed; the owner attributes the
-remaining growth to full-context fork_task transmission plus noise. Independent
+remaining growth to full-context task(fork: true) transmission plus noise. Independent
 review approved merging, subject to this documentation correction. This decision
 supersedes the earlier unmet-gate and not-ready-to-merge verdicts above. Every
 measurement, spread and attribution limitation is retained unchanged. Phase 2

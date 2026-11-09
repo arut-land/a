@@ -10,7 +10,7 @@ facts.
 Implementation status: typed turns and tasks, awaited and detached
 execution, ephemeral turns, keyed reuse, immutable prefix images, inherited
 registrations, nested storage, durable inbox transport and depth
-enforcement are implemented. `ext-subagent` supplies `task`, `fork_task`
+enforcement are implemented. `ext-subagent` supplies `task` (fresh by default, or `fork: true` for inherited context)
 and `background_task`; title, compact, judge and approval descriptions are
 turns. Named channels and questions remain follow-up compositions. The
 `Route` service decides who a message reaches; `ext-subagent`'s route
@@ -34,7 +34,7 @@ conversation, and an impossible combination does not compile:
 | Keyed reuse | `.key(k)` (turns only): a repeated key returns the committed result; a task is its call's, once per purpose | the owning call |
 | Thread | `.per_call()` (turns only) scopes the thread to the owning call | the session |
 | Context | `.owner_context()`: the owner's conversation before the owning call. Turns project it per input; tasks freeze an immutable context cut | fresh |
-| Bounds | `.bounds(exchanges, bytes)` (turns only), `.max_tokens(n)`, `.budget(b)`, `.depth(n)` (tasks only) | 8 exchanges, 64 KiB; 4096 tokens, 60 s; depth 8 |
+| Bounds | `.bounds(exchanges, bytes)`, `.max_tokens(n)`, `.budget(b)` (turns only); `.depth(n)` (tasks only) | turns: 8 exchanges, 64 KiB, 4096 tokens, 60 s; tasks: depth 8, shared descendant allowance 32 |
 | Routing | `.fast()`, `.role(ModelRole)`; `.kind(name)` (tasks only) selects another registered agent kind | the session's model; the current kind |
 | Placement | `.placement(Placement::Here)` | here |
 | Execution | `.ask(cx)` awaits the committed result; `.detach()` gives a turn's `Background` observer, `.detach(cx)` a task's `ConversationHandle` | |
@@ -45,7 +45,7 @@ few builder calls in their own crate. Title is
 detached under the key `initial` on its first model call and asked under
 the owning call's key by `/title`. A sub-agent is
 `task::<Subagent>("task", prompt)`, plus `.owner_context()` for
-`fork_task` and `.detach(cx)` for `background_task`.
+`task(fork: true)` and `.detach(cx)` for `background_task`.
 
 Compile-fail tests in `ext::conversation` hold the impossible combinations:
 an ephemeral task (an agent loop runs its tools from its own log), a keyed
@@ -117,8 +117,8 @@ discards its queued work in the interrupt fact. Notification can still settle,
 but acknowledgement or replay cannot execute the cancelled input.
 
 
-A task's `Spawn` contains a prompt, context, runner selection, typed budget
-and placement. Context is `Fresh` or `Owner`; an owner prefix runs through
+A task's `Spawn` contains a prompt, context, runner selection, depth and
+descendant allowances, and placement. Context is `Fresh` or `Owner`; an owner prefix runs through
 the owning call's sequence, which must be committed. Runner selection
 consists of an agent name and a model role (session, fast, or an
 extension-defined role resolved by the model service). Resolve and freeze
@@ -145,10 +145,35 @@ exhaustion. The engine intersects a requested budget with the parent's
 remaining allowance, so a recursive tool cannot reset its depth. Persist the
 remaining budget in the spawn intent. Static constructors may use const depth
 parameters, but a runtime check is necessary at erased extension boundaries
-and when restoring serialized data. The token allowance bounds each model
-response. The duration bounds the owned child's work; admission time is persisted so recovery subtracts elapsed time
-rather than replenishing it. Token and elapsed-time allowances use the
-existing positive token limit and duration types; they are not currency caps.
+and when restoring serialized data. Model-only side turns do not consume an
+agent ownership edge or spawn slot, including at an agent's exhausted depth.
+Their model-only runner receives no agent delegation slots.
+
+Each root turn starts with 32 descendant slots. An admitted agent child costs
+one slot and receives half the remaining slots (rounded down), reserved from
+its parent's allowance. The parent retains the rest for other children.
+A child keeps its allocation across its own turns and resumes; neither a
+fresh prompt nor inherited context replenishes it. Accepted links charge
+these allocations; replay derives the remaining allowance from the log.
+Refused links charge nothing. Unused reservations are not returned when a
+child finishes. Thus one root turn creates at most 32 descendants, while
+useful two- and three-level trees remain possible. `SpawnExhausted` and
+`DepthExhausted` are task admission refusals returned as tool failures,
+not retryable provider failures.
+
+Fresh and forked `task` calls support the same `kind` option; only their
+context differs. The subagent extension appends a normal user-message
+reminder with the child's assigned prompt and remaining allowance. Inherited
+conversation is reference material; the child's prompt is its own current
+work. Agents delegate distinct supporting work, retain their own contribution,
+and synthesize the results. No phrase matching or semantic refusal guesses
+whether a prompt is a whole-task handoff.
+
+Agent tasks have no wall-clock deadline and use the session's normal response
+limit. They finish normally or stop with an owning-turn interruption or an
+explicit user stop. Model-only side turns retain their own token and duration
+budgets; those bounds are fields of the model-only runner, not agent tasks.
+Admission time remains metadata for the conversation history.
 
 A prefix child inherits the effective conversation through the chosen seq,
 including context edits and skill publications, but does not acquire the
@@ -224,7 +249,8 @@ stay pinned; reload cannot widen their authority.
 The `task` tool retains the current kind by default; its optional `kind` selects
 a registered kind. `reviewer` is a source-declared example: it excludes
 `Compact`, starts with fresh settings, and adds a policy layer denying tool calls.
-It reviews the supplied prompt or `fork_task` context without tool side effects.
+It reviews the supplied prompt, optionally with inherited context (`task` with
+`fork: true` and `kind: "reviewer"`), without tool side effects.
 
 ## Durable lifecycle
 
